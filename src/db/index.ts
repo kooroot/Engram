@@ -12,17 +12,38 @@ export interface DatabaseConnection {
   close(): void;
 }
 
+// M3: Migration tracking table
+function ensureMigrationTable(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS _migrations (
+      id    INTEGER PRIMARY KEY,
+      name  TEXT NOT NULL UNIQUE,
+      applied_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%f','now'))
+    )
+  `);
+}
+
 function runMigrations(db: Database.Database, migrationFiles: string[]): void {
-  // Use compiled dist path or source path
   const dir = fs.existsSync(MIGRATIONS_DIR)
     ? MIGRATIONS_DIR
     : path.join(__dirname, '..', '..', 'src', 'db', 'migrations');
 
+  ensureMigrationTable(db);
+  const applied = new Set(
+    (db.prepare('SELECT name FROM _migrations').all() as Array<{ name: string }>)
+      .map(r => r.name)
+  );
+
+  const insertMigration = db.prepare('INSERT INTO _migrations (name) VALUES (?)');
+
   for (const file of migrationFiles) {
+    if (applied.has(file)) continue;
+
     const filePath = path.join(dir, file);
     if (fs.existsSync(filePath)) {
       const sql = fs.readFileSync(filePath, 'utf-8');
       db.exec(sql);
+      insertMigration.run(file);
     }
   }
 }
@@ -30,18 +51,15 @@ function runMigrations(db: Database.Database, migrationFiles: string[]): void {
 export function initMainDb(config: Config): DatabaseConnection {
   const dbPath = path.join(config.dataDir, config.dbFilename);
 
-  // Ensure data directory exists
   fs.mkdirSync(config.dataDir, { recursive: true });
 
   const db = new Database(dbPath);
 
-  // Performance & safety settings
   db.pragma('journal_mode = WAL');
   db.pragma('synchronous = NORMAL');
   db.pragma('foreign_keys = ON');
   db.pragma('busy_timeout = 5000');
 
-  // Run event log + state tree + history migrations
   runMigrations(db, [
     '001_init_events.sql',
     '002_init_state_tree.sql',
@@ -67,7 +85,6 @@ export function initVecDb(config: Config): DatabaseConnection {
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
 
-  // Run vector store migration (without sqlite-vec extension for now)
   runMigrations(db, ['004_init_vectors.sql']);
 
   return {

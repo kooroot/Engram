@@ -15,6 +15,9 @@ import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
 
+/** Callback invoked after a successful mutation with affected node IDs */
+export type MutationCallback = (nodeIds: string[]) => void;
+
 export class StateTree {
   // Node statements
   private insertNodeStmt: Stmt;
@@ -23,6 +26,7 @@ export class StateTree {
   private getNodesByTypeStmt: Stmt;
   private updateNodeStmt: Stmt;
   private deleteNodeStmt: Stmt;
+  private searchNodesByNameStmt: Stmt;
 
   // Edge statements
   private insertEdgeStmt: Stmt;
@@ -37,6 +41,9 @@ export class StateTree {
   // History statement
   private insertHistoryStmt: Stmt;
 
+  // Post-mutation callbacks (for cache invalidation, auto-embedding, etc.)
+  private onMutateCallbacks: MutationCallback[] = [];
+
   constructor(
     private db: Database.Database,
     private eventLog: EventLog,
@@ -49,8 +56,13 @@ export class StateTree {
     `);
 
     this.getNodeByIdStmt = db.prepare('SELECT * FROM nodes WHERE id = ?');
-    this.getNodeByNameStmt = db.prepare('SELECT * FROM nodes WHERE name = ? AND archived = 0');
+    this.getNodeByNameStmt = db.prepare('SELECT * FROM nodes WHERE name = ? AND archived = 0 LIMIT 1');
     this.getNodesByTypeStmt = db.prepare('SELECT * FROM nodes WHERE type = ? AND archived = 0 LIMIT ?');
+
+    // H3: Search by name + type for disambiguation
+    this.searchNodesByNameStmt = db.prepare(
+      'SELECT * FROM nodes WHERE name = ? AND type = ? AND archived = 0 LIMIT 1'
+    );
 
     this.updateNodeStmt = db.prepare(`
       UPDATE nodes SET
@@ -106,6 +118,11 @@ export class StateTree {
     `);
   }
 
+  /** Register a callback to be invoked after successful mutations */
+  onMutate(callback: MutationCallback): void {
+    this.onMutateCallbacks.push(callback);
+  }
+
   // ─── Node Operations ─────────────────────────────────────────
 
   getNode(id: string): Node | null {
@@ -118,8 +135,22 @@ export class StateTree {
     return row ? nodeFromRow(row) : null;
   }
 
+  /** H3: Disambiguated lookup by name + type */
+  getNodeByNameAndType(name: string, type: string): Node | null {
+    const row = this.searchNodesByNameStmt.get(name, type) as NodeRow | undefined;
+    return row ? nodeFromRow(row) : null;
+  }
+
   getNodesByType(type: string, limit: number = 100): Node[] {
     const rows = this.getNodesByTypeStmt.all(type, limit) as NodeRow[];
+    return rows.map(nodeFromRow);
+  }
+
+  /** Search all active nodes (no type restriction) */
+  searchAllNodes(limit: number = 100): Node[] {
+    const rows = this.db.prepare(
+      'SELECT * FROM nodes WHERE archived = 0 LIMIT ?'
+    ).all(limit) as NodeRow[];
     return rows.map(nodeFromRow);
   }
 
@@ -149,21 +180,15 @@ export class StateTree {
 
   /**
    * Execute a batch of node mutations in a single transaction.
-   * Automatically logs a mutation event.
+   * C3 fix: Event logging happens AFTER the mutation transaction succeeds,
+   * preventing conflicts between immutability triggers and rollback.
    */
   mutate(operations: MutationOp[]): { results: MutationResult[]; event_id: number } {
     const results: MutationResult[] = [];
     const affectedNodeIds: string[] = [];
 
-    const txn = this.db.transaction(() => {
-      // Log the mutation event first to get an event_id
-      const event = this.eventLog.append({
-        type: 'mutation',
-        source: 'agent',
-        content: { operations },
-        state_ref: [], // will be updated conceptually — IDs collected below
-      });
-
+    // Phase 1: Execute mutations in a transaction (no event logging)
+    const mutationTxn = this.db.transaction(() => {
       for (const op of operations) {
         switch (op.op) {
           case 'create': {
@@ -175,7 +200,7 @@ export class StateTree {
               properties: JSON.stringify(op.properties ?? {}),
               summary: op.summary ?? null,
               confidence: op.confidence ?? 1.0,
-              event_id: event.id,
+              event_id: null,
             });
             results.push({ op: 'create', node_id: id, version: 1 });
             affectedNodeIds.push(id);
@@ -187,16 +212,14 @@ export class StateTree {
               throw new Error(`Node not found: ${op.node_id}`);
             }
 
-            // Snapshot current state to history
             this.insertHistoryStmt.run({
               node_id: existing.id,
               version: existing.version,
               properties: existing.properties,
-              changed_by: event.id,
+              changed_by: null,
             });
 
-            // Merge properties
-            const currentProps = JSON.parse(existing.properties) as Record<string, unknown>;
+            const currentProps = safeJsonParse(existing.properties);
             if (op.set) {
               Object.assign(currentProps, op.set);
             }
@@ -212,7 +235,7 @@ export class StateTree {
               properties: JSON.stringify(currentProps),
               summary: op.summary ?? existing.summary,
               confidence: op.confidence ?? existing.confidence,
-              event_id: event.id,
+              event_id: null,
             });
 
             results.push({ op: 'update', node_id: op.node_id, version: existing.version + 1 });
@@ -224,12 +247,11 @@ export class StateTree {
             if (!toDelete) {
               throw new Error(`Node not found: ${op.node_id}`);
             }
-            // Snapshot before deletion
             this.insertHistoryStmt.run({
               node_id: toDelete.id,
               version: toDelete.version,
               properties: toDelete.properties,
-              changed_by: event.id,
+              changed_by: null,
             });
             this.deleteNodeStmt.run(op.node_id);
             results.push({ op: 'delete', node_id: op.node_id, version: toDelete.version });
@@ -238,12 +260,38 @@ export class StateTree {
           }
         }
       }
-
-      return event.id;
     });
 
-    const eventId = txn();
-    return { results, event_id: eventId };
+    mutationTxn();
+
+    // Phase 2: Log event AFTER successful mutation (outside transaction)
+    const event = this.eventLog.append({
+      type: 'mutation',
+      source: 'agent',
+      content: { operations },
+      state_ref: affectedNodeIds,
+    });
+
+    // Phase 3: Update event_id references on affected nodes
+    const updateEventRef = this.db.prepare('UPDATE nodes SET event_id = ? WHERE id = ?');
+    const updateHistoryRef = this.db.prepare(
+      'UPDATE node_history SET changed_by = ? WHERE node_id = ? AND changed_by IS NULL'
+    );
+    for (const nodeId of affectedNodeIds) {
+      // Only update if node still exists (not deleted)
+      const exists = this.getNodeByIdStmt.get(nodeId) as NodeRow | undefined;
+      if (exists) {
+        updateEventRef.run(event.id, nodeId);
+      }
+      updateHistoryRef.run(event.id, nodeId);
+    }
+
+    // Phase 4: Fire callbacks
+    for (const cb of this.onMutateCallbacks) {
+      cb(affectedNodeIds);
+    }
+
+    return { results, event_id: event.id };
   }
 
   /**
@@ -251,32 +299,27 @@ export class StateTree {
    */
   link(operations: LinkOp[]): { results: LinkResult[]; event_id: number } {
     const results: LinkResult[] = [];
+    const affectedEdgeIds: string[] = [];
 
-    const txn = this.db.transaction(() => {
-      const event = this.eventLog.append({
-        type: 'mutation',
-        source: 'agent',
-        content: { link_operations: operations },
-      });
-
+    const linkTxn = this.db.transaction(() => {
       for (const op of operations) {
         switch (op.op) {
           case 'create': {
-            // UPSERT: if triplet exists, update instead
             const existing = this.getEdgeByTripletStmt.get(
               op.source_id, op.predicate, op.target_id
             ) as EdgeRow | undefined;
 
             if (existing) {
-              const currentProps = JSON.parse(existing.properties) as Record<string, unknown>;
+              const currentProps = safeJsonParse(existing.properties);
               const merged = { ...currentProps, ...(op.properties ?? {}) };
               this.updateEdgeStmt.run({
                 id: existing.id,
                 properties: JSON.stringify(merged),
                 confidence: op.confidence ?? existing.confidence,
-                event_id: event.id,
+                event_id: null,
               });
               results.push({ op: 'update', edge_id: existing.id });
+              affectedEdgeIds.push(existing.id);
             } else {
               const id = ulid();
               this.insertEdgeStmt.run({
@@ -286,9 +329,10 @@ export class StateTree {
                 target_id: op.target_id,
                 properties: JSON.stringify(op.properties ?? {}),
                 confidence: op.confidence ?? 1.0,
-                event_id: event.id,
+                event_id: null,
               });
               results.push({ op: 'create', edge_id: id });
+              affectedEdgeIds.push(id);
             }
             break;
           }
@@ -306,35 +350,69 @@ export class StateTree {
               throw new Error('Edge not found for update');
             }
 
-            const currentProps = JSON.parse(edgeRow.properties) as Record<string, unknown>;
+            const currentProps = safeJsonParse(edgeRow.properties);
             const merged = { ...currentProps, ...(op.set ?? {}) };
 
             this.updateEdgeStmt.run({
               id: edgeRow.id,
               properties: JSON.stringify(merged),
               confidence: op.confidence ?? edgeRow.confidence,
-              event_id: event.id,
+              event_id: null,
             });
             results.push({ op: 'update', edge_id: edgeRow.id });
+            affectedEdgeIds.push(edgeRow.id);
             break;
           }
           case 'delete': {
+            // M5: Report if edge not found
             if (op.edge_id) {
+              const exists = this.getEdgeByIdStmt.get(op.edge_id) as EdgeRow | undefined;
+              if (!exists) {
+                results.push({ op: 'delete', edge_id: op.edge_id });
+                break;
+              }
               this.deleteEdgeByIdStmt.run(op.edge_id);
               results.push({ op: 'delete', edge_id: op.edge_id });
             } else if (op.source_id && op.predicate && op.target_id) {
               this.deleteEdgeByTripletStmt.run(op.source_id, op.predicate, op.target_id);
               results.push({ op: 'delete', edge_id: `${op.source_id}:${op.predicate}:${op.target_id}` });
+            } else {
+              throw new Error('Delete requires edge_id or complete triplet (source_id, predicate, target_id)');
             }
             break;
           }
         }
       }
-
-      return event.id;
     });
 
-    const eventId = txn();
-    return { results, event_id: eventId };
+    linkTxn();
+
+    // Log event after successful mutation
+    const event = this.eventLog.append({
+      type: 'mutation',
+      source: 'agent',
+      content: { link_operations: operations },
+      state_ref: affectedEdgeIds,
+    });
+
+    // Update event_id on edges
+    const updateEdgeRef = this.db.prepare('UPDATE edges SET event_id = ? WHERE id = ?');
+    for (const edgeId of affectedEdgeIds) {
+      const exists = this.getEdgeByIdStmt.get(edgeId) as EdgeRow | undefined;
+      if (exists) {
+        updateEdgeRef.run(event.id, edgeId);
+      }
+    }
+
+    return { results, event_id: event.id };
+  }
+}
+
+/** H5: Safe JSON.parse that returns {} on failure instead of crashing */
+function safeJsonParse(str: string): Record<string, unknown> {
+  try {
+    return JSON.parse(str) as Record<string, unknown>;
+  } catch {
+    return {};
   }
 }

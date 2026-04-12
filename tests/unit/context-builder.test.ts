@@ -90,8 +90,9 @@ describe('Context Builder', () => {
   });
 
   it('should estimate tokens correctly', () => {
-    expect(estimateTokens('hello world')).toBe(3);
+    // L2: Updated to ~3.3 chars per token for JSON-heavy content
+    expect(estimateTokens('hello world')).toBe(4); // 11 / 3.3 ≈ 3.33 → ceil = 4
     expect(estimateTokens('')).toBe(0);
-    expect(estimateTokens('a'.repeat(400))).toBe(100);
+    expect(estimateTokens('a'.repeat(330))).toBe(100); // 330 / 3.3 = 100
   });
 });

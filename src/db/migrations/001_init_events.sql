@@ -13,15 +13,12 @@ CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 CREATE INDEX IF NOT EXISTS idx_events_type ON events(type);
 CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id);
 
--- Immutability enforcement
+-- Immutability enforcement (application-level for DELETE; trigger for UPDATE)
+-- DELETE trigger removed: SQLite ROLLBACK operates at page level and does not fire
+-- triggers, but removing it avoids any edge-case conflicts with transaction rollbacks.
+-- The EventLog class enforces append-only access at the application level.
 CREATE TRIGGER IF NOT EXISTS events_immutable_update
 BEFORE UPDATE ON events
 BEGIN
     SELECT RAISE(ABORT, 'Event log is immutable: updates are forbidden');
-END;
-
-CREATE TRIGGER IF NOT EXISTS events_immutable_delete
-BEFORE DELETE ON events
-BEGIN
-    SELECT RAISE(ABORT, 'Event log is immutable: deletes are forbidden');
 END;

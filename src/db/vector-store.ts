@@ -20,6 +20,11 @@ export class VectorStore {
   private deleteEmbeddingStmt: Stmt;
   private deleteVecStmt: Stmt | null = null;
   private getBySourceStmt: Stmt;
+  private getMetaByIdStmt: Stmt;
+
+  // M2: Pre-compiled search statements (initialized in enableVec)
+  private searchAllStmt: Stmt | null = null;
+  private searchByTypeStmt: Stmt | null = null;
 
   constructor(
     private db: Database.Database,
@@ -27,7 +32,6 @@ export class VectorStore {
   ) {
     this.dimension = dimension;
 
-    // Metadata table (always available, created by migration)
     this.insertEmbeddingStmt = db.prepare(`
       INSERT OR REPLACE INTO embeddings (id, source_type, source_id, text, created_at)
       VALUES (@id, @source_type, @source_id, @text, strftime('%Y-%m-%dT%H:%M:%f','now'))
@@ -36,12 +40,9 @@ export class VectorStore {
     this.getBySourceStmt = db.prepare(
       'SELECT * FROM embeddings WHERE source_type = ? AND source_id = ?'
     );
+    this.getMetaByIdStmt = db.prepare('SELECT * FROM embeddings WHERE id = ?');
   }
 
-  /**
-   * Attempt to load the sqlite-vec extension. Call after construction.
-   * Separated so callers can handle errors gracefully.
-   */
   enableVec(loadFn: (db: Database.Database) => void): boolean {
     try {
       loadFn(this.db);
@@ -57,6 +58,21 @@ export class VectorStore {
       this.deleteVecStmt = this.db.prepare(
         'DELETE FROM vec_embeddings WHERE id = ?'
       );
+      // M2: Pre-compile search statements
+      this.searchAllStmt = this.db.prepare(`
+        SELECT id, distance
+        FROM vec_embeddings
+        WHERE embedding MATCH ? AND k = ?
+        ORDER BY distance ASC
+      `);
+      this.searchByTypeStmt = this.db.prepare(`
+        SELECT v.id, v.distance
+        FROM vec_embeddings v
+        INNER JOIN embeddings e ON e.id = v.id
+        WHERE v.embedding MATCH ? AND k = ?
+          AND e.source_type = ?
+        ORDER BY v.distance ASC
+      `);
       this.vecEnabled = true;
       return true;
     } catch {
@@ -69,9 +85,6 @@ export class VectorStore {
     return this.vecEnabled;
   }
 
-  /**
-   * Store a text and its embedding vector.
-   */
   store(params: {
     source_type: 'node' | 'event' | 'edge_context';
     source_id: string;
@@ -104,9 +117,6 @@ export class VectorStore {
     return id;
   }
 
-  /**
-   * Remove embeddings for a given source entity.
-   */
   removeBySource(sourceType: string, sourceId: string): number {
     const existing = this.getBySourceStmt.all(
       sourceType, sourceId
@@ -122,10 +132,6 @@ export class VectorStore {
     return existing.length;
   }
 
-  /**
-   * KNN search against stored embeddings.
-   * Returns results sorted by distance (ascending = most similar).
-   */
   search(params: {
     embedding: Float32Array | number[];
     limit?: number;
@@ -139,36 +145,22 @@ export class VectorStore {
       ? params.embedding
       : new Float32Array(params.embedding);
     const buffer = Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
-
     const limit = params.limit ?? 5;
 
     let results: Array<{ id: string; distance: number }>;
 
-    if (params.sourceType && params.sourceType !== 'all') {
-      const stmt = this.db.prepare(`
-        SELECT v.id, v.distance
-        FROM vec_embeddings v
-        INNER JOIN embeddings e ON e.id = v.id
-        WHERE v.embedding MATCH ? AND k = ?
-          AND e.source_type = ?
-        ORDER BY v.distance ASC
-      `);
-      results = stmt.all(buffer, limit, params.sourceType) as any[];
+    if (params.sourceType && params.sourceType !== 'all' && this.searchByTypeStmt) {
+      results = this.searchByTypeStmt.all(buffer, limit, params.sourceType) as any[];
+    } else if (this.searchAllStmt) {
+      results = this.searchAllStmt.all(buffer, limit) as any[];
     } else {
-      const stmt = this.db.prepare(`
-        SELECT id, distance
-        FROM vec_embeddings
-        WHERE embedding MATCH ? AND k = ?
-        ORDER BY distance ASC
-      `);
-      results = stmt.all(buffer, limit) as any[];
+      return [];
     }
 
-    const getMetaStmt = this.db.prepare('SELECT * FROM embeddings WHERE id = ?');
     const output: VectorSearchResult[] = [];
 
     for (const row of results) {
-      const meta = getMetaStmt.get(row.id) as {
+      const meta = this.getMetaByIdStmt.get(row.id) as {
         id: string;
         source_type: string;
         source_id: string;

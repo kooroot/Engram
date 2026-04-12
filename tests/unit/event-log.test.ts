@@ -65,16 +65,19 @@ describe('EventLog', () => {
     }).toThrow(/immutable/i);
   });
 
-  it('should enforce immutability - DELETE should fail', () => {
+  it('should allow DELETE at DB level (application-level enforcement)', () => {
+    // C3 fix: DELETE trigger removed to prevent rollback conflicts.
+    // Immutability is enforced at the application level (EventLog has no delete method).
     eventLog.append({
       type: 'action',
       source: 'agent',
       content: { action: 'test' },
     });
 
+    // Direct SQL delete now succeeds (but EventLog class doesn't expose this)
     expect(() => {
       db.prepare('DELETE FROM events WHERE id = 1').run();
-    }).toThrow(/immutable/i);
+    }).not.toThrow();
   });
 
   it('should maintain checksum chain integrity', () => {

@@ -63,10 +63,18 @@ export interface EdgeRow {
   event_id: number | null;
 }
 
+function safeParseJson(str: string): Record<string, unknown> {
+  try {
+    return JSON.parse(str) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
 export function nodeFromRow(row: NodeRow): Node {
   return {
     ...row,
-    properties: JSON.parse(row.properties),
+    properties: safeParseJson(row.properties),
     archived: row.archived === 1,
   };
 }
@@ -74,7 +82,7 @@ export function nodeFromRow(row: NodeRow): Node {
 export function edgeFromRow(row: EdgeRow): Edge {
   return {
     ...row,
-    properties: JSON.parse(row.properties),
+    properties: safeParseJson(row.properties),
     archived: row.archived === 1,
   };
 }

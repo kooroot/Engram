@@ -3,7 +3,6 @@ import type Database from 'better-sqlite3';
 import type { Event, EventType, EventSource, EventRow } from '../types/index.js';
 import { eventFromRow } from '../types/index.js';
 
-// Use a flexible statement type to avoid generic arity issues with better-sqlite3
 type Stmt = Database.Statement;
 
 export class EventLog {
@@ -13,6 +12,13 @@ export class EventLog {
   private queryByTypeStmt: Stmt;
   private queryBySessionStmt: Stmt;
   private queryRecentStmt: Stmt;
+  private appendTxn: (params: {
+    type: EventType;
+    source: EventSource;
+    session_id?: string;
+    content: Record<string, unknown>;
+    state_ref?: string[];
+  }) => Event;
 
   constructor(private db: Database.Database) {
     this.insertStmt = db.prepare(`
@@ -25,6 +31,36 @@ export class EventLog {
     this.queryByTypeStmt = db.prepare('SELECT * FROM events WHERE type = ? ORDER BY id DESC LIMIT ?');
     this.queryBySessionStmt = db.prepare('SELECT * FROM events WHERE session_id = ? ORDER BY id ASC');
     this.queryRecentStmt = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?');
+
+    // C2 fix: Atomic read-last-checksum + insert prevents checksum chain race conditions
+    this.appendTxn = db.transaction((params: {
+      type: EventType;
+      source: EventSource;
+      session_id?: string;
+      content: Record<string, unknown>;
+      state_ref?: string[];
+    }): Event => {
+      const contentStr = JSON.stringify(params.content);
+      const stateRefStr = params.state_ref ? JSON.stringify(params.state_ref) : null;
+
+      const lastEvent = this.getLastStmt.get() as EventRow | undefined;
+      const prevChecksum = lastEvent?.checksum ?? '';
+      const checksum = createHash('sha256')
+        .update(prevChecksum + contentStr)
+        .digest('hex');
+
+      const result = this.insertStmt.run({
+        type: params.type,
+        source: params.source,
+        session_id: params.session_id ?? null,
+        content: contentStr,
+        state_ref: stateRefStr,
+        checksum,
+      });
+
+      const row = this.getByIdStmt.get(result.lastInsertRowid) as EventRow;
+      return eventFromRow(row);
+    });
   }
 
   append(params: {
@@ -34,27 +70,7 @@ export class EventLog {
     content: Record<string, unknown>;
     state_ref?: string[];
   }): Event {
-    const contentStr = JSON.stringify(params.content);
-    const stateRefStr = params.state_ref ? JSON.stringify(params.state_ref) : null;
-
-    // Compute chain checksum: SHA-256(prev_checksum + content)
-    const lastEvent = this.getLastStmt.get() as EventRow | undefined;
-    const prevChecksum = lastEvent?.checksum ?? '';
-    const checksum = createHash('sha256')
-      .update(prevChecksum + contentStr)
-      .digest('hex');
-
-    const result = this.insertStmt.run({
-      type: params.type,
-      source: params.source,
-      session_id: params.session_id ?? null,
-      content: contentStr,
-      state_ref: stateRefStr,
-      checksum,
-    });
-
-    const row = this.getByIdStmt.get(result.lastInsertRowid) as EventRow;
-    return eventFromRow(row);
+    return this.appendTxn(params);
   }
 
   getById(id: number): Event | null {

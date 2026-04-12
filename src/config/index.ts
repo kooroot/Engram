@@ -20,12 +20,13 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     maintenance: overrides.maintenance,
   };
 
-  const config = ConfigSchema.parse(raw);
+  const parsed = ConfigSchema.parse(raw);
 
-  // Resolve dataDir to absolute path
-  if (!path.isAbsolute(config.dataDir)) {
-    config.dataDir = path.resolve(process.cwd(), config.dataDir);
-  }
-
-  return config;
+  // L6: Return new object instead of mutating parsed Zod output
+  return {
+    ...parsed,
+    dataDir: path.isAbsolute(parsed.dataDir)
+      ? parsed.dataDir
+      : path.resolve(process.cwd(), parsed.dataDir),
+  };
 }

@@ -63,7 +63,6 @@ export interface QueryParams {
     direction: 'outgoing' | 'incoming' | 'both';
     depth: number;
   };
-  where?: Record<string, unknown>;
   include_archived?: boolean;
   limit?: number;
 }

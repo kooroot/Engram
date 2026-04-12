@@ -9,7 +9,10 @@ export function registerLogEvent(server: McpServer, eventLog: EventLog): void {
       type: z.enum(['observation', 'action', 'mutation', 'query', 'system']).describe('Event type'),
       source: z.enum(['user', 'agent', 'system']).default('agent').describe('Event source'),
       session_id: z.string().optional().describe('Session identifier to group related events'),
-      content: z.record(z.unknown()).describe('Event payload as JSON object'),
+      content: z.record(z.unknown())
+        .refine(val => JSON.stringify(val).length <= 100_000,
+          { message: 'Content payload must be under 100KB' })
+        .describe('Event payload as JSON object (max 100KB)'),
     },
   }, async ({ type, source, session_id, content }) => {
     const event = eventLog.append({ type, source, session_id, content });

@@ -21,8 +21,8 @@ export function registerAllTools(
   embeddingProvider: EmbeddingProvider | null,
 ): void {
   registerLogEvent(server, eventLog);
-  registerMutateState(server, stateTree);
-  registerLinkEntities(server, stateTree);
+  registerMutateState(server, stateTree, cache);
+  registerLinkEntities(server, stateTree, cache);
   registerQueryEngram(server, stateTree);
   registerSearchMemory(server, vectorStore, embeddingProvider);
   registerGetContext(server, stateTree, vectorStore, cache, embeddingProvider);

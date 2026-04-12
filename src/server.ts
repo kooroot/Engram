@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Config } from './config/index.js';
 import { initMainDb, initVecDb } from './db/index.js';
@@ -68,9 +69,9 @@ export function createEngramServer(
   const vectorStore = new VectorStore(vecDb.db, embeddingProvider?.dimension ?? config.embedding.dimension);
   const cache = new EngineCache(config.cache);
 
-  // Try to enable sqlite-vec
+  // C1 fix: Use createRequire for ESM compatibility with native addons
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const require = createRequire(import.meta.url);
     const sqliteVec = require('sqlite-vec') as { load: (db: any) => void };
     vectorStore.enableVec(sqliteVec.load);
   } catch {
@@ -113,6 +114,25 @@ export function createEngramServer(
   );
 
   registerAllTools(mcpServer, eventLog, stateTree, vectorStore, cache, embeddingProvider);
+
+  // Auto-embed nodes on mutation (if embedding provider available)
+  if (embeddingProvider && vectorStore.isVecEnabled) {
+    stateTree.onMutate(async (nodeIds) => {
+      for (const nodeId of nodeIds) {
+        const node = stateTree.getNode(nodeId);
+        if (!node) continue; // deleted
+
+        const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+        try {
+          const embedding = await embeddingProvider.embed(text);
+          vectorStore.removeBySource('node', nodeId);
+          vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
+        } catch {
+          // Embedding failure is non-fatal
+        }
+      }
+    });
+  }
 
   return {
     mcpServer,

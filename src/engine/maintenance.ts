@@ -39,10 +39,12 @@ export function runMaintenance(
     orphansDetected: 0,
   };
 
-  // 1. Confidence decay: reduce confidence for nodes not updated recently
+  // M4: Proportional confidence decay based on elapsed days since last update
+  // decay = factor ^ days_since_update (more stale = more decay)
   const decayStmt = db.prepare(`
     UPDATE nodes
-    SET confidence = confidence * @factor,
+    SET confidence = confidence * POWER(@factor,
+      MAX(1, CAST(julianday('now') - julianday(updated_at) AS INTEGER))),
         updated_at = updated_at
     WHERE archived = 0
       AND updated_at < datetime('now', @daysAgo)
