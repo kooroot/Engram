@@ -1,0 +1,37 @@
+{
+  "name": "engram",
+  "version": "0.1.0",
+  "description": "AI-native persistent memory space with state-transition architecture",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "engram": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc && cp -r src/db/migrations dist/db/",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": ["mcp", "memory", "ai", "graph", "state-machine"],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "better-sqlite3": "^11.8.2",
+    "sqlite-vec": "^0.1.9",
+    "ulid": "^2.3.0",
+    "zod": "^3.24.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^22.15.3",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.2"
+  }
+}
