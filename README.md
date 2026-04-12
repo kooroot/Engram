@@ -90,6 +90,62 @@ Settings > MCP Servers > Add:
 }
 ```
 
+## Usage Modes
+
+Engram has three interfaces — pick the one that fits:
+
+| Mode | For | Command |
+|------|-----|---------|
+| **MCP Server** | AI agents (Claude, Cursor) | `engram mcp` or auto-detected via piped stdin |
+| **CLI** | Humans in terminal | `engram status`, `engram nodes`, `engram search ...` |
+| **REST API** | Web dashboards, apps | `engram serve --port 3333` |
+
+### CLI Examples
+
+```bash
+# What's in memory?
+engram status
+
+# List all people
+engram nodes --type person
+
+# Inspect a specific entity
+engram node "Alice"
+
+# Search for something
+engram search "platform team"
+
+# See what the AI has been doing
+engram events --limit 10
+
+# View how a node changed over time
+engram history "Alice"
+
+# Get the same context an AI agent would see
+engram context "project status" --entities "Alice,Engram"
+
+# Run maintenance (decay stale nodes, archive, clean orphans)
+engram maintenance --dry-run
+```
+
+### REST API
+
+```bash
+# Start the API server
+engram serve --port 3333
+
+# Then query from anywhere
+curl http://localhost:3333/api/status
+curl http://localhost:3333/api/nodes?type=person
+curl http://localhost:3333/api/nodes/Alice
+curl http://localhost:3333/api/search?q=engineer
+curl http://localhost:3333/api/events?limit=10
+curl http://localhost:3333/api/history/Alice
+curl -X POST http://localhost:3333/api/context \
+  -H 'Content-Type: application/json' \
+  -d '{"topic": "project status", "entities": ["Alice"]}'
+```
+
 ## Architecture
 
 ```
