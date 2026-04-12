@@ -4,6 +4,13 @@ import * as svc from '../service.js';
 import * as fmt from './formatters.js';
 import type { EventType } from '../types/index.js';
 
+/** M2: Safe parseInt with fallback for CLI options */
+function safeInt(val: string | undefined, fallback: number): number {
+  if (!val) return fallback;
+  const n = Number(val);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
 function withCore(fn: (core: EngramCore) => void | Promise<void>) {
   return async () => {
     const core = createEngramCore();
@@ -36,7 +43,7 @@ export function registerCLICommands(program: Command): void {
     .action((opts) => withCore((core) => {
       const nodes = svc.listNodes(core, {
         type: opts.type,
-        limit: parseInt(opts.limit),
+        limit: safeInt(opts.limit, 50),
       });
       console.log(fmt.formatNodeRows(nodes));
     })());
@@ -82,7 +89,7 @@ export function registerCLICommands(program: Command): void {
     .description('Search nodes by keyword')
     .option('-l, --limit <n>', 'Max results', '20')
     .action((query, opts) => withCore((core) => {
-      const results = svc.searchNodes(core, query, parseInt(opts.limit));
+      const results = svc.searchNodes(core, query, safeInt(opts.limit, 20));
       console.log(fmt.formatNodeRows(results));
     })());
 
@@ -95,7 +102,7 @@ export function registerCLICommands(program: Command): void {
     .option('-t, --type <type>', 'Filter by event type')
     .action((opts) => withCore((core) => {
       const events = svc.listEvents(core, {
-        limit: parseInt(opts.limit),
+        limit: safeInt(opts.limit, 20),
         type: opts.type as EventType | undefined,
       });
       console.log(fmt.formatEventRows(events));
@@ -130,7 +137,7 @@ export function registerCLICommands(program: Command): void {
       const context = svc.getContext(core, {
         topic,
         entities,
-        maxTokens: parseInt(opts.maxTokens),
+        maxTokens: safeInt(opts.maxTokens, 2000),
       });
       console.log(context);
     })());
@@ -160,7 +167,7 @@ export function registerCLICommands(program: Command): void {
       const app = createApp(core);
       const port = parseInt(opts.port);
 
-      serve({ fetch: app.fetch, port, hostname: opts.host }, () => {
+      const server = serve({ fetch: app.fetch, port, hostname: opts.host }, () => {
         console.log(`Engram REST API listening on http://${opts.host}:${port}`);
         console.log(`  GET  /api/status`);
         console.log(`  GET  /api/nodes`);
@@ -172,7 +179,9 @@ export function registerCLICommands(program: Command): void {
         console.log(`  GET  /api/history/:nodeId`);
       });
 
-      process.on('SIGINT', () => { core.close(); process.exit(0); });
-      process.on('SIGTERM', () => { core.close(); process.exit(0); });
+      // M7: Gracefully close HTTP server + DB on shutdown
+      const shutdown = () => { server.close(); core.close(); process.exit(0); };
+      process.on('SIGINT', shutdown);
+      process.on('SIGTERM', shutdown);
     });
 }

@@ -14,6 +14,7 @@ import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/
 import { traverseGraph } from './engine/graph-traversal.js';
 import { buildContext } from './engine/context-builder.js';
 import type { Node, Edge, Event, EventType } from './types/index.js';
+import { safeJsonParse } from './utils.js';
 
 export interface EngramCore {
   config: Config;
@@ -291,10 +292,3 @@ export function runMaintenanceCycle(
   return { ...report, ...statsAfter };
 }
 
-function safeJsonParse(str: string): Record<string, unknown> {
-  try {
-    return JSON.parse(str) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}

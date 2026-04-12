@@ -24,12 +24,29 @@ export interface EventRow {
   checksum: string | null;
 }
 
+function safeParseJson(str: string): Record<string, unknown> {
+  try {
+    return JSON.parse(str) as Record<string, unknown>;
+  } catch {
+    return {};
+  }
+}
+
+function safeParseArray(str: string | null): string[] | null {
+  if (!str) return null;
+  try {
+    return JSON.parse(str) as string[];
+  } catch {
+    return null;
+  }
+}
+
 export function eventFromRow(row: EventRow): Event {
   return {
     ...row,
     type: row.type as EventType,
     source: row.source as EventSource,
-    content: JSON.parse(row.content),
-    state_ref: row.state_ref ? JSON.parse(row.state_ref) : null,
+    content: safeParseJson(row.content),
+    state_ref: safeParseArray(row.state_ref),
   };
 }

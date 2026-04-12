@@ -11,6 +11,7 @@ import type {
   LinkResult,
 } from '../types/index.js';
 import { nodeFromRow, edgeFromRow } from '../types/index.js';
+import { safeJsonParse } from '../utils.js';
 import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
@@ -27,6 +28,7 @@ export class StateTree {
   private updateNodeStmt: Stmt;
   private deleteNodeStmt: Stmt;
   private searchNodesByNameStmt: Stmt;
+  private searchAllNodesStmt: Stmt;
 
   // Edge statements
   private insertEdgeStmt: Stmt;
@@ -59,9 +61,13 @@ export class StateTree {
     this.getNodeByNameStmt = db.prepare('SELECT * FROM nodes WHERE name = ? AND archived = 0 LIMIT 1');
     this.getNodesByTypeStmt = db.prepare('SELECT * FROM nodes WHERE type = ? AND archived = 0 LIMIT ?');
 
-    // H3: Search by name + type for disambiguation
     this.searchNodesByNameStmt = db.prepare(
       'SELECT * FROM nodes WHERE name = ? AND type = ? AND archived = 0 LIMIT 1'
+    );
+
+    // M1: Pre-compiled statement for searchAllNodes
+    this.searchAllNodesStmt = db.prepare(
+      'SELECT * FROM nodes WHERE archived = 0 LIMIT ?'
     );
 
     this.updateNodeStmt = db.prepare(`
@@ -148,9 +154,7 @@ export class StateTree {
 
   /** Search all active nodes (no type restriction) */
   searchAllNodes(limit: number = 100): Node[] {
-    const rows = this.db.prepare(
-      'SELECT * FROM nodes WHERE archived = 0 LIMIT ?'
-    ).all(limit) as NodeRow[];
+    const rows = this.searchAllNodesStmt.all(limit) as NodeRow[];
     return rows.map(nodeFromRow);
   }
 
@@ -408,11 +412,3 @@ export class StateTree {
   }
 }
 
-/** H5: Safe JSON.parse that returns {} on failure instead of crashing */
-function safeJsonParse(str: string): Record<string, unknown> {
-  try {
-    return JSON.parse(str) as Record<string, unknown>;
-  } catch {
-    return {};
-  }
-}
