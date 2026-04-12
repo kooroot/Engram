@@ -145,4 +145,34 @@ export function registerCLICommands(program: Command): void {
       const report = svc.runMaintenanceCycle(core, opts.dryRun ?? false);
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     })());
+
+  // ─── serve ───────────────────────────────────────
+
+  program
+    .command('serve')
+    .description('Start REST API server')
+    .option('-p, --port <port>', 'Port number', '3333')
+    .option('--host <host>', 'Host to bind', '127.0.0.1')
+    .action(async (opts) => {
+      const { serve } = await import('@hono/node-server');
+      const { createApp } = await import('../api/index.js');
+      const core = createEngramCore();
+      const app = createApp(core);
+      const port = parseInt(opts.port);
+
+      serve({ fetch: app.fetch, port, hostname: opts.host }, () => {
+        console.log(`Engram REST API listening on http://${opts.host}:${port}`);
+        console.log(`  GET  /api/status`);
+        console.log(`  GET  /api/nodes`);
+        console.log(`  GET  /api/nodes/:id`);
+        console.log(`  GET  /api/edges/:nodeId`);
+        console.log(`  GET  /api/search?q=...`);
+        console.log(`  GET  /api/events`);
+        console.log(`  POST /api/context`);
+        console.log(`  GET  /api/history/:nodeId`);
+      });
+
+      process.on('SIGINT', () => { core.close(); process.exit(0); });
+      process.on('SIGTERM', () => { core.close(); process.exit(0); });
+    });
 }
