@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import chalk from 'chalk';
 import { loadConfig } from '../config/index.js';
 import { resolveEmbeddingProvider } from '../service.js';
+import { renderBanner } from './banner.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 interface CheckResult {
@@ -191,7 +192,63 @@ function printRow(r: CheckResult): void {
   if (r.fix) console.log(`    ${chalk.dim('→')} ${chalk.cyan(r.fix)}`);
 }
 
-export async function runDoctor(): Promise<void> {
+function getPackageDir(): string {
+  const here = fileURLToPath(import.meta.url);
+  return path.resolve(path.dirname(here), '..', '..');
+}
+
+async function runRebuild(cmd: string, args: string[], cwd: string): Promise<boolean> {
+  return new Promise(resolve => {
+    console.log(chalk.dim(`  $ cd ${cwd}`));
+    console.log(chalk.dim(`  $ ${cmd} ${args.join(' ')}`));
+    const child = spawn(cmd, args, { cwd, stdio: 'inherit' });
+    child.on('error', () => resolve(false));
+    child.on('close', code => resolve(code === 0));
+  });
+}
+
+async function attemptAutoFix(): Promise<boolean> {
+  const pkgDir = getPackageDir();
+  console.log(chalk.bold('\n  Attempting auto-fix for native modules…\n'));
+
+  const hasNpm = await hasCommand('npm');
+  const hasBun = await hasCommand('bun');
+
+  // Strategy 1: npm rebuild (most reliable for native modules)
+  if (hasNpm) {
+    console.log(chalk.dim('  Strategy 1: npm rebuild'));
+    const ok = await runRebuild('npm', ['rebuild', 'better-sqlite3', 'sqlite-vec'], pkgDir);
+    if (ok) return true;
+    console.log(chalk.yellow('  npm rebuild failed — trying next strategy…\n'));
+  }
+
+  // Strategy 2: reinstall in place via bun (runs install scripts in that context)
+  if (hasBun) {
+    console.log(chalk.dim('  Strategy 2: bun install --ignore-scripts=false'));
+    const ok = await runRebuild('bun', ['install', '--ignore-scripts=false', '--force'], pkgDir);
+    if (ok) return true;
+    console.log(chalk.yellow('  bun install failed — trying next strategy…\n'));
+  }
+
+  // Strategy 3: raw npm install in place
+  if (hasNpm) {
+    console.log(chalk.dim('  Strategy 3: npm install'));
+    const ok = await runRebuild('npm', ['install', '--no-save'], pkgDir);
+    if (ok) return true;
+  }
+
+  return false;
+}
+
+export interface DoctorOptions {
+  fix?: boolean;
+  quiet?: boolean;
+}
+
+export async function runDoctor(options: DoctorOptions = {}): Promise<void> {
+  if (!options.quiet) {
+    console.log(renderBanner());
+  }
   console.log(chalk.bold('\nEngram Doctor\n'));
 
   const config = loadConfig();
@@ -202,12 +259,11 @@ export async function runDoctor(): Promise<void> {
   const results: CheckResult[] = [];
   results.push(await checkNode());
   results.push(checkBuild());
-  const bindingsResult = await checkSqliteBindings();
+  let bindingsResult = await checkSqliteBindings();
   results.push(bindingsResult);
   results.push(checkDataDir(dataDir));
   results.push(checkDbFile(mainDb, 'main db'));
   results.push(checkDbFile(vecDb, 'vector db'));
-  // Skip provider probe if bindings are broken — it would fail for unrelated reasons
   if (bindingsResult.status !== 'fail') {
     results.push(await checkEmbeddingProvider());
   }
@@ -219,8 +275,37 @@ export async function runDoctor(): Promise<void> {
   const warns = results.filter(r => r.status === 'warn').length;
 
   console.log('');
+
+  // Auto-fix path: re-run bindings check after fix attempt
+  if (options.fix && bindingsResult.status === 'fail') {
+    const fixed = await attemptAutoFix();
+    if (fixed) {
+      console.log('');
+      const retry = await checkSqliteBindings();
+      if (retry.status === 'ok') {
+        console.log(chalk.green('  ✓ Native modules rebuilt successfully. Run `engram status` to verify.'));
+        console.log('');
+        process.exitCode = 0;
+        return;
+      }
+      bindingsResult = retry;
+      console.log(chalk.yellow(`  Rebuild completed but probe still fails: ${retry.detail}`));
+      console.log('');
+    } else {
+      console.log(chalk.red('  Auto-fix failed. Manual options:'));
+      console.log(chalk.cyan(`    cd ${getPackageDir()} && npm install`));
+      console.log(chalk.cyan(`    npm install -g @kooroot/engram         # full reinstall via npm`));
+      console.log('');
+      process.exitCode = 1;
+      return;
+    }
+  }
+
   if (fails > 0) {
     console.log(chalk.red(`${fails} fail${fails === 1 ? '' : 's'}, ${warns} warning${warns === 1 ? '' : 's'}.`));
+    if (results.some(r => r.label === 'sqlite bindings' && r.status === 'fail')) {
+      console.log(chalk.dim('  Tip: re-run with `engram doctor --fix` to auto-rebuild native modules.'));
+    }
     process.exitCode = 1;
   } else if (warns > 0) {
     console.log(chalk.yellow(`${warns} warning${warns === 1 ? '' : 's'}, no failures.`));

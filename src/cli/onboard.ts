@@ -4,6 +4,7 @@ import os from 'node:os';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as p from '@clack/prompts';
+import { renderBanner } from './banner.js';
 
 interface OnboardAnswers {
   dataDir: string;
@@ -105,6 +106,7 @@ function ensureNotCancelled<T>(value: T | symbol): asserts value is T {
 
 export async function runOnboard(): Promise<void> {
   console.clear();
+  process.stdout.write(renderBanner());
   p.intro('🧠  Engram onboarding');
 
   p.note(

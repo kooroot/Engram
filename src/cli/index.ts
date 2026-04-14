@@ -47,8 +47,10 @@ export function registerCLICommands(program: Command): void {
   program
     .command('doctor')
     .description('Diagnose Engram installation (build, data dir, embeddings, MCP registration)')
-    .action(async () => {
-      await runDoctor();
+    .option('--fix', 'Attempt to auto-repair detected issues (e.g. rebuild native modules)')
+    .option('--quiet', 'Suppress the banner')
+    .action(async (opts: { fix?: boolean; quiet?: boolean }) => {
+      await runDoctor({ fix: opts.fix, quiet: opts.quiet });
     });
 
   // ─── status ──────────────────────────────────────
