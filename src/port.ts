@@ -166,6 +166,10 @@ export function importBundle(
   const existsNode = core.db.prepare(
     'SELECT version FROM nodes WHERE id = ? AND namespace = ?'
   );
+  // C-A1: detect cross-namespace collision before any write
+  const findNodeAnywhere = core.db.prepare(
+    'SELECT namespace FROM nodes WHERE id = ?'
+  );
   const insertEdge = core.db.prepare(`
     INSERT OR IGNORE INTO edges
       (id, source_id, predicate, target_id, properties, confidence, created_at, updated_at, version, archived, event_id, namespace)
@@ -189,6 +193,15 @@ export function importBundle(
         destId = ulid();
         idMap.set(node.id, destId);
         result.renamed++;
+      }
+
+      // C-A1: refuse to clobber a node belonging to a different namespace
+      const elsewhere = findNodeAnywhere.get(destId) as { namespace: string } | undefined;
+      if (elsewhere && elsewhere.namespace !== targetNs) {
+        throw new Error(
+          `Import aborted: node ${destId} already exists in namespace '${elsewhere.namespace}' ` +
+          `(importing into '${targetNs}'). Use strategy 'reassign' to generate new IDs.`
+        );
       }
 
       const existing = existsNode.get(destId, targetNs) as { version: number } | undefined;
@@ -218,10 +231,21 @@ export function importBundle(
     }
 
     // Pass 2: edges (remap source/target if reassigned)
+    const findEdgeAnywhere = core.db.prepare('SELECT namespace FROM edges WHERE id = ?');
     for (const edge of bundle.edges) {
       const srcId = idMap.get(edge.source_id) ?? edge.source_id;
       const tgtId = idMap.get(edge.target_id) ?? edge.target_id;
       const edgeId = strategy === 'reassign' ? ulid() : edge.id;
+
+      // C-A1 (edges): refuse cross-namespace edge ID collisions
+      if (strategy !== 'reassign') {
+        const elsewhere = findEdgeAnywhere.get(edgeId) as { namespace: string } | undefined;
+        if (elsewhere && elsewhere.namespace !== targetNs) {
+          throw new Error(
+            `Import aborted: edge ${edgeId} already exists in namespace '${elsewhere.namespace}'. Use 'reassign'.`
+          );
+        }
+      }
 
       insertEdge.run(
         edgeId, srcId, edge.predicate, tgtId,

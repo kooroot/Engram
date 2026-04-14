@@ -330,6 +330,20 @@ export class StateTree {
       for (const op of operations) {
         switch (op.op) {
           case 'create': {
+            // C-A3: verify source/target nodes belong to this namespace
+            const src = this.getNodeByIdStmt.get(op.source_id, this.namespace) as NodeRow | undefined;
+            if (!src) {
+              throw new Error(
+                `Cannot create edge: source node ${op.source_id} not found in namespace '${this.namespace}'`
+              );
+            }
+            const tgt = this.getNodeByIdStmt.get(op.target_id, this.namespace) as NodeRow | undefined;
+            if (!tgt) {
+              throw new Error(
+                `Cannot create edge: target node ${op.target_id} not found in namespace '${this.namespace}'`
+              );
+            }
+
             const existing = this.getEdgeByTripletStmt.get(
               op.source_id, op.predicate, op.target_id, this.namespace
             ) as EdgeRow | undefined;

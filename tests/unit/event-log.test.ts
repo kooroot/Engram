@@ -23,6 +23,7 @@ function setupDb(): Database.Database {
     '003_init_node_history.sql',
     '005_add_namespaces.sql',
     '007_add_fts5.sql',
+    '008_namespace_scope_fixes.sql',
   ]) {
     db.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf-8'));
   }

@@ -19,7 +19,7 @@ function setupDb(): Database.Database {
   const migrationsDir = path.join(
     import.meta.dirname, '..', '..', 'src', 'db', 'migrations'
   );
-  for (const file of ['001_init_events.sql', '002_init_state_tree.sql', '003_init_node_history.sql', '005_add_namespaces.sql', '007_add_fts5.sql']) {
+  for (const file of ['001_init_events.sql', '002_init_state_tree.sql', '003_init_node_history.sql', '005_add_namespaces.sql', '007_add_fts5.sql', '008_namespace_scope_fixes.sql']) {
     const sql = fs.readFileSync(path.join(migrationsDir, file), 'utf-8');
     db.exec(sql);
   }
