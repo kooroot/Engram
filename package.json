@@ -1,6 +1,6 @@
 {
   "name": "@kooroot/engram",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI-native persistent memory for agents — knowledge graph, not files, not RAG. MCP server + CLI + REST.",
   "type": "module",
   "main": "dist/index.js",
@@ -51,6 +51,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@clack/prompts": "^1.2.0",
     "@hono/node-server": "^1.19.13",
     "@modelcontextprotocol/sdk": "^1.12.1",
     "better-sqlite3": "^11.8.2",
