@@ -19,7 +19,7 @@ import type { EmbeddingProvider } from './embeddings/index.js';
 import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
 import { LocalEmbeddingProvider } from './embeddings/local.js';
 import { safeJsonParse } from './utils.js';
-import { metrics, startTimer } from './metrics.js';
+import { metrics, startTimer, safeNamespaceLabel } from './metrics.js';
 import { log } from './logger.js';
 
 export { exportNamespace, importBundle } from './port.js';
@@ -143,9 +143,9 @@ export function createEngramCore(
           const embedding = await embeddingProvider.embed(text);
           vectorStore.removeBySource('node', nodeId);
           vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
-          metrics.embeddings.inc({ namespace: ns });
+          metrics.embeddings.inc({ namespace: safeNamespaceLabel(ns) });
         } catch (err) {
-          metrics.embeddingFailures.inc({ namespace: ns });
+          metrics.embeddingFailures.inc({ namespace: safeNamespaceLabel(ns) });
           log.warn('auto-embed failed', { namespace: ns, node_id: nodeId, error: String(err) });
         }
       }
@@ -430,7 +430,7 @@ export async function getContext(
 ): Promise<string> {
   const strategy: ContextStrategy = opts.strategy ?? 'hybrid';
   const stopTimer = startTimer();
-  metrics.contextRequests.inc({ namespace: core.config.namespace, strategy });
+  metrics.contextRequests.inc({ namespace: safeNamespaceLabel(core.config.namespace), strategy });
   const allNodes = new Map<string, Node>();
   const allEdges = new Map<string, Edge>();
 
@@ -469,7 +469,7 @@ export async function getContext(
   }
 
   if (allNodes.size === 0) {
-    metrics.contextDuration.observe({ namespace: core.config.namespace, strategy }, stopTimer());
+    metrics.contextDuration.observe({ namespace: safeNamespaceLabel(core.config.namespace), strategy }, stopTimer());
     return 'No relevant context found.';
   }
 
@@ -478,7 +478,7 @@ export async function getContext(
     [...allEdges.values()],
     { maxTokens: opts.maxTokens ?? 2000 },
   );
-  metrics.contextDuration.observe({ namespace: core.config.namespace, strategy }, stopTimer());
+  metrics.contextDuration.observe({ namespace: safeNamespaceLabel(core.config.namespace), strategy }, stopTimer());
   return out;
 }
 

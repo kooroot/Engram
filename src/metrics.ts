@@ -5,6 +5,30 @@
 
 type LabelValues = Record<string, string>;
 
+/**
+ * Global namespace allowlist for metric labels.
+ * H-B2: untrusted namespace input must not explode Prometheus cardinality.
+ * Unrecognized namespaces collapse to `_other`.
+ */
+let namespaceAllowlist: Set<string> | null = null;
+
+export function setNamespaceAllowlist(names: string[] | null): void {
+  namespaceAllowlist = names ? new Set(names) : null;
+}
+
+export function safeNamespaceLabel(ns: string): string {
+  if (!namespaceAllowlist) return ns; // unrestricted mode (single-tenant)
+  return namespaceAllowlist.has(ns) ? ns : '_other';
+}
+
+// Initialize from env at module load
+{
+  const raw = process.env['ENGRAM_METRIC_NAMESPACES'];
+  if (raw) {
+    setNamespaceAllowlist(raw.split(',').map(s => s.trim()).filter(Boolean));
+  }
+}
+
 interface CounterEntry { labels: LabelValues; value: number }
 interface HistogramEntry { labels: LabelValues; buckets: Map<number, number>; sum: number; count: number }
 

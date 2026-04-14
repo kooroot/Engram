@@ -61,6 +61,12 @@ async function resolveClientKey(
   return 'anon';
 }
 
+function parseAllowlist(raw: string | undefined): Set<string> | null {
+  if (!raw) return null;
+  const list = raw.split(',').map(s => s.trim()).filter(Boolean);
+  return list.length > 0 ? new Set(list) : null;
+}
+
 /** Normalize /api/nodes/01HXYZ to /api/nodes/:id for metric cardinality */
 function normalizePath(path: string): string {
   return path
@@ -106,9 +112,45 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
   const app = new Hono();
   const allowPerRequest = opts.allowPerRequestNamespace ?? true;
 
-  // Per-namespace core cache (reused across requests for same namespace)
+  // H-B3: Bounded LRU cache for per-request namespace cores.
+  // Eviction closes the DB connection so descriptors/memory stay capped.
+  const CORE_CACHE_MAX = Number(process.env['ENGRAM_CORE_CACHE_SIZE']) || 32;
+  const namespaceAllowlist = parseAllowlist(process.env['ENGRAM_NAMESPACE_ALLOWLIST']);
   const coreCache = new Map<string, EngramCore>();
   coreCache.set(defaultCore.config.namespace, defaultCore);
+
+  function touchLru(ns: string, core: EngramCore): void {
+    // Map iteration order is insertion order; delete+set moves to end
+    coreCache.delete(ns);
+    coreCache.set(ns, core);
+  }
+
+  function getOrCreateCore(ns: string): EngramCore {
+    const existing = coreCache.get(ns);
+    if (existing) {
+      touchLru(ns, existing);
+      return existing;
+    }
+
+    // Namespace allowlist enforcement
+    if (namespaceAllowlist && !namespaceAllowlist.has(ns)) {
+      throw new Error(`Namespace '${ns}' is not in the allowlist`);
+    }
+
+    // Evict oldest non-default entry when at capacity
+    if (coreCache.size >= CORE_CACHE_MAX) {
+      for (const [key, core] of coreCache) {
+        if (key === defaultCore.config.namespace) continue;
+        coreCache.delete(key);
+        try { core.close(); } catch { /* ignore */ }
+        break;
+      }
+    }
+
+    const core = createEngramCore({ namespace: ns });
+    coreCache.set(ns, core);
+    return core;
+  }
 
   /** Resolve which EngramCore to use for this request */
   function resolveCore(c: any): EngramCore {
@@ -126,12 +168,7 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
       throw new Error('Invalid namespace format');
     }
 
-    let cached = coreCache.get(requested);
-    if (!cached) {
-      cached = createEngramCore({ namespace: requested });
-      coreCache.set(requested, cached);
-    }
-    return cached;
+    return getOrCreateCore(requested);
   }
 
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
@@ -364,17 +401,18 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
     }
 
     const targetNs = body.targetNamespace ?? (body.bundle as any).namespace;
-    // Import writes go into the namespaced core — resolve explicitly
-    const targetCore = (() => {
-      if (!targetNs || targetNs === defaultCore.config.namespace) return defaultCore;
-      if (!validateNamespace(targetNs)) throw new Error('Invalid target namespace format');
-      let cached = coreCache.get(targetNs);
-      if (!cached) {
-        cached = createEngramCore({ namespace: targetNs });
-        coreCache.set(targetNs, cached);
+    let targetCore: EngramCore;
+    try {
+      if (!targetNs || targetNs === defaultCore.config.namespace) {
+        targetCore = defaultCore;
+      } else if (!validateNamespace(targetNs)) {
+        return c.json({ error: 'Invalid target namespace format' }, 400);
+      } else {
+        targetCore = getOrCreateCore(targetNs);
       }
-      return cached;
-    })();
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
 
     try {
       const result = svc.importBundle(targetCore, body.bundle as unknown as svc.ExportBundle, {

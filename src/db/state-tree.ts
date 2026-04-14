@@ -12,7 +12,7 @@ import type {
 } from '../types/index.js';
 import { nodeFromRow, edgeFromRow } from '../types/index.js';
 import { safeJsonParse } from '../utils.js';
-import { metrics, startTimer } from '../metrics.js';
+import { metrics, startTimer, safeNamespaceLabel } from '../metrics.js';
 import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
@@ -315,8 +315,8 @@ export class StateTree {
 
     this.fireCallbacks(affectedNodeIds);
 
-    metrics.mutations.inc({ namespace: this.namespace, kind: 'node' }, operations.length);
-    metrics.mutationDuration.observe({ namespace: this.namespace, kind: 'node' }, stopTimer());
+    metrics.mutations.inc({ namespace: safeNamespaceLabel(this.namespace), kind: 'node' }, operations.length);
+    metrics.mutationDuration.observe({ namespace: safeNamespaceLabel(this.namespace), kind: 'node' }, stopTimer());
 
     return { results, event_id: event.id };
   }
@@ -452,8 +452,8 @@ export class StateTree {
       this.fireCallbacks([...affectedNodeIds]);
     }
 
-    metrics.mutations.inc({ namespace: this.namespace, kind: 'edge' }, operations.length);
-    metrics.mutationDuration.observe({ namespace: this.namespace, kind: 'edge' }, stopTimer());
+    metrics.mutations.inc({ namespace: safeNamespaceLabel(this.namespace), kind: 'edge' }, operations.length);
+    metrics.mutationDuration.observe({ namespace: safeNamespaceLabel(this.namespace), kind: 'edge' }, stopTimer());
 
     return { results, event_id: event.id };
   }
