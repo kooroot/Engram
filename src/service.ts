@@ -19,6 +19,8 @@ import type { EmbeddingProvider } from './embeddings/index.js';
 import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
 import { LocalEmbeddingProvider } from './embeddings/local.js';
 import { safeJsonParse } from './utils.js';
+import { metrics, startTimer } from './metrics.js';
+import { log } from './logger.js';
 
 export { exportNamespace, importBundle } from './port.js';
 export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from './port.js';
@@ -131,7 +133,6 @@ export function createEngramCore(
     // sqlite-vec not available — vector search disabled, graph queries still work
   }
 
-  // BUG-B fix: Register auto-embedding hook in shared layer, not just server.ts
   if (embeddingProvider && vectorStore.isVecEnabled && !options.disableAutoEmbed) {
     stateTree.onMutate(async (nodeIds) => {
       for (const nodeId of nodeIds) {
@@ -142,8 +143,10 @@ export function createEngramCore(
           const embedding = await embeddingProvider.embed(text);
           vectorStore.removeBySource('node', nodeId);
           vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
+          metrics.embeddings.inc({ namespace: ns });
         } catch (err) {
-          console.error('[auto-embed] failed for node', nodeId, err);
+          metrics.embeddingFailures.inc({ namespace: ns });
+          log.warn('auto-embed failed', { namespace: ns, node_id: nodeId, error: String(err) });
         }
       }
     });
@@ -426,6 +429,8 @@ export async function getContext(
   },
 ): Promise<string> {
   const strategy: ContextStrategy = opts.strategy ?? 'hybrid';
+  const stopTimer = startTimer();
+  metrics.contextRequests.inc({ namespace: core.config.namespace, strategy });
   const allNodes = new Map<string, Node>();
   const allEdges = new Map<string, Edge>();
 
@@ -463,13 +468,18 @@ export async function getContext(
     }
   }
 
-  if (allNodes.size === 0) return 'No relevant context found.';
+  if (allNodes.size === 0) {
+    metrics.contextDuration.observe({ namespace: core.config.namespace, strategy }, stopTimer());
+    return 'No relevant context found.';
+  }
 
-  return buildContext(
+  const out = buildContext(
     [...allNodes.values()],
     [...allEdges.values()],
     { maxTokens: opts.maxTokens ?? 2000 },
   );
+  metrics.contextDuration.observe({ namespace: core.config.namespace, strategy }, stopTimer());
+  return out;
 }
 
 function expand(

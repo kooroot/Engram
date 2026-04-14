@@ -4,6 +4,8 @@ import { z } from 'zod';
 import type { EngramCore } from '../service.js';
 import { createEngramCore } from '../service.js';
 import * as svc from '../service.js';
+import { metrics, renderMetrics, startTimer } from '../metrics.js';
+import { log, newRequestId } from '../logger.js';
 
 const VALID_EVENT_TYPES = ['observation', 'action', 'mutation', 'query', 'system'] as const;
 
@@ -22,6 +24,14 @@ function safeInt(val: string | undefined, fallback: number): number {
 
 function validateNamespace(ns: string): boolean {
   return /^[a-zA-Z0-9_\-.]+$/.test(ns) && ns.length >= 1 && ns.length <= 64;
+}
+
+/** Normalize /api/nodes/01HXYZ to /api/nodes/:id for metric cardinality */
+function normalizePath(path: string): string {
+  return path
+    .replace(/\/api\/nodes\/[^/]+/, '/api/nodes/:id')
+    .replace(/\/api\/edges\/[^/]+/, '/api/edges/:nodeId')
+    .replace(/\/api\/history\/[^/]+/, '/api/history/:nodeId');
 }
 
 export interface ApiOptions {
@@ -63,6 +73,37 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
 
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
   app.use('*', cors({ origin: corsOrigin }));
+
+  // Request logging + metrics
+  app.use('*', async (c, next) => {
+    const requestId = newRequestId();
+    const stop = startTimer();
+    const method = c.req.method;
+    const path = c.req.path;
+
+    c.header('X-Request-ID', requestId);
+    await next();
+
+    const duration = stop();
+    const status = c.res.status;
+    const labels = { method, path: normalizePath(path), status: String(status) };
+
+    metrics.apiRequests.inc(labels);
+    metrics.apiDuration.observe(labels, duration);
+    if (status >= 400) metrics.apiErrors.inc(labels);
+
+    log.info('http', { requestId, method, path, status, duration_ms: Math.round(duration * 1000) });
+  });
+
+  // ─── Metrics ───────────────────────────────────
+
+  app.get('/api/metrics', (c) => {
+    return c.text(renderMetrics(), 200, { 'Content-Type': 'text/plain; version=0.0.4' });
+  });
+
+  app.get('/api/health', (c) => {
+    return c.json({ status: 'ok', version: '0.1.0' });
+  });
 
   // ─── Status ────────────────────────────────────
 

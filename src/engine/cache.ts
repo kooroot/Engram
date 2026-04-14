@@ -1,4 +1,5 @@
 import type { Node } from '../types/index.js';
+import { metrics } from '../metrics.js';
 
 export interface CacheConfig {
   maxNodes: number;
@@ -46,13 +47,18 @@ export class EngineCache {
 
   getNode(id: string): Node | null {
     const cached = this.nodeCache.get(id);
-    if (!cached) return null;
-
-    if (Date.now() - cached.cachedAt > this.config.nodeTTLMs) {
-      this.nodeCache.delete(id);
+    if (!cached) {
+      metrics.cacheMisses.inc({ kind: 'node' });
       return null;
     }
 
+    if (Date.now() - cached.cachedAt > this.config.nodeTTLMs) {
+      this.nodeCache.delete(id);
+      metrics.cacheMisses.inc({ kind: 'node' });
+      return null;
+    }
+
+    metrics.cacheHits.inc({ kind: 'node' });
     return cached.node;
   }
 
@@ -80,13 +86,18 @@ export class EngineCache {
 
   getContext(key: string): string | null {
     const cached = this.contextCache.get(key);
-    if (!cached) return null;
-
-    if (Date.now() - cached.cachedAt > this.config.contextTTLMs) {
-      this.contextCache.delete(key);
+    if (!cached) {
+      metrics.cacheMisses.inc({ kind: 'context' });
       return null;
     }
 
+    if (Date.now() - cached.cachedAt > this.config.contextTTLMs) {
+      this.contextCache.delete(key);
+      metrics.cacheMisses.inc({ kind: 'context' });
+      return null;
+    }
+
+    metrics.cacheHits.inc({ kind: 'context' });
     return cached.result;
   }
 
