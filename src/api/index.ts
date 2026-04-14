@@ -6,6 +6,7 @@ import { createEngramCore } from '../service.js';
 import * as svc from '../service.js';
 import { metrics, renderMetrics, startTimer } from '../metrics.js';
 import { log, newRequestId } from '../logger.js';
+import { RateLimiter, type RateLimitConfig } from '../rate-limit.js';
 
 const VALID_EVENT_TYPES = ['observation', 'action', 'mutation', 'query', 'system'] as const;
 
@@ -37,6 +38,18 @@ function normalizePath(path: string): string {
 export interface ApiOptions {
   /** If true, allow ?namespace= or X-Engram-Namespace header to override default core */
   allowPerRequestNamespace?: boolean;
+  /** Rate limit config (overrides env). Set to `false` to disable. */
+  rateLimit?: RateLimitConfig | false;
+}
+
+/** Extract rate limit config from env vars */
+function envRateLimit(): RateLimitConfig | false {
+  if (process.env['ENGRAM_RATE_LIMIT'] === 'off') return false;
+  return {
+    burst: Number(process.env['ENGRAM_RATE_BURST'] ?? 60),
+    refillPerSecond: Number(process.env['ENGRAM_RATE_PER_SEC'] ?? 10),
+    idleTimeoutMs: 300_000,
+  };
 }
 
 export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono {
@@ -73,6 +86,36 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
 
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
   app.use('*', cors({ origin: corsOrigin }));
+
+  // Rate limiting (per remote address)
+  const rlConfig = opts.rateLimit ?? envRateLimit();
+  const limiter = rlConfig === false ? null : new RateLimiter(rlConfig);
+
+  if (limiter) {
+    app.use('*', async (c, next) => {
+      // Skip health & metrics endpoints (monitoring shouldn't trigger limits)
+      if (c.req.path === '/api/health' || c.req.path === '/api/metrics') {
+        return next();
+      }
+
+      // Identify client: auth token > forwarded-for > unknown
+      const authHeader = c.req.header('authorization') ?? '';
+      const fwd = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
+      const key = authHeader.startsWith('Bearer ')
+        ? `token:${authHeader.slice(7, 20)}` // fingerprint, don't log full token
+        : fwd ?? 'anon';
+
+      const { allowed, retryAfterMs } = limiter.tryConsume(key);
+      if (!allowed) {
+        c.header('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
+        c.header('X-RateLimit-Burst', String(limiter.config.burst));
+        c.header('X-RateLimit-Refill-Per-Sec', String(limiter.config.refillPerSecond));
+        return c.json({ error: 'Too many requests', retry_after_ms: retryAfterMs }, 429);
+      }
+
+      return next();
+    });
+  }
 
   // Request logging + metrics
   app.use('*', async (c, next) => {
