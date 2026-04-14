@@ -130,14 +130,16 @@ export function registerCLICommands(program: Command): void {
     .description('Get context for a topic (same as get_context tool)')
     .option('-e, --entities <items>', 'Comma-separated entity names', '')
     .option('-m, --max-tokens <n>', 'Token budget', '2000')
-    .action((topic, opts) => withCore((core) => {
+    .option('-s, --strategy <strategy>', 'graph | semantic | hybrid', 'hybrid')
+    .action((topic, opts) => withCore(async (core) => {
       const entities = opts.entities
         ? opts.entities.split(',').map((s: string) => s.trim()).filter(Boolean)
         : undefined;
-      const context = svc.getContext(core, {
+      const context = await svc.getContext(core, {
         topic,
         entities,
         maxTokens: safeInt(opts.maxTokens, 2000),
+        strategy: opts.strategy as svc.ContextStrategy,
       });
       console.log(context);
     })());

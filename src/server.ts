@@ -1,23 +1,18 @@
-import { createRequire } from 'node:module';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { Config } from './config/index.js';
-import { initMainDb, initVecDb } from './db/index.js';
-import { EventLog } from './db/event-log.js';
-import { StateTree } from './db/state-tree.js';
-import { VectorStore } from './db/vector-store.js';
-import { EngineCache } from './engine/cache.js';
+import { createEngramCore, type EngramCore } from './service.js';
 import { registerAllTools } from './tools/index.js';
 import type { EmbeddingProvider } from './embeddings/index.js';
-import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
-import { LocalEmbeddingProvider } from './embeddings/local.js';
 
 export interface EngramServer {
   mcpServer: McpServer;
-  eventLog: EventLog;
-  stateTree: StateTree;
-  vectorStore: VectorStore;
-  cache: EngineCache;
-  embeddingProvider: EmbeddingProvider | null;
+  core: EngramCore;
+  // Direct access for tests and advanced integration (forwards from core)
+  eventLog: EngramCore['eventLog'];
+  stateTree: EngramCore['stateTree'];
+  vectorStore: EngramCore['vectorStore'];
+  cache: EngramCore['cache'];
+  embeddingProvider: EngramCore['embeddingProvider'];
   close(): void;
 }
 
@@ -25,60 +20,13 @@ export interface CreateServerOptions {
   embeddingProvider?: EmbeddingProvider;
 }
 
-function resolveEmbeddingProvider(
-  config: Config,
-  override?: EmbeddingProvider,
-): EmbeddingProvider | null {
-  if (override) return override;
-
-  switch (config.embedding.provider) {
-    case 'openai':
-      return new OpenAIEmbeddingProvider({
-        apiKey: config.embedding.apiKey,
-        model: config.embedding.model,
-        dimension: config.embedding.dimension,
-        baseUrl: config.embedding.baseUrl,
-      });
-    case 'local':
-      return new LocalEmbeddingProvider(config.embedding.dimension);
-    case 'none':
-    default:
-      // Auto-detect: if OPENAI_API_KEY is set, use OpenAI
-      if (config.embedding.apiKey) {
-        return new OpenAIEmbeddingProvider({
-          apiKey: config.embedding.apiKey,
-          model: config.embedding.model,
-          dimension: config.embedding.dimension,
-          baseUrl: config.embedding.baseUrl,
-        });
-      }
-      return null;
-  }
-}
-
 export function createEngramServer(
   config: Config,
   options: CreateServerOptions = {},
 ): EngramServer {
-  const mainDb = initMainDb(config);
-  const vecDb = initVecDb(config);
-
-  const eventLog = new EventLog(mainDb.db);
-  const stateTree = new StateTree(mainDb.db, eventLog);
-  const embeddingProvider = resolveEmbeddingProvider(config, options.embeddingProvider);
-  const vectorStore = new VectorStore(vecDb.db, embeddingProvider?.dimension ?? config.embedding.dimension);
-  const cache = new EngineCache(config.cache);
-
-  // C1 fix: Use createRequire for ESM compatibility with native addons
-  try {
-    const require = createRequire(import.meta.url);
-    const sqliteVec = require('sqlite-vec') as { load: (db: any) => void };
-    vectorStore.enableVec(sqliteVec.load);
-  } catch {
-    // sqlite-vec not available — vector search disabled, graph queries still work
-  }
-
-  const hasSemanticSearch = embeddingProvider !== null && vectorStore.isVecEnabled;
+  // Reuse the shared core factory — embedding, vec, auto-embed hook all handled there
+  const core = createEngramCore(config, { embeddingProvider: options.embeddingProvider });
+  const hasSemanticSearch = core.embeddingProvider !== null && core.vectorStore.isVecEnabled;
 
   const mcpServer = new McpServer(
     {
@@ -113,37 +61,25 @@ export function createEngramServer(
     },
   );
 
-  registerAllTools(mcpServer, eventLog, stateTree, vectorStore, cache, embeddingProvider);
-
-  // Auto-embed nodes on mutation (if embedding provider available)
-  if (embeddingProvider && vectorStore.isVecEnabled) {
-    stateTree.onMutate(async (nodeIds) => {
-      for (const nodeId of nodeIds) {
-        const node = stateTree.getNode(nodeId);
-        if (!node) continue; // deleted
-
-        const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
-        try {
-          const embedding = await embeddingProvider.embed(text);
-          vectorStore.removeBySource('node', nodeId);
-          vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
-        } catch {
-          // Embedding failure is non-fatal
-        }
-      }
-    });
-  }
+  registerAllTools(
+    mcpServer,
+    core.eventLog,
+    core.stateTree,
+    core.vectorStore,
+    core.cache,
+    core.embeddingProvider,
+  );
 
   return {
     mcpServer,
-    eventLog,
-    stateTree,
-    vectorStore,
-    cache,
-    embeddingProvider,
+    core,
+    eventLog: core.eventLog,
+    stateTree: core.stateTree,
+    vectorStore: core.vectorStore,
+    cache: core.cache,
+    embeddingProvider: core.embeddingProvider,
     close() {
-      mainDb.close();
-      vecDb.close();
+      core.close();
     },
   };
 }

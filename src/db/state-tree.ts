@@ -16,8 +16,12 @@ import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
 
-/** Callback invoked after a successful mutation with affected node IDs */
-export type MutationCallback = (nodeIds: string[]) => void;
+/**
+ * Callback invoked after a successful mutation with affected node IDs.
+ * May be async — returned promises are awaited in the background (fire-and-forget).
+ * Errors are logged but do not propagate.
+ */
+export type MutationCallback = (nodeIds: string[]) => void | Promise<void>;
 
 export class StateTree {
   // Node statements
@@ -45,6 +49,8 @@ export class StateTree {
 
   // Post-mutation callbacks (for cache invalidation, auto-embedding, etc.)
   private onMutateCallbacks: MutationCallback[] = [];
+  // Track in-flight async callbacks so callers can drain before close
+  private pendingCallbacks: Set<Promise<void>> = new Set();
 
   constructor(
     private db: Database.Database,
@@ -290,10 +296,8 @@ export class StateTree {
       updateHistoryRef.run(event.id, nodeId);
     }
 
-    // Phase 4: Fire callbacks
-    for (const cb of this.onMutateCallbacks) {
-      cb(affectedNodeIds);
-    }
+    // Fire callbacks (tracked so callers can drain before close)
+    this.fireCallbacks(affectedNodeIds);
 
     return { results, event_id: event.id };
   }
@@ -399,16 +403,55 @@ export class StateTree {
       state_ref: affectedEdgeIds,
     });
 
-    // Update event_id on edges
+    // Update event_id on edges + collect affected node IDs for callback
     const updateEdgeRef = this.db.prepare('UPDATE edges SET event_id = ? WHERE id = ?');
+    const affectedNodeIds = new Set<string>();
     for (const edgeId of affectedEdgeIds) {
       const exists = this.getEdgeByIdStmt.get(edgeId) as EdgeRow | undefined;
       if (exists) {
         updateEdgeRef.run(event.id, edgeId);
+        affectedNodeIds.add(exists.source_id);
+        affectedNodeIds.add(exists.target_id);
       }
     }
 
+    // Fire callbacks for both endpoint nodes (for cache invalidation, etc.)
+    if (affectedNodeIds.size > 0) {
+      this.fireCallbacks([...affectedNodeIds]);
+    }
+
     return { results, event_id: event.id };
+  }
+
+  /**
+   * Fire onMutate callbacks in a tracked way.
+   * Async returns are added to pendingCallbacks so callers can drain.
+   * Errors are logged but do not propagate.
+   */
+  private fireCallbacks(nodeIds: string[]): void {
+    for (const cb of this.onMutateCallbacks) {
+      try {
+        const maybePromise = cb(nodeIds);
+        if (maybePromise instanceof Promise) {
+          const tracked = maybePromise
+            .catch(err => { console.error('[StateTree] onMutate callback error:', err); })
+            .finally(() => { this.pendingCallbacks.delete(tracked); });
+          this.pendingCallbacks.add(tracked);
+        }
+      } catch (err) {
+        console.error('[StateTree] onMutate callback error:', err);
+      }
+    }
+  }
+
+  /**
+   * Wait for all in-flight onMutate callbacks to complete.
+   * Call before closing the DB to ensure async work (e.g., auto-embedding) finishes.
+   */
+  async drainCallbacks(): Promise<void> {
+    while (this.pendingCallbacks.size > 0) {
+      await Promise.allSettled([...this.pendingCallbacks]);
+    }
   }
 }
 

@@ -11,6 +11,7 @@ const contextBodySchema = z.object({
   topic: z.string().max(1000).optional(),
   entities: z.array(z.string().max(512)).max(20).optional(),
   max_tokens: z.number().min(100).max(8000).optional(),
+  strategy: z.enum(['graph', 'semantic', 'hybrid']).optional(),
 });
 
 /** Parse int with fallback — M2 fix */
@@ -97,10 +98,11 @@ export function createApp(core: EngramCore): Hono {
       return c.json({ error: message }, 400);
     }
 
-    const context = svc.getContext(core, {
+    const context = await svc.getContext(core, {
       topic: body.topic,
       entities: body.entities,
       maxTokens: body.max_tokens,
+      strategy: body.strategy,
     });
     return c.json({ context });
   });

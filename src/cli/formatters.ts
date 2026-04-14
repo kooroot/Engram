@@ -26,6 +26,9 @@ export function formatTable(headers: string[], rows: string[][]): string {
 // ─── Status ──────────────────────────────────────────────
 
 export function formatStatus(status: StatusInfo): string {
+  const semantic = status.semanticEnabled
+    ? chalk.green('enabled')
+    : chalk.dim('disabled');
   const lines = [
     chalk.bold('Engram Status'),
     chalk.dim('─'.repeat(40)),
@@ -33,6 +36,7 @@ export function formatStatus(status: StatusInfo): string {
     `  Nodes (archived) ${chalk.dim(String(status.archivedNodes))}`,
     `  Edges            ${chalk.green(String(status.activeEdges))}`,
     `  Events           ${chalk.blue(String(status.totalEvents))}`,
+    `  Semantic search  ${semantic}`,
     chalk.dim('─'.repeat(40)),
     `  Data dir         ${chalk.dim(status.dataDir)}`,
   ];

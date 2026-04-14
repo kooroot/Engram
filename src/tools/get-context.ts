@@ -137,11 +137,15 @@ function findNodesByKeywords(stateTree: StateTree, keywords: string[]): Node[] {
 
   for (const node of allActive) {
     const nameLower = node.name.toLowerCase();
+    const typeLower = node.type.toLowerCase();
     const summaryLower = (node.summary ?? '').toLowerCase();
     const propsStr = JSON.stringify(node.properties).toLowerCase();
 
     if (keywords.some(kw =>
-      nameLower.includes(kw) || summaryLower.includes(kw) || propsStr.includes(kw)
+      nameLower.includes(kw) ||
+      typeLower.includes(kw) ||
+      summaryLower.includes(kw) ||
+      propsStr.includes(kw)
     )) {
       results.push(node);
     }

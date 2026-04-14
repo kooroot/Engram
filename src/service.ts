@@ -1,8 +1,9 @@
 /**
- * Shared service layer — used by both CLI and REST API.
+ * Shared service layer — used by both CLI and REST API (and indirectly by MCP server).
  * Wraps core classes with query operations for human-facing interfaces.
  */
 import type Database from 'better-sqlite3';
+import { createRequire } from 'node:module';
 import type { Config } from './config/index.js';
 import { loadConfig } from './config/index.js';
 import { initMainDb, initVecDb, type DatabaseConnection } from './db/index.js';
@@ -14,6 +15,9 @@ import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/
 import { traverseGraph } from './engine/graph-traversal.js';
 import { buildContext } from './engine/context-builder.js';
 import type { Node, Edge, Event, EventType } from './types/index.js';
+import type { EmbeddingProvider } from './embeddings/index.js';
+import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
+import { LocalEmbeddingProvider } from './embeddings/local.js';
 import { safeJsonParse } from './utils.js';
 
 export interface EngramCore {
@@ -25,18 +29,100 @@ export interface EngramCore {
   stateTree: StateTree;
   vectorStore: VectorStore;
   cache: EngineCache;
+  embeddingProvider: EmbeddingProvider | null;
+  /** Synchronous close — does NOT wait for pending async callbacks */
   close(): void;
+  /** Wait for all pending async callbacks (auto-embeds) then close */
+  closeAsync(): Promise<void>;
 }
 
-export function createEngramCore(configOverrides: Partial<Config> = {}): EngramCore {
+export interface CreateCoreOptions {
+  embeddingProvider?: EmbeddingProvider;
+  disableAutoEmbed?: boolean;
+}
+
+/**
+ * Resolve embedding provider from config (or override).
+ * Auto-detects OpenAI if OPENAI_API_KEY is set and provider is 'none'.
+ */
+export function resolveEmbeddingProvider(
+  config: Config,
+  override?: EmbeddingProvider,
+): EmbeddingProvider | null {
+  if (override) return override;
+
+  switch (config.embedding.provider) {
+    case 'openai':
+      return new OpenAIEmbeddingProvider({
+        apiKey: config.embedding.apiKey,
+        model: config.embedding.model,
+        dimension: config.embedding.dimension,
+        baseUrl: config.embedding.baseUrl,
+      });
+    case 'local':
+      return new LocalEmbeddingProvider(config.embedding.dimension);
+    case 'none':
+    default:
+      if (config.embedding.apiKey) {
+        return new OpenAIEmbeddingProvider({
+          apiKey: config.embedding.apiKey,
+          model: config.embedding.model,
+          dimension: config.embedding.dimension,
+          baseUrl: config.embedding.baseUrl,
+        });
+      }
+      return null;
+  }
+}
+
+/**
+ * Factory used by CLI, REST, and MCP server alike.
+ * Handles: DB initialization, embedding provider resolution, sqlite-vec loading,
+ * and optional auto-embedding hook registration.
+ */
+export function createEngramCore(
+  configOverrides: Partial<Config> = {},
+  options: CreateCoreOptions = {},
+): EngramCore {
   const config = loadConfig(configOverrides);
   const mainDb = initMainDb(config);
   const vecDb = initVecDb(config);
 
   const eventLog = new EventLog(mainDb.db);
   const stateTree = new StateTree(mainDb.db, eventLog);
-  const vectorStore = new VectorStore(vecDb.db);
+  const embeddingProvider = resolveEmbeddingProvider(config, options.embeddingProvider);
+
+  // BUG-A fix: Pass dimension from provider or config
+  const dim = embeddingProvider?.dimension ?? config.embedding.dimension;
+  const vectorStore = new VectorStore(vecDb.db, dim);
   const cache = new EngineCache(config.cache);
+
+  // Enable sqlite-vec (single source of truth; removed duplication from server.ts)
+  try {
+    const require = createRequire(import.meta.url);
+    const sqliteVec = require('sqlite-vec') as { load: (db: any) => void };
+    vectorStore.enableVec(sqliteVec.load);
+  } catch {
+    // sqlite-vec not available — vector search disabled, graph queries still work
+  }
+
+  // BUG-B fix: Register auto-embedding hook in shared layer, not just server.ts
+  if (embeddingProvider && vectorStore.isVecEnabled && !options.disableAutoEmbed) {
+    stateTree.onMutate(async (nodeIds) => {
+      for (const nodeId of nodeIds) {
+        const node = stateTree.getNode(nodeId);
+        if (!node) continue;
+        const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+        try {
+          const embedding = await embeddingProvider.embed(text);
+          vectorStore.removeBySource('node', nodeId);
+          vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
+        } catch (err) {
+          console.error('[auto-embed] failed for node', nodeId, err);
+        }
+      }
+    });
+  }
 
   return {
     config,
@@ -47,7 +133,13 @@ export function createEngramCore(configOverrides: Partial<Config> = {}): EngramC
     stateTree,
     vectorStore,
     cache,
+    embeddingProvider,
     close() {
+      mainDb.close();
+      vecDb.close();
+    },
+    async closeAsync() {
+      await stateTree.drainCallbacks();
       mainDb.close();
       vecDb.close();
     },
@@ -62,6 +154,7 @@ export interface StatusInfo {
   activeEdges: number;
   totalEvents: number;
   dataDir: string;
+  semanticEnabled: boolean;
 }
 
 export function getStatus(core: EngramCore): StatusInfo {
@@ -69,6 +162,7 @@ export function getStatus(core: EngramCore): StatusInfo {
   return {
     ...stats,
     dataDir: core.config.dataDir,
+    semanticEnabled: core.embeddingProvider !== null && core.vectorStore.isVecEnabled,
   };
 }
 
@@ -160,17 +254,47 @@ export function searchNodes(
 
   for (const node of allActive) {
     const nameLower = node.name.toLowerCase();
+    const typeLower = node.type.toLowerCase();
     const summaryLower = (node.summary ?? '').toLowerCase();
     const propsStr = JSON.stringify(node.properties).toLowerCase();
 
     if (keywords.some(kw =>
-      nameLower.includes(kw) || summaryLower.includes(kw) || propsStr.includes(kw)
+      nameLower.includes(kw) ||
+      typeLower.includes(kw) ||
+      summaryLower.includes(kw) ||
+      propsStr.includes(kw)
     )) {
       results.push(node);
     }
   }
 
   return results.slice(0, limit);
+}
+
+/**
+ * Semantic search using vector embeddings.
+ * Returns [] if embedding provider or sqlite-vec not available.
+ */
+export async function semanticSearch(
+  core: EngramCore,
+  query: string,
+  limit: number = 5,
+): Promise<Node[]> {
+  if (!core.embeddingProvider || !core.vectorStore.isVecEnabled) return [];
+
+  const embedding = await core.embeddingProvider.embed(query);
+  const vecResults = core.vectorStore.search({
+    embedding,
+    limit,
+    sourceType: 'node',
+  });
+
+  const nodes: Node[] = [];
+  for (const r of vecResults) {
+    const node = core.stateTree.getNode(r.source_id);
+    if (node && !node.archived) nodes.push(node);
+  }
+  return nodes;
 }
 
 // ─── Events ──────────────────────────────────────────────
@@ -224,13 +348,25 @@ export function getNodeHistory(
 
 // ─── Context ─────────────────────────────────────────────
 
-export function getContext(
+export type ContextStrategy = 'graph' | 'semantic' | 'hybrid';
+
+/**
+ * BUG-C fix: Now supports semantic/hybrid strategy via embedding + vector store.
+ */
+export async function getContext(
   core: EngramCore,
-  opts: { topic?: string; entities?: string[]; maxTokens?: number },
-): string {
+  opts: {
+    topic?: string;
+    entities?: string[];
+    maxTokens?: number;
+    strategy?: ContextStrategy;
+  },
+): Promise<string> {
+  const strategy: ContextStrategy = opts.strategy ?? 'hybrid';
   const allNodes = new Map<string, Node>();
   const allEdges = new Map<string, Edge>();
 
+  // Direct entity resolution
   if (opts.entities) {
     for (const entity of opts.entities) {
       const node = core.stateTree.getNode(entity)
@@ -242,12 +378,25 @@ export function getContext(
     }
   }
 
-  if (opts.topic) {
-    const keywords = opts.topic.toLowerCase().split(/\s+/);
+  // Graph keyword search
+  if (opts.topic && (strategy === 'graph' || strategy === 'hybrid')) {
     const candidates = searchNodes(core, opts.topic, 20);
     for (const node of candidates) {
       allNodes.set(node.id, node);
       expand(core, node.id, allNodes, allEdges);
+    }
+  }
+
+  // Semantic vector search
+  if (opts.topic && (strategy === 'semantic' || strategy === 'hybrid')) {
+    try {
+      const semantic = await semanticSearch(core, opts.topic, 10);
+      for (const node of semantic) {
+        allNodes.set(node.id, node);
+        expand(core, node.id, allNodes, allEdges);
+      }
+    } catch {
+      // Semantic search failed — fall back to graph results only
     }
   }
 
@@ -291,4 +440,3 @@ export function runMaintenanceCycle(
   const statsAfter = getStatus(core);
   return { ...report, ...statsAfter };
 }
-
