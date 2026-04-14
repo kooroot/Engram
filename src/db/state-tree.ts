@@ -217,6 +217,7 @@ export class StateTree {
     const stopTimer = startTimer();
     const results: MutationResult[] = [];
     const affectedNodeIds: string[] = [];
+    const historyRowIds: Array<number | bigint> = []; // M8: track exact history rows to attach event_id to
 
     const mutationTxn = this.db.transaction(() => {
       for (const op of operations) {
@@ -243,13 +244,14 @@ export class StateTree {
               throw new Error(`Node not found: ${op.node_id}`);
             }
 
-            this.insertHistoryStmt.run({
+            const histResult = this.insertHistoryStmt.run({
               node_id: existing.id,
               version: existing.version,
               properties: existing.properties,
               changed_by: null,
               namespace: this.namespace,
             });
+            historyRowIds.push(histResult.lastInsertRowid);
 
             const currentProps = safeJsonParse(existing.properties);
             if (op.set) Object.assign(currentProps, op.set);
@@ -274,13 +276,14 @@ export class StateTree {
             if (!toDelete) {
               throw new Error(`Node not found: ${op.node_id}`);
             }
-            this.insertHistoryStmt.run({
+            const histResult = this.insertHistoryStmt.run({
               node_id: toDelete.id,
               version: toDelete.version,
               properties: toDelete.properties,
               changed_by: null,
               namespace: this.namespace,
             });
+            historyRowIds.push(histResult.lastInsertRowid);
             this.deleteNodeStmt.run(op.node_id, this.namespace);
             results.push({ op: 'delete', node_id: op.node_id, version: toDelete.version });
             affectedNodeIds.push(op.node_id);
@@ -302,15 +305,18 @@ export class StateTree {
     const updateEventRef = this.db.prepare(
       'UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?'
     );
-    const updateHistoryRef = this.db.prepare(
-      'UPDATE node_history SET changed_by = ? WHERE node_id = ? AND namespace = ? AND changed_by IS NULL'
+    // M8: update only THIS mutation's history rows, by exact rowid
+    const updateHistoryById = this.db.prepare(
+      'UPDATE node_history SET changed_by = ? WHERE id = ?'
     );
     for (const nodeId of affectedNodeIds) {
       const exists = this.getNodeByIdStmt.get(nodeId, this.namespace) as NodeRow | undefined;
       if (exists) {
         updateEventRef.run(event.id, nodeId, this.namespace);
       }
-      updateHistoryRef.run(event.id, nodeId, this.namespace);
+    }
+    for (const rowid of historyRowIds) {
+      updateHistoryById.run(event.id, rowid);
     }
 
     this.fireCallbacks(affectedNodeIds);
@@ -507,16 +513,18 @@ export class StateTree {
 
     let mergedEdges = 0;
     let dedupEdges = 0;
+    let historyRowId: number | bigint = 0;
 
     const txn = this.db.transaction(() => {
-      // 1. Snapshot target before merge
-      this.insertHistoryStmt.run({
+      // 1. Snapshot target before merge (M8: track rowid for exact attach later)
+      const histResult = this.insertHistoryStmt.run({
         node_id: target.id,
         version: target.version,
         properties: target.properties,
         changed_by: null,
         namespace: this.namespace,
       });
+      historyRowId = histResult.lastInsertRowid;
 
       // 2. Merge properties (target wins on key conflict — target is the canonical entity)
       const sourceProps = safeJsonParse(source.properties);
@@ -593,11 +601,11 @@ export class StateTree {
       state_ref: [sourceId, targetId],
     });
 
-    // Reference the event on target and history
+    // Reference the event on target and the specific history row we inserted
     this.db.prepare('UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?')
       .run(event.id, target.id, this.namespace);
-    this.db.prepare('UPDATE node_history SET changed_by = ? WHERE node_id = ? AND namespace = ? AND changed_by IS NULL')
-      .run(event.id, target.id, this.namespace);
+    this.db.prepare('UPDATE node_history SET changed_by = ? WHERE id = ?')
+      .run(event.id, historyRowId);
 
     // Fire callbacks for both nodes (cache invalidation, re-embed)
     this.fireCallbacks([sourceId, targetId]);
