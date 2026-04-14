@@ -15,10 +15,10 @@ function setupDb(): Database.Database {
   if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
   const db = new Database(TEST_DB_PATH);
   db.pragma('journal_mode = WAL');
-  const migrationPath = path.join(
-    import.meta.dirname, '..', '..', 'src', 'db', 'migrations', '004_init_vectors.sql'
-  );
-  db.exec(fs.readFileSync(migrationPath, 'utf-8'));
+  const migrationsDir = path.join(import.meta.dirname, '..', '..', 'src', 'db', 'migrations');
+  for (const file of ['004_init_vectors.sql', '006_add_vector_namespaces.sql']) {
+    db.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf-8'));
+  }
   return db;
 }
 

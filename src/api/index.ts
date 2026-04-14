@@ -2,11 +2,11 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { z } from 'zod';
 import type { EngramCore } from '../service.js';
+import { createEngramCore } from '../service.js';
 import * as svc from '../service.js';
 
 const VALID_EVENT_TYPES = ['observation', 'action', 'mutation', 'query', 'system'] as const;
 
-// H2: Zod schema for POST /api/context body validation
 const contextBodySchema = z.object({
   topic: z.string().max(1000).optional(),
   entities: z.array(z.string().max(512)).max(20).optional(),
@@ -14,36 +14,82 @@ const contextBodySchema = z.object({
   strategy: z.enum(['graph', 'semantic', 'hybrid']).optional(),
 });
 
-/** Parse int with fallback — M2 fix */
 function safeInt(val: string | undefined, fallback: number): number {
   if (!val) return fallback;
   const n = Number(val);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
-export function createApp(core: EngramCore): Hono {
-  const app = new Hono();
+function validateNamespace(ns: string): boolean {
+  return /^[a-zA-Z0-9_\-.]+$/.test(ns) && ns.length >= 1 && ns.length <= 64;
+}
 
-  // M3: CORS origin configurable via env, defaults to open for local dev
+export interface ApiOptions {
+  /** If true, allow ?namespace= or X-Engram-Namespace header to override default core */
+  allowPerRequestNamespace?: boolean;
+}
+
+export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono {
+  const app = new Hono();
+  const allowPerRequest = opts.allowPerRequestNamespace ?? true;
+
+  // Per-namespace core cache (reused across requests for same namespace)
+  const coreCache = new Map<string, EngramCore>();
+  coreCache.set(defaultCore.config.namespace, defaultCore);
+
+  /** Resolve which EngramCore to use for this request */
+  function resolveCore(c: any): EngramCore {
+    if (!allowPerRequest) return defaultCore;
+
+    const nsFromQuery = c.req.query('namespace');
+    const nsFromHeader = c.req.header('x-engram-namespace');
+    const requested = nsFromQuery ?? nsFromHeader;
+
+    if (!requested || requested === defaultCore.config.namespace) {
+      return defaultCore;
+    }
+
+    if (!validateNamespace(requested)) {
+      throw new Error('Invalid namespace format');
+    }
+
+    let cached = coreCache.get(requested);
+    if (!cached) {
+      cached = createEngramCore({ namespace: requested });
+      coreCache.set(requested, cached);
+    }
+    return cached;
+  }
+
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
   app.use('*', cors({ origin: corsOrigin }));
 
   // ─── Status ────────────────────────────────────
 
   app.get('/api/status', (c) => {
+    const core = resolveCore(c);
     return c.json(svc.getStatus(core));
+  });
+
+  // ─── Namespaces ────────────────────────────────
+
+  app.get('/api/namespaces', (c) => {
+    const list = svc.listNamespaces(defaultCore);
+    return c.json({ namespaces: list, current: defaultCore.config.namespace });
   });
 
   // ─── Nodes ─────────────────────────────────────
 
   app.get('/api/nodes', (c) => {
+    const core = resolveCore(c);
     const type = c.req.query('type');
     const limit = safeInt(c.req.query('limit'), 50);
     const nodes = svc.listNodes(core, { type: type || undefined, limit });
-    return c.json({ nodes, count: nodes.length });
+    return c.json({ nodes, count: nodes.length, namespace: core.config.namespace });
   });
 
   app.get('/api/nodes/:id', (c) => {
+    const core = resolveCore(c);
     const detail = svc.getNodeDetail(core, c.req.param('id'));
     if (!detail) return c.json({ error: 'Node not found' }, 404);
     return c.json(detail);
@@ -52,6 +98,7 @@ export function createApp(core: EngramCore): Hono {
   // ─── Edges ─────────────────────────────────────
 
   app.get('/api/edges/:nodeId', (c) => {
+    const core = resolveCore(c);
     const result = svc.getEdgesForNode(core, c.req.param('nodeId'));
     if (!result) return c.json({ error: 'Node not found' }, 404);
     return c.json(result);
@@ -60,19 +107,20 @@ export function createApp(core: EngramCore): Hono {
   // ─── Search ────────────────────────────────────
 
   app.get('/api/search', (c) => {
+    const core = resolveCore(c);
     const q = c.req.query('q');
     if (!q) return c.json({ error: 'Query parameter "q" is required' }, 400);
     const limit = safeInt(c.req.query('limit'), 20);
     const results = svc.searchNodes(core, q, limit);
-    return c.json({ results, count: results.length });
+    return c.json({ results, count: results.length, namespace: core.config.namespace });
   });
 
   // ─── Events ────────────────────────────────────
 
   app.get('/api/events', (c) => {
+    const core = resolveCore(c);
     const limit = safeInt(c.req.query('limit'), 20);
     const typeParam = c.req.query('type');
-    // L1: Validate event type
     const type = typeParam && VALID_EVENT_TYPES.includes(typeParam as any)
       ? typeParam as typeof VALID_EVENT_TYPES[number]
       : undefined;
@@ -80,13 +128,13 @@ export function createApp(core: EngramCore): Hono {
       return c.json({ error: `Invalid type. Valid: ${VALID_EVENT_TYPES.join(', ')}` }, 400);
     }
     const events = svc.listEvents(core, { limit, type });
-    return c.json({ events, count: events.length });
+    return c.json({ events, count: events.length, namespace: core.config.namespace });
   });
 
   // ─── Context ───────────────────────────────────
 
   app.post('/api/context', async (c) => {
-    // H2: Validate request body
+    const core = resolveCore(c);
     let body: z.infer<typeof contextBodySchema>;
     try {
       const raw = await c.req.json();
@@ -104,12 +152,13 @@ export function createApp(core: EngramCore): Hono {
       maxTokens: body.max_tokens,
       strategy: body.strategy,
     });
-    return c.json({ context });
+    return c.json({ context, namespace: core.config.namespace });
   });
 
   // ─── History ───────────────────────────────────
 
   app.get('/api/history/:nodeId', (c) => {
+    const core = resolveCore(c);
     const result = svc.getNodeHistory(core, c.req.param('nodeId'));
     if (!result) return c.json({ error: 'Node not found' }, 404);
     return c.json(result);
@@ -118,6 +167,10 @@ export function createApp(core: EngramCore): Hono {
   // ─── Error handler ─────────────────────────────
 
   app.onError((err, c) => {
+    // Namespace validation errors are client errors (400); others are 500
+    if (err.message.includes('namespace') || err.message.includes('Invalid')) {
+      return c.json({ error: err.message }, 400);
+    }
     console.error('API error:', err);
     return c.json({ error: 'Internal server error' }, 500);
   });

@@ -1,5 +1,4 @@
 import type Database from 'better-sqlite3';
-import type { NodeRow } from '../types/index.js';
 
 export interface MaintenanceConfig {
   confidenceDecayFactor: number;
@@ -22,78 +21,78 @@ export interface MaintenanceReport {
 }
 
 /**
- * Run maintenance tasks on the state tree:
+ * Run maintenance tasks on the state tree (scoped to a namespace):
  * - Confidence decay for stale nodes
  * - Archive low-confidence / inactive nodes
  * - Detect orphan nodes (no edges, not rule/concept)
  */
 export function runMaintenance(
   db: Database.Database,
+  namespace: string = 'default',
   config: Partial<MaintenanceConfig> = {},
 ): MaintenanceReport {
   const cfg = { ...DEFAULT_CONFIG, ...config };
+  const report: MaintenanceReport = { decayed: 0, archived: 0, orphansDetected: 0 };
 
-  const report: MaintenanceReport = {
-    decayed: 0,
-    archived: 0,
-    orphansDetected: 0,
-  };
-
-  // M4: Proportional confidence decay based on elapsed days since last update
-  // decay = factor ^ days_since_update (more stale = more decay)
+  // M4: Proportional confidence decay
   const decayStmt = db.prepare(`
     UPDATE nodes
     SET confidence = confidence * POWER(@factor,
       MAX(1, CAST(julianday('now') - julianday(updated_at) AS INTEGER))),
         updated_at = updated_at
-    WHERE archived = 0
+    WHERE namespace = @ns
+      AND archived = 0
       AND updated_at < datetime('now', @daysAgo)
       AND confidence > @threshold
   `);
 
   const decayResult = decayStmt.run({
+    ns: namespace,
     factor: cfg.confidenceDecayFactor,
     daysAgo: `-${cfg.archiveInactiveDays} days`,
     threshold: cfg.archiveConfidenceThreshold,
   });
   report.decayed = decayResult.changes;
 
-  // 2. Archive nodes with low confidence
   const archiveStmt = db.prepare(`
     UPDATE nodes
     SET archived = 1
-    WHERE archived = 0
+    WHERE namespace = @ns
+      AND archived = 0
       AND confidence < @threshold
   `);
 
   const archiveResult = archiveStmt.run({
+    ns: namespace,
     threshold: cfg.archiveConfidenceThreshold,
   });
   report.archived = archiveResult.changes;
 
-  // 3. Detect orphan nodes (no edges, not standalone types, old enough)
   const orphanStmt = db.prepare(`
     SELECT n.id FROM nodes n
-    WHERE n.archived = 0
+    WHERE n.namespace = @ns
+      AND n.archived = 0
       AND n.type NOT IN ('rule', 'concept')
       AND NOT EXISTS (
-        SELECT 1 FROM edges e WHERE e.source_id = n.id OR e.target_id = n.id
+        SELECT 1 FROM edges e WHERE (e.source_id = n.id OR e.target_id = n.id) AND e.namespace = @ns
       )
       AND n.updated_at < datetime('now', @daysAgo)
   `);
 
   const orphans = orphanStmt.all({
+    ns: namespace,
     daysAgo: `-${cfg.orphanGraceDays} days`,
   }) as Array<{ id: string }>;
 
   report.orphansDetected = orphans.length;
 
-  // Archive orphans
   if (orphans.length > 0) {
-    const archiveOrphanStmt = db.prepare('UPDATE nodes SET archived = 1 WHERE id = ?');
+    const archiveOrphanStmt = db.prepare(
+      'UPDATE nodes SET archived = 1 WHERE id = ? AND namespace = ?'
+    );
     const archiveOrphans = db.transaction(() => {
       for (const orphan of orphans) {
-        archiveOrphanStmt.run(orphan.id);
+        archiveOrphanStmt.run(orphan.id, namespace);
       }
     });
     archiveOrphans();
@@ -103,10 +102,11 @@ export function runMaintenance(
   return report;
 }
 
-/**
- * Get counts of active vs archived nodes.
- */
-export function getStateStats(db: Database.Database): {
+/** Get counts of active vs archived nodes (scoped to namespace) */
+export function getStateStats(
+  db: Database.Database,
+  namespace: string = 'default',
+): {
   activeNodes: number;
   archivedNodes: number;
   activeEdges: number;
@@ -116,16 +116,16 @@ export function getStateStats(db: Database.Database): {
     SELECT
       SUM(CASE WHEN archived = 0 THEN 1 ELSE 0 END) as active,
       SUM(CASE WHEN archived = 1 THEN 1 ELSE 0 END) as archived
-    FROM nodes
-  `).get() as { active: number; archived: number };
+    FROM nodes WHERE namespace = ?
+  `).get(namespace) as { active: number | null; archived: number | null };
 
   const edgeCount = db.prepare(
-    'SELECT COUNT(*) as count FROM edges WHERE archived = 0'
-  ).get() as { count: number };
+    'SELECT COUNT(*) as count FROM edges WHERE namespace = ? AND archived = 0'
+  ).get(namespace) as { count: number };
 
   const eventCount = db.prepare(
-    'SELECT COUNT(*) as count FROM events'
-  ).get() as { count: number };
+    'SELECT COUNT(*) as count FROM events WHERE namespace = ?'
+  ).get(namespace) as { count: number };
 
   return {
     activeNodes: nodeStats.active ?? 0,

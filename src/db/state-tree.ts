@@ -24,6 +24,8 @@ type Stmt = Database.Statement;
 export type MutationCallback = (nodeIds: string[]) => void | Promise<void>;
 
 export class StateTree {
+  private namespace: string;
+
   // Node statements
   private insertNodeStmt: Stmt;
   private getNodeByIdStmt: Stmt;
@@ -47,33 +49,32 @@ export class StateTree {
   // History statement
   private insertHistoryStmt: Stmt;
 
-  // Post-mutation callbacks (for cache invalidation, auto-embedding, etc.)
+  // Post-mutation callbacks
   private onMutateCallbacks: MutationCallback[] = [];
-  // Track in-flight async callbacks so callers can drain before close
   private pendingCallbacks: Set<Promise<void>> = new Set();
 
   constructor(
     private db: Database.Database,
     private eventLog: EventLog,
+    namespace: string = 'default',
   ) {
+    this.namespace = namespace;
+
     // -- Nodes --
     this.insertNodeStmt = db.prepare(`
-      INSERT INTO nodes (id, type, name, properties, summary, confidence, created_at, updated_at, event_id)
+      INSERT INTO nodes (id, type, name, properties, summary, confidence, created_at, updated_at, event_id, namespace)
       VALUES (@id, @type, @name, @properties, @summary, @confidence,
-              strftime('%Y-%m-%dT%H:%M:%f','now'), strftime('%Y-%m-%dT%H:%M:%f','now'), @event_id)
+              strftime('%Y-%m-%dT%H:%M:%f','now'), strftime('%Y-%m-%dT%H:%M:%f','now'), @event_id, @namespace)
     `);
 
-    this.getNodeByIdStmt = db.prepare('SELECT * FROM nodes WHERE id = ?');
-    this.getNodeByNameStmt = db.prepare('SELECT * FROM nodes WHERE name = ? AND archived = 0 LIMIT 1');
-    this.getNodesByTypeStmt = db.prepare('SELECT * FROM nodes WHERE type = ? AND archived = 0 LIMIT ?');
-
+    this.getNodeByIdStmt = db.prepare('SELECT * FROM nodes WHERE id = ? AND namespace = ?');
+    this.getNodeByNameStmt = db.prepare('SELECT * FROM nodes WHERE name = ? AND namespace = ? AND archived = 0 LIMIT 1');
+    this.getNodesByTypeStmt = db.prepare('SELECT * FROM nodes WHERE type = ? AND namespace = ? AND archived = 0 LIMIT ?');
     this.searchNodesByNameStmt = db.prepare(
-      'SELECT * FROM nodes WHERE name = ? AND type = ? AND archived = 0 LIMIT 1'
+      'SELECT * FROM nodes WHERE name = ? AND type = ? AND namespace = ? AND archived = 0 LIMIT 1'
     );
-
-    // M1: Pre-compiled statement for searchAllNodes
     this.searchAllNodesStmt = db.prepare(
-      'SELECT * FROM nodes WHERE archived = 0 LIMIT ?'
+      'SELECT * FROM nodes WHERE namespace = ? AND archived = 0 LIMIT ?'
     );
 
     this.updateNodeStmt = db.prepare(`
@@ -85,27 +86,27 @@ export class StateTree {
         updated_at = strftime('%Y-%m-%dT%H:%M:%f','now'),
         version = version + 1,
         event_id = @event_id
-      WHERE id = @id
+      WHERE id = @id AND namespace = @namespace
     `);
 
-    this.deleteNodeStmt = db.prepare('DELETE FROM nodes WHERE id = ?');
+    this.deleteNodeStmt = db.prepare('DELETE FROM nodes WHERE id = ? AND namespace = ?');
 
     // -- Edges --
     this.insertEdgeStmt = db.prepare(`
-      INSERT INTO edges (id, source_id, predicate, target_id, properties, confidence, created_at, updated_at, event_id)
+      INSERT INTO edges (id, source_id, predicate, target_id, properties, confidence, created_at, updated_at, event_id, namespace)
       VALUES (@id, @source_id, @predicate, @target_id, @properties, @confidence,
-              strftime('%Y-%m-%dT%H:%M:%f','now'), strftime('%Y-%m-%dT%H:%M:%f','now'), @event_id)
+              strftime('%Y-%m-%dT%H:%M:%f','now'), strftime('%Y-%m-%dT%H:%M:%f','now'), @event_id, @namespace)
     `);
 
-    this.getEdgeByIdStmt = db.prepare('SELECT * FROM edges WHERE id = ?');
+    this.getEdgeByIdStmt = db.prepare('SELECT * FROM edges WHERE id = ? AND namespace = ?');
     this.getEdgeByTripletStmt = db.prepare(
-      'SELECT * FROM edges WHERE source_id = ? AND predicate = ? AND target_id = ?'
+      'SELECT * FROM edges WHERE source_id = ? AND predicate = ? AND target_id = ? AND namespace = ?'
     );
     this.getEdgesBySourceStmt = db.prepare(
-      'SELECT * FROM edges WHERE source_id = ? AND archived = 0'
+      'SELECT * FROM edges WHERE source_id = ? AND namespace = ? AND archived = 0'
     );
     this.getEdgesByTargetStmt = db.prepare(
-      'SELECT * FROM edges WHERE target_id = ? AND archived = 0'
+      'SELECT * FROM edges WHERE target_id = ? AND namespace = ? AND archived = 0'
     );
 
     this.updateEdgeStmt = db.prepare(`
@@ -115,19 +116,24 @@ export class StateTree {
         updated_at = strftime('%Y-%m-%dT%H:%M:%f','now'),
         version = version + 1,
         event_id = @event_id
-      WHERE id = @id
+      WHERE id = @id AND namespace = @namespace
     `);
 
-    this.deleteEdgeByIdStmt = db.prepare('DELETE FROM edges WHERE id = ?');
+    this.deleteEdgeByIdStmt = db.prepare('DELETE FROM edges WHERE id = ? AND namespace = ?');
     this.deleteEdgeByTripletStmt = db.prepare(
-      'DELETE FROM edges WHERE source_id = ? AND predicate = ? AND target_id = ?'
+      'DELETE FROM edges WHERE source_id = ? AND predicate = ? AND target_id = ? AND namespace = ?'
     );
 
     // -- History --
     this.insertHistoryStmt = db.prepare(`
-      INSERT INTO node_history (node_id, version, properties, changed_by)
-      VALUES (@node_id, @version, @properties, @changed_by)
+      INSERT INTO node_history (node_id, version, properties, changed_by, namespace)
+      VALUES (@node_id, @version, @properties, @changed_by, @namespace)
     `);
+  }
+
+  /** Returns the namespace this instance operates on */
+  get ns(): string {
+    return this.namespace;
   }
 
   /** Register a callback to be invoked after successful mutations */
@@ -138,66 +144,58 @@ export class StateTree {
   // ─── Node Operations ─────────────────────────────────────────
 
   getNode(id: string): Node | null {
-    const row = this.getNodeByIdStmt.get(id) as NodeRow | undefined;
+    const row = this.getNodeByIdStmt.get(id, this.namespace) as NodeRow | undefined;
     return row ? nodeFromRow(row) : null;
   }
 
   getNodeByName(name: string): Node | null {
-    const row = this.getNodeByNameStmt.get(name) as NodeRow | undefined;
+    const row = this.getNodeByNameStmt.get(name, this.namespace) as NodeRow | undefined;
     return row ? nodeFromRow(row) : null;
   }
 
-  /** H3: Disambiguated lookup by name + type */
   getNodeByNameAndType(name: string, type: string): Node | null {
-    const row = this.searchNodesByNameStmt.get(name, type) as NodeRow | undefined;
+    const row = this.searchNodesByNameStmt.get(name, type, this.namespace) as NodeRow | undefined;
     return row ? nodeFromRow(row) : null;
   }
 
   getNodesByType(type: string, limit: number = 100): Node[] {
-    const rows = this.getNodesByTypeStmt.all(type, limit) as NodeRow[];
+    const rows = this.getNodesByTypeStmt.all(type, this.namespace, limit) as NodeRow[];
     return rows.map(nodeFromRow);
   }
 
-  /** Search all active nodes (no type restriction) */
   searchAllNodes(limit: number = 100): Node[] {
-    const rows = this.searchAllNodesStmt.all(limit) as NodeRow[];
+    const rows = this.searchAllNodesStmt.all(this.namespace, limit) as NodeRow[];
     return rows.map(nodeFromRow);
   }
 
   // ─── Edge Operations ─────────────────────────────────────────
 
   getEdge(id: string): Edge | null {
-    const row = this.getEdgeByIdStmt.get(id) as EdgeRow | undefined;
+    const row = this.getEdgeByIdStmt.get(id, this.namespace) as EdgeRow | undefined;
     return row ? edgeFromRow(row) : null;
   }
 
   getEdgeByTriplet(sourceId: string, predicate: string, targetId: string): Edge | null {
-    const row = this.getEdgeByTripletStmt.get(sourceId, predicate, targetId) as EdgeRow | undefined;
+    const row = this.getEdgeByTripletStmt.get(sourceId, predicate, targetId, this.namespace) as EdgeRow | undefined;
     return row ? edgeFromRow(row) : null;
   }
 
   getEdgesFrom(nodeId: string): Edge[] {
-    const rows = this.getEdgesBySourceStmt.all(nodeId) as EdgeRow[];
+    const rows = this.getEdgesBySourceStmt.all(nodeId, this.namespace) as EdgeRow[];
     return rows.map(edgeFromRow);
   }
 
   getEdgesTo(nodeId: string): Edge[] {
-    const rows = this.getEdgesByTargetStmt.all(nodeId) as EdgeRow[];
+    const rows = this.getEdgesByTargetStmt.all(nodeId, this.namespace) as EdgeRow[];
     return rows.map(edgeFromRow);
   }
 
-  // ─── Mutation (Transactional) ─────────────────────────────────
+  // ─── Mutation ────────────────────────────────────────────────
 
-  /**
-   * Execute a batch of node mutations in a single transaction.
-   * C3 fix: Event logging happens AFTER the mutation transaction succeeds,
-   * preventing conflicts between immutability triggers and rollback.
-   */
   mutate(operations: MutationOp[]): { results: MutationResult[]; event_id: number } {
     const results: MutationResult[] = [];
     const affectedNodeIds: string[] = [];
 
-    // Phase 1: Execute mutations in a transaction (no event logging)
     const mutationTxn = this.db.transaction(() => {
       for (const op of operations) {
         switch (op.op) {
@@ -211,13 +209,14 @@ export class StateTree {
               summary: op.summary ?? null,
               confidence: op.confidence ?? 1.0,
               event_id: null,
+              namespace: this.namespace,
             });
             results.push({ op: 'create', node_id: id, version: 1 });
             affectedNodeIds.push(id);
             break;
           }
           case 'update': {
-            const existing = this.getNodeByIdStmt.get(op.node_id) as NodeRow | undefined;
+            const existing = this.getNodeByIdStmt.get(op.node_id, this.namespace) as NodeRow | undefined;
             if (!existing) {
               throw new Error(`Node not found: ${op.node_id}`);
             }
@@ -227,17 +226,12 @@ export class StateTree {
               version: existing.version,
               properties: existing.properties,
               changed_by: null,
+              namespace: this.namespace,
             });
 
             const currentProps = safeJsonParse(existing.properties);
-            if (op.set) {
-              Object.assign(currentProps, op.set);
-            }
-            if (op.unset) {
-              for (const key of op.unset) {
-                delete currentProps[key];
-              }
-            }
+            if (op.set) Object.assign(currentProps, op.set);
+            if (op.unset) for (const key of op.unset) delete currentProps[key];
 
             this.updateNodeStmt.run({
               id: op.node_id,
@@ -246,6 +240,7 @@ export class StateTree {
               summary: op.summary ?? existing.summary,
               confidence: op.confidence ?? existing.confidence,
               event_id: null,
+              namespace: this.namespace,
             });
 
             results.push({ op: 'update', node_id: op.node_id, version: existing.version + 1 });
@@ -253,7 +248,7 @@ export class StateTree {
             break;
           }
           case 'delete': {
-            const toDelete = this.getNodeByIdStmt.get(op.node_id) as NodeRow | undefined;
+            const toDelete = this.getNodeByIdStmt.get(op.node_id, this.namespace) as NodeRow | undefined;
             if (!toDelete) {
               throw new Error(`Node not found: ${op.node_id}`);
             }
@@ -262,8 +257,9 @@ export class StateTree {
               version: toDelete.version,
               properties: toDelete.properties,
               changed_by: null,
+              namespace: this.namespace,
             });
-            this.deleteNodeStmt.run(op.node_id);
+            this.deleteNodeStmt.run(op.node_id, this.namespace);
             results.push({ op: 'delete', node_id: op.node_id, version: toDelete.version });
             affectedNodeIds.push(op.node_id);
             break;
@@ -274,7 +270,6 @@ export class StateTree {
 
     mutationTxn();
 
-    // Phase 2: Log event AFTER successful mutation (outside transaction)
     const event = this.eventLog.append({
       type: 'mutation',
       source: 'agent',
@@ -282,29 +277,25 @@ export class StateTree {
       state_ref: affectedNodeIds,
     });
 
-    // Phase 3: Update event_id references on affected nodes
-    const updateEventRef = this.db.prepare('UPDATE nodes SET event_id = ? WHERE id = ?');
+    const updateEventRef = this.db.prepare(
+      'UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?'
+    );
     const updateHistoryRef = this.db.prepare(
-      'UPDATE node_history SET changed_by = ? WHERE node_id = ? AND changed_by IS NULL'
+      'UPDATE node_history SET changed_by = ? WHERE node_id = ? AND namespace = ? AND changed_by IS NULL'
     );
     for (const nodeId of affectedNodeIds) {
-      // Only update if node still exists (not deleted)
-      const exists = this.getNodeByIdStmt.get(nodeId) as NodeRow | undefined;
+      const exists = this.getNodeByIdStmt.get(nodeId, this.namespace) as NodeRow | undefined;
       if (exists) {
-        updateEventRef.run(event.id, nodeId);
+        updateEventRef.run(event.id, nodeId, this.namespace);
       }
-      updateHistoryRef.run(event.id, nodeId);
+      updateHistoryRef.run(event.id, nodeId, this.namespace);
     }
 
-    // Fire callbacks (tracked so callers can drain before close)
     this.fireCallbacks(affectedNodeIds);
 
     return { results, event_id: event.id };
   }
 
-  /**
-   * Execute a batch of edge (link) operations in a single transaction.
-   */
   link(operations: LinkOp[]): { results: LinkResult[]; event_id: number } {
     const results: LinkResult[] = [];
     const affectedEdgeIds: string[] = [];
@@ -314,7 +305,7 @@ export class StateTree {
         switch (op.op) {
           case 'create': {
             const existing = this.getEdgeByTripletStmt.get(
-              op.source_id, op.predicate, op.target_id
+              op.source_id, op.predicate, op.target_id, this.namespace
             ) as EdgeRow | undefined;
 
             if (existing) {
@@ -325,6 +316,7 @@ export class StateTree {
                 properties: JSON.stringify(merged),
                 confidence: op.confidence ?? existing.confidence,
                 event_id: null,
+                namespace: this.namespace,
               });
               results.push({ op: 'update', edge_id: existing.id });
               affectedEdgeIds.push(existing.id);
@@ -338,6 +330,7 @@ export class StateTree {
                 properties: JSON.stringify(op.properties ?? {}),
                 confidence: op.confidence ?? 1.0,
                 event_id: null,
+                namespace: this.namespace,
               });
               results.push({ op: 'create', edge_id: id });
               affectedEdgeIds.push(id);
@@ -347,10 +340,10 @@ export class StateTree {
           case 'update': {
             let edgeRow: EdgeRow | undefined;
             if (op.edge_id) {
-              edgeRow = this.getEdgeByIdStmt.get(op.edge_id) as EdgeRow | undefined;
+              edgeRow = this.getEdgeByIdStmt.get(op.edge_id, this.namespace) as EdgeRow | undefined;
             } else if (op.source_id && op.predicate && op.target_id) {
               edgeRow = this.getEdgeByTripletStmt.get(
-                op.source_id, op.predicate, op.target_id
+                op.source_id, op.predicate, op.target_id, this.namespace
               ) as EdgeRow | undefined;
             }
 
@@ -366,26 +359,26 @@ export class StateTree {
               properties: JSON.stringify(merged),
               confidence: op.confidence ?? edgeRow.confidence,
               event_id: null,
+              namespace: this.namespace,
             });
             results.push({ op: 'update', edge_id: edgeRow.id });
             affectedEdgeIds.push(edgeRow.id);
             break;
           }
           case 'delete': {
-            // M5: Report if edge not found
             if (op.edge_id) {
-              const exists = this.getEdgeByIdStmt.get(op.edge_id) as EdgeRow | undefined;
+              const exists = this.getEdgeByIdStmt.get(op.edge_id, this.namespace) as EdgeRow | undefined;
               if (!exists) {
                 results.push({ op: 'delete', edge_id: op.edge_id });
                 break;
               }
-              this.deleteEdgeByIdStmt.run(op.edge_id);
+              this.deleteEdgeByIdStmt.run(op.edge_id, this.namespace);
               results.push({ op: 'delete', edge_id: op.edge_id });
             } else if (op.source_id && op.predicate && op.target_id) {
-              this.deleteEdgeByTripletStmt.run(op.source_id, op.predicate, op.target_id);
+              this.deleteEdgeByTripletStmt.run(op.source_id, op.predicate, op.target_id, this.namespace);
               results.push({ op: 'delete', edge_id: `${op.source_id}:${op.predicate}:${op.target_id}` });
             } else {
-              throw new Error('Delete requires edge_id or complete triplet (source_id, predicate, target_id)');
+              throw new Error('Delete requires edge_id or complete triplet');
             }
             break;
           }
@@ -395,7 +388,6 @@ export class StateTree {
 
     linkTxn();
 
-    // Log event after successful mutation
     const event = this.eventLog.append({
       type: 'mutation',
       source: 'agent',
@@ -403,19 +395,19 @@ export class StateTree {
       state_ref: affectedEdgeIds,
     });
 
-    // Update event_id on edges + collect affected node IDs for callback
-    const updateEdgeRef = this.db.prepare('UPDATE edges SET event_id = ? WHERE id = ?');
+    const updateEdgeRef = this.db.prepare(
+      'UPDATE edges SET event_id = ? WHERE id = ? AND namespace = ?'
+    );
     const affectedNodeIds = new Set<string>();
     for (const edgeId of affectedEdgeIds) {
-      const exists = this.getEdgeByIdStmt.get(edgeId) as EdgeRow | undefined;
+      const exists = this.getEdgeByIdStmt.get(edgeId, this.namespace) as EdgeRow | undefined;
       if (exists) {
-        updateEdgeRef.run(event.id, edgeId);
+        updateEdgeRef.run(event.id, edgeId, this.namespace);
         affectedNodeIds.add(exists.source_id);
         affectedNodeIds.add(exists.target_id);
       }
     }
 
-    // Fire callbacks for both endpoint nodes (for cache invalidation, etc.)
     if (affectedNodeIds.size > 0) {
       this.fireCallbacks([...affectedNodeIds]);
     }
@@ -423,11 +415,6 @@ export class StateTree {
     return { results, event_id: event.id };
   }
 
-  /**
-   * Fire onMutate callbacks in a tracked way.
-   * Async returns are added to pendingCallbacks so callers can drain.
-   * Errors are logged but do not propagate.
-   */
   private fireCallbacks(nodeIds: string[]): void {
     for (const cb of this.onMutateCallbacks) {
       try {
@@ -444,14 +431,9 @@ export class StateTree {
     }
   }
 
-  /**
-   * Wait for all in-flight onMutate callbacks to complete.
-   * Call before closing the DB to ensure async work (e.g., auto-embedding) finishes.
-   */
   async drainCallbacks(): Promise<void> {
     while (this.pendingCallbacks.size > 0) {
       await Promise.allSettled([...this.pendingCallbacks]);
     }
   }
 }
-

@@ -88,13 +88,14 @@ export function createEngramCore(
   const mainDb = initMainDb(config);
   const vecDb = initVecDb(config);
 
-  const eventLog = new EventLog(mainDb.db);
-  const stateTree = new StateTree(mainDb.db, eventLog);
+  const ns = config.namespace;
+  const eventLog = new EventLog(mainDb.db, ns);
+  const stateTree = new StateTree(mainDb.db, eventLog, ns);
   const embeddingProvider = resolveEmbeddingProvider(config, options.embeddingProvider);
 
   // BUG-A fix: Pass dimension from provider or config
   const dim = embeddingProvider?.dimension ?? config.embedding.dimension;
-  const vectorStore = new VectorStore(vecDb.db, dim);
+  const vectorStore = new VectorStore(vecDb.db, dim, ns);
   const cache = new EngineCache(config.cache);
 
   // Enable sqlite-vec (single source of truth; removed duplication from server.ts)
@@ -154,16 +155,26 @@ export interface StatusInfo {
   activeEdges: number;
   totalEvents: number;
   dataDir: string;
+  namespace: string;
   semanticEnabled: boolean;
 }
 
 export function getStatus(core: EngramCore): StatusInfo {
-  const stats = getStateStats(core.db);
+  const stats = getStateStats(core.db, core.config.namespace);
   return {
     ...stats,
     dataDir: core.config.dataDir,
+    namespace: core.config.namespace,
     semanticEnabled: core.embeddingProvider !== null && core.vectorStore.isVecEnabled,
   };
+}
+
+/** List all distinct namespaces that exist in the DB */
+export function listNamespaces(core: EngramCore): string[] {
+  const rows = core.db
+    .prepare('SELECT DISTINCT namespace FROM nodes UNION SELECT DISTINCT namespace FROM events ORDER BY namespace')
+    .all() as Array<{ namespace: string }>;
+  return rows.map(r => r.namespace);
 }
 
 // ─── Nodes ───────────────────────────────────────────────
@@ -436,7 +447,7 @@ export function runMaintenanceCycle(
     return { decayed: 0, archived: 0, orphansDetected: 0, ...statsBefore };
   }
 
-  const report = runMaintenance(core.db, core.config.maintenance);
+  const report = runMaintenance(core.db, core.config.namespace, core.config.maintenance);
   const statsAfter = getStatus(core);
   return { ...report, ...statsAfter };
 }

@@ -32,6 +32,7 @@ export function formatStatus(status: StatusInfo): string {
   const lines = [
     chalk.bold('Engram Status'),
     chalk.dim('─'.repeat(40)),
+    `  Namespace        ${chalk.cyan(status.namespace)}`,
     `  Nodes (active)   ${chalk.green(String(status.activeNodes))}`,
     `  Nodes (archived) ${chalk.dim(String(status.archivedNodes))}`,
     `  Edges            ${chalk.green(String(status.activeEdges))}`,

@@ -5,6 +5,10 @@ export const ConfigSchema = z.object({
   dbFilename: z.string().default('engram.db'),
   vecDbFilename: z.string().default('engram-vec.db'),
 
+  /** Namespace for memory isolation (multi-tenant/multi-project). Default 'default'. */
+  namespace: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_\-.]+$/,
+    'Namespace must be alphanumeric with dashes/dots/underscores').default('default'),
+
   cache: z.object({
     maxNodes: z.number().int().positive().default(10_000),
     nodeTTLMs: z.number().int().positive().default(300_000),

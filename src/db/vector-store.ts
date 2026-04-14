@@ -14,6 +14,7 @@ export interface VectorSearchResult {
 export class VectorStore {
   private vecEnabled: boolean = false;
   private dimension: number;
+  private namespace: string;
 
   private insertEmbeddingStmt: Stmt;
   private insertVecStmt: Stmt | null = null;
@@ -22,25 +23,26 @@ export class VectorStore {
   private getBySourceStmt: Stmt;
   private getMetaByIdStmt: Stmt;
 
-  // M2: Pre-compiled search statements (initialized in enableVec)
   private searchAllStmt: Stmt | null = null;
   private searchByTypeStmt: Stmt | null = null;
 
   constructor(
     private db: Database.Database,
     dimension: number = 1536,
+    namespace: string = 'default',
   ) {
     this.dimension = dimension;
+    this.namespace = namespace;
 
     this.insertEmbeddingStmt = db.prepare(`
-      INSERT OR REPLACE INTO embeddings (id, source_type, source_id, text, created_at)
-      VALUES (@id, @source_type, @source_id, @text, strftime('%Y-%m-%dT%H:%M:%f','now'))
+      INSERT OR REPLACE INTO embeddings (id, source_type, source_id, text, created_at, namespace)
+      VALUES (@id, @source_type, @source_id, @text, strftime('%Y-%m-%dT%H:%M:%f','now'), @namespace)
     `);
-    this.deleteEmbeddingStmt = db.prepare('DELETE FROM embeddings WHERE id = ?');
+    this.deleteEmbeddingStmt = db.prepare('DELETE FROM embeddings WHERE id = ? AND namespace = ?');
     this.getBySourceStmt = db.prepare(
-      'SELECT * FROM embeddings WHERE source_type = ? AND source_id = ?'
+      'SELECT * FROM embeddings WHERE source_type = ? AND source_id = ? AND namespace = ?'
     );
-    this.getMetaByIdStmt = db.prepare('SELECT * FROM embeddings WHERE id = ?');
+    this.getMetaByIdStmt = db.prepare('SELECT * FROM embeddings WHERE id = ? AND namespace = ?');
   }
 
   enableVec(loadFn: (db: Database.Database) => void): boolean {
@@ -58,12 +60,14 @@ export class VectorStore {
       this.deleteVecStmt = this.db.prepare(
         'DELETE FROM vec_embeddings WHERE id = ?'
       );
-      // M2: Pre-compile search statements
+      // Namespace filter joins via embeddings metadata
       this.searchAllStmt = this.db.prepare(`
-        SELECT id, distance
-        FROM vec_embeddings
-        WHERE embedding MATCH ? AND k = ?
-        ORDER BY distance ASC
+        SELECT v.id, v.distance
+        FROM vec_embeddings v
+        INNER JOIN embeddings e ON e.id = v.id
+        WHERE v.embedding MATCH ? AND k = ?
+          AND e.namespace = ?
+        ORDER BY v.distance ASC
       `);
       this.searchByTypeStmt = this.db.prepare(`
         SELECT v.id, v.distance
@@ -71,6 +75,7 @@ export class VectorStore {
         INNER JOIN embeddings e ON e.id = v.id
         WHERE v.embedding MATCH ? AND k = ?
           AND e.source_type = ?
+          AND e.namespace = ?
         ORDER BY v.distance ASC
       `);
       this.vecEnabled = true;
@@ -83,6 +88,10 @@ export class VectorStore {
 
   get isVecEnabled(): boolean {
     return this.vecEnabled;
+  }
+
+  get ns(): string {
+    return this.namespace;
   }
 
   store(params: {
@@ -107,6 +116,7 @@ export class VectorStore {
       source_type: params.source_type,
       source_id: params.source_id,
       text: params.text,
+      namespace: this.namespace,
     });
 
     if (this.vecEnabled && this.insertVecStmt) {
@@ -119,11 +129,11 @@ export class VectorStore {
 
   removeBySource(sourceType: string, sourceId: string): number {
     const existing = this.getBySourceStmt.all(
-      sourceType, sourceId
+      sourceType, sourceId, this.namespace
     ) as Array<{ id: string }>;
 
     for (const row of existing) {
-      this.deleteEmbeddingStmt.run(row.id);
+      this.deleteEmbeddingStmt.run(row.id, this.namespace);
       if (this.vecEnabled && this.deleteVecStmt) {
         this.deleteVecStmt.run(row.id);
       }
@@ -150,9 +160,9 @@ export class VectorStore {
     let results: Array<{ id: string; distance: number }>;
 
     if (params.sourceType && params.sourceType !== 'all' && this.searchByTypeStmt) {
-      results = this.searchByTypeStmt.all(buffer, limit, params.sourceType) as any[];
+      results = this.searchByTypeStmt.all(buffer, limit, params.sourceType, this.namespace) as any[];
     } else if (this.searchAllStmt) {
-      results = this.searchAllStmt.all(buffer, limit) as any[];
+      results = this.searchAllStmt.all(buffer, limit, this.namespace) as any[];
     } else {
       return [];
     }
@@ -160,7 +170,7 @@ export class VectorStore {
     const output: VectorSearchResult[] = [];
 
     for (const row of results) {
-      const meta = this.getMetaByIdStmt.get(row.id) as {
+      const meta = this.getMetaByIdStmt.get(row.id, this.namespace) as {
         id: string;
         source_type: string;
         source_id: string;

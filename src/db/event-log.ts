@@ -6,12 +6,15 @@ import { eventFromRow } from '../types/index.js';
 type Stmt = Database.Statement;
 
 export class EventLog {
+  private namespace: string;
+
   private insertStmt: Stmt;
   private getByIdStmt: Stmt;
   private getLastStmt: Stmt;
   private queryByTypeStmt: Stmt;
   private queryBySessionStmt: Stmt;
   private queryRecentStmt: Stmt;
+  private verifyAllStmt: Stmt;
   private appendTxn: (params: {
     type: EventType;
     source: EventSource;
@@ -20,19 +23,23 @@ export class EventLog {
     state_ref?: string[];
   }) => Event;
 
-  constructor(private db: Database.Database) {
+  constructor(private db: Database.Database, namespace: string = 'default') {
+    this.namespace = namespace;
+
     this.insertStmt = db.prepare(`
-      INSERT INTO events (type, source, session_id, content, state_ref, checksum)
-      VALUES (@type, @source, @session_id, @content, @state_ref, @checksum)
+      INSERT INTO events (type, source, session_id, content, state_ref, checksum, namespace)
+      VALUES (@type, @source, @session_id, @content, @state_ref, @checksum, @namespace)
     `);
 
-    this.getByIdStmt = db.prepare('SELECT * FROM events WHERE id = ?');
-    this.getLastStmt = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 1');
-    this.queryByTypeStmt = db.prepare('SELECT * FROM events WHERE type = ? ORDER BY id DESC LIMIT ?');
-    this.queryBySessionStmt = db.prepare('SELECT * FROM events WHERE session_id = ? ORDER BY id ASC');
-    this.queryRecentStmt = db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?');
+    // All reads scoped by namespace so per-namespace checksum chains stay independent
+    this.getByIdStmt = db.prepare('SELECT * FROM events WHERE id = ? AND namespace = ?');
+    this.getLastStmt = db.prepare('SELECT * FROM events WHERE namespace = ? ORDER BY id DESC LIMIT 1');
+    this.queryByTypeStmt = db.prepare('SELECT * FROM events WHERE type = ? AND namespace = ? ORDER BY id DESC LIMIT ?');
+    this.queryBySessionStmt = db.prepare('SELECT * FROM events WHERE session_id = ? AND namespace = ? ORDER BY id ASC');
+    this.queryRecentStmt = db.prepare('SELECT * FROM events WHERE namespace = ? ORDER BY id DESC LIMIT ?');
+    this.verifyAllStmt = db.prepare('SELECT * FROM events WHERE namespace = ? ORDER BY id ASC');
 
-    // C2 fix: Atomic read-last-checksum + insert prevents checksum chain race conditions
+    // C2 fix: Atomic read-last-checksum + insert prevents race conditions
     this.appendTxn = db.transaction((params: {
       type: EventType;
       source: EventSource;
@@ -43,7 +50,8 @@ export class EventLog {
       const contentStr = JSON.stringify(params.content);
       const stateRefStr = params.state_ref ? JSON.stringify(params.state_ref) : null;
 
-      const lastEvent = this.getLastStmt.get() as EventRow | undefined;
+      // Per-namespace chain: read last event in THIS namespace
+      const lastEvent = this.getLastStmt.get(this.namespace) as EventRow | undefined;
       const prevChecksum = lastEvent?.checksum ?? '';
       const checksum = createHash('sha256')
         .update(prevChecksum + contentStr)
@@ -56,9 +64,10 @@ export class EventLog {
         content: contentStr,
         state_ref: stateRefStr,
         checksum,
+        namespace: this.namespace,
       });
 
-      const row = this.getByIdStmt.get(result.lastInsertRowid) as EventRow;
+      const row = this.getByIdStmt.get(result.lastInsertRowid, this.namespace) as EventRow;
       return eventFromRow(row);
     });
   }
@@ -74,30 +83,27 @@ export class EventLog {
   }
 
   getById(id: number): Event | null {
-    const row = this.getByIdStmt.get(id) as EventRow | undefined;
+    const row = this.getByIdStmt.get(id, this.namespace) as EventRow | undefined;
     return row ? eventFromRow(row) : null;
   }
 
   queryByType(type: EventType, limit: number = 50): Event[] {
-    const rows = this.queryByTypeStmt.all(type, limit) as EventRow[];
+    const rows = this.queryByTypeStmt.all(type, this.namespace, limit) as EventRow[];
     return rows.map(eventFromRow);
   }
 
   queryBySession(sessionId: string): Event[] {
-    const rows = this.queryBySessionStmt.all(sessionId) as EventRow[];
+    const rows = this.queryBySessionStmt.all(sessionId, this.namespace) as EventRow[];
     return rows.map(eventFromRow);
   }
 
   queryRecent(limit: number = 50): Event[] {
-    const rows = this.queryRecentStmt.all(limit) as EventRow[];
+    const rows = this.queryRecentStmt.all(this.namespace, limit) as EventRow[];
     return rows.map(eventFromRow);
   }
 
   verifyIntegrity(): { valid: boolean; brokenAt?: number } {
-    const allEvents = this.db
-      .prepare('SELECT * FROM events ORDER BY id ASC')
-      .all() as EventRow[];
-
+    const allEvents = this.verifyAllStmt.all(this.namespace) as EventRow[];
     let prevChecksum = '';
 
     for (const row of allEvents) {
@@ -108,7 +114,6 @@ export class EventLog {
       if (row.checksum !== expected) {
         return { valid: false, brokenAt: row.id };
       }
-
       prevChecksum = row.checksum!;
     }
 

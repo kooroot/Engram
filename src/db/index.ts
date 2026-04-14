@@ -64,6 +64,7 @@ export function initMainDb(config: Config): DatabaseConnection {
     '001_init_events.sql',
     '002_init_state_tree.sql',
     '003_init_node_history.sql',
+    '005_add_namespaces.sql',
   ]);
 
   return {
@@ -85,7 +86,10 @@ export function initVecDb(config: Config): DatabaseConnection {
   db.pragma('synchronous = NORMAL');
   db.pragma('busy_timeout = 5000');
 
-  runMigrations(db, ['004_init_vectors.sql']);
+  runMigrations(db, [
+    '004_init_vectors.sql',
+    '006_add_vector_namespaces.sql',
+  ]);
 
   return {
     db,
