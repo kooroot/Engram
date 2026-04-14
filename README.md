@@ -126,6 +126,18 @@ engram context "project status" --entities "Alice,Engram"
 
 # Run maintenance (decay stale nodes, archive, clean orphans)
 engram maintenance --dry-run
+
+# Multi-namespace workflows
+engram --namespace work status              # stats for 'work' namespace
+engram --namespace personal nodes --type person
+engram namespaces                           # list all namespaces
+
+# Merge duplicate entities (re-points edges, archives source)
+engram merge Alice-v1 Alice-v2
+
+# Backup / restore
+engram --namespace work export > backup.json
+engram import backup.json --target work-restored --strategy reassign
 ```
 
 ### REST API
@@ -295,9 +307,41 @@ Requires an embedding provider (OpenAI or local). Embeddings are auto-generated 
 | `ENGRAM_DATA_DIR` | `./data` | Directory for database files |
 | `ENGRAM_DB_FILENAME` | `engram.db` | Main database filename |
 | `ENGRAM_VEC_DB_FILENAME` | `engram-vec.db` | Vector database filename |
+| `ENGRAM_NAMESPACE` | `default` | Memory namespace (multi-tenant isolation) |
 | `ENGRAM_EMBEDDING_PROVIDER` | `none` | `openai`, `local`, or `none` |
 | `OPENAI_API_KEY` | — | Auto-enables OpenAI embeddings when set |
 | `OPENAI_BASE_URL` | — | Custom OpenAI-compatible endpoint |
+| `ENGRAM_API_TOKEN` | — | Bearer token(s) for REST API (comma-separated) |
+| `ENGRAM_RATE_BURST` | `60` | Rate limit: burst capacity |
+| `ENGRAM_RATE_PER_SEC` | `10` | Rate limit: sustained rate per second |
+| `ENGRAM_RATE_LIMIT` | — | Set to `off` to disable rate limiting |
+| `ENGRAM_CORS_ORIGIN` | `*` | CORS origin for REST API |
+| `ENGRAM_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
+| `ENGRAM_LOG_FORMAT` | `json` | `json` or `pretty` |
+
+### Production Deployment
+
+```bash
+# Typical production REST API setup
+export ENGRAM_DATA_DIR=/var/lib/engram
+export ENGRAM_API_TOKEN="$(openssl rand -hex 32)"
+export ENGRAM_RATE_BURST=100
+export ENGRAM_RATE_PER_SEC=20
+export ENGRAM_CORS_ORIGIN=https://app.example.com
+export ENGRAM_LOG_LEVEL=info
+export ENGRAM_LOG_FORMAT=json
+export OPENAI_API_KEY=sk-...
+
+engram serve --port 3333 --host 0.0.0.0
+```
+
+Observability endpoints:
+- `GET /api/health` — liveness probe (always public, exempt from auth/rate-limit)
+- `GET /api/metrics` — Prometheus text format (requires auth if configured)
+
+Scrape `/api/metrics` with Prometheus; the exposed metrics include mutation
+and context latency histograms, cache hit rates, embedding success/failure,
+and per-endpoint request/error counters.
 
 ### Semantic Search Setup
 

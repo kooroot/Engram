@@ -40,6 +40,22 @@ export interface ApiOptions {
   allowPerRequestNamespace?: boolean;
   /** Rate limit config (overrides env). Set to `false` to disable. */
   rateLimit?: RateLimitConfig | false;
+  /**
+   * Bearer token(s) required for API access.
+   * - Single string: that token must match
+   * - Array: any matching token is allowed
+   * - undefined: reads ENGRAM_API_TOKEN env (comma-separated); unset → auth disabled
+   */
+  authTokens?: string | string[];
+}
+
+/** Build token set from option or env var */
+function resolveAuthTokens(opt?: string | string[]): Set<string> {
+  if (Array.isArray(opt)) return new Set(opt.filter(Boolean));
+  if (typeof opt === 'string') return new Set([opt].filter(Boolean));
+  const env = process.env['ENGRAM_API_TOKEN'];
+  if (!env) return new Set();
+  return new Set(env.split(',').map(t => t.trim()).filter(Boolean));
 }
 
 /** Extract rate limit config from env vars */
@@ -86,6 +102,26 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
 
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
   app.use('*', cors({ origin: corsOrigin }));
+
+  // Auth: Bearer token. Applied BEFORE rate limit so unauthenticated requests
+  // don't consume rate budget.
+  const tokens = resolveAuthTokens(opts.authTokens);
+  if (tokens.size > 0) {
+    app.use('*', async (c, next) => {
+      // Exempt health from auth so load balancers / monitors can probe
+      if (c.req.path === '/api/health') return next();
+
+      const header = c.req.header('authorization') ?? '';
+      if (!header.startsWith('Bearer ')) {
+        return c.json({ error: 'Missing Authorization header' }, 401);
+      }
+      const provided = header.slice(7).trim();
+      if (!tokens.has(provided)) {
+        return c.json({ error: 'Invalid token' }, 403);
+      }
+      return next();
+    });
+  }
 
   // Rate limiting (per remote address)
   const rlConfig = opts.rateLimit ?? envRateLimit();
