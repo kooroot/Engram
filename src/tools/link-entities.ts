@@ -3,10 +3,7 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { StateTree } from '../db/state-tree.js';
 import type { EngineCache } from '../engine/cache.js';
 import type { LinkOp } from '../types/index.js';
-
-const propertiesSchema = z.record(z.unknown()).optional()
-  .refine(val => !val || Object.keys(val).length <= 100,
-    { message: 'Properties must have at most 100 keys' });
+import { propertiesSchema } from './schemas.js';
 
 const createLinkOp = z.object({
   op: z.literal('create'),

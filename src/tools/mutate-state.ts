@@ -4,12 +4,7 @@ import type { StateTree } from '../db/state-tree.js';
 import type { EngineCache } from '../engine/cache.js';
 import type { MutationOp } from '../types/index.js';
 import { detectDuplicates } from '../engine/conflict-resolver.js';
-
-// H4: Limit property size to prevent DoS
-const MAX_PROPERTIES_KEYS = 100;
-const propertiesSchema = z.record(z.unknown()).optional()
-  .refine(val => !val || Object.keys(val).length <= MAX_PROPERTIES_KEYS,
-    { message: `Properties must have at most ${MAX_PROPERTIES_KEYS} keys` });
+import { propertiesSchema } from './schemas.js';
 
 const createOp = z.object({
   op: z.literal('create'),
