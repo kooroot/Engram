@@ -1,409 +1,408 @@
 <p align="center">
   <h1 align="center">Engram</h1>
   <p align="center">
-    <strong>AI-native persistent memory for agents — not files, not RAG, just state.</strong>
+    <strong>AI-native persistent memory for agents — knowledge graph, not files, not RAG.</strong>
   </p>
   <p align="center">
     <a href="#quick-start">Quick Start</a> &middot;
+    <a href="#three-interfaces-one-memory">Interfaces</a> &middot;
     <a href="#architecture">Architecture</a> &middot;
-    <a href="#mcp-tools">Tools</a> &middot;
-    <a href="#configuration">Config</a>
+    <a href="#configuration">Configuration</a> &middot;
+    <a href="#production-deployment">Production</a>
   </p>
 </p>
 
 ---
 
-Engram is an **MCP server** that gives AI agents a structured, persistent memory as a **knowledge graph**. Instead of stuffing context into markdown files or re-embedding every conversation, Engram separates immutable history from mutable state — so your agent can update a single fact in O(1), not rewrite an entire document.
+Engram is an **MCP server** that gives AI agents a structured, persistent memory as a **knowledge graph**. Instead of stuffing context into markdown files or re-embedding every conversation, Engram separates immutable history from mutable state — so an agent can update a single fact in O(1), not rewrite an entire document.
 
 ```
 Agent learns "Alice got promoted"
   → mutate_state({ op: "update", node_id: "alice", set: { role: "lead" } })
-  → Done. One row updated. Old value preserved in history.
+  → One row updated. Old value preserved in history. Event log chained.
 
 Agent needs context about Alice
   → get_context({ entities: ["Alice"], max_tokens: 2000 })
-  → Returns: Alice [person] (conf: 0.95)
-              Senior engineer → lead (updated 2m ago)
-              → works_on: Engram
-              → knows: Bob
+  → Alice [person] (conf: 0.95)
+     Lead engineer on platform team
+     → works_on: Engram
+     → knows: Bob
+     ← manages: Charlie
 ```
 
 ## Why Engram?
 
 | Problem | Traditional Approach | Engram |
 |---------|---------------------|--------|
-| Update a fact | Rewrite/summarize entire doc | `UPDATE nodes SET ... WHERE id = ?` |
+| Update a fact | Rewrite / summarize entire doc | `UPDATE nodes SET … WHERE id = ?` |
 | Recall an entity | Embed + search + pray | Direct O(1) graph lookup |
 | Track relationships | Implicit in prose | Explicit SPO triplets with confidence |
-| Audit trail | Overwritten and lost | Immutable event log with checksum chain |
+| Audit trail | Overwritten and lost | Immutable event log with SHA-256 chain |
+| Multi-user / multi-project | Shared pile | First-class namespaces |
 | Token cost | Dump everything into context | Budget-controlled, relevance-ranked injection |
+| Keyword search at 10K+ nodes | Falls apart | FTS5, sub-1 ms |
 
 ## Quick Start
 
 ```bash
-# Clone & install
-git clone https://github.com/kooroot/engram.git
-cd engram
+git clone https://github.com/kooroot/Engram.git
+cd Engram
 bun install
-
-# Build
 bun run build
 
-# Run (stdio transport for MCP)
-node dist/index.js
+# Use as global CLI
+bun link
+engram status
 ```
 
-### Add to Claude Desktop
+### Hook into an agent
 
-`~/Library/Application Support/Claude/claude_desktop_config.json`:
+**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
 ```json
 {
   "mcpServers": {
     "engram": {
       "command": "node",
-      "args": ["/absolute/path/to/engram/dist/index.js"],
-      "env": {
-        "ENGRAM_DATA_DIR": "/path/to/data"
-      }
+      "args": ["/absolute/path/to/Engram/dist/index.js"],
+      "env": { "ENGRAM_DATA_DIR": "/path/to/data" }
     }
   }
 }
 ```
 
-### Add to Claude Code
+**Claude Code:**
 
 ```bash
-claude mcp add engram node /absolute/path/to/engram/dist/index.js
+claude mcp add engram node /absolute/path/to/Engram/dist/index.js
 ```
 
-### Add to Cursor
+**Cursor / any MCP-compatible client:** point `command` at `node /path/to/Engram/dist/index.js`.
 
-Settings > MCP Servers > Add:
+## Three Interfaces, One Memory
 
-```json
-{
-  "engram": {
-    "command": "node",
-    "args": ["/absolute/path/to/engram/dist/index.js"]
-  }
-}
-```
+Engram exposes the same underlying knowledge graph through three access modes:
 
-## Usage Modes
+| Mode | Who uses it | How |
+|------|-------------|-----|
+| **MCP Server** | AI agents (Claude, Cursor, custom) | `engram mcp` (or auto-detected piped stdin) |
+| **CLI** | Humans in a terminal | `engram status`, `engram search …` |
+| **REST API** | Web dashboards, external apps, SaaS | `engram serve --port 3333` |
 
-Engram has three interfaces — pick the one that fits:
+All three share the same `src/service.ts` layer, so behavior is consistent.
 
-| Mode | For | Command |
-|------|-----|---------|
-| **MCP Server** | AI agents (Claude, Cursor) | `engram mcp` or auto-detected via piped stdin |
-| **CLI** | Humans in terminal | `engram status`, `engram nodes`, `engram search ...` |
-| **REST API** | Web dashboards, apps | `engram serve --port 3333` |
-
-### CLI Examples
+### CLI
 
 ```bash
-# What's in memory?
-engram status
+engram status                              # namespace stats + semantic flag
+engram nodes --type person                 # list nodes filtered by type
+engram node "Alice"                        # full detail (props, edges, version)
+engram edges "Engram"                      # relationships in both directions
+engram search "platform engineer"          # FTS5-backed keyword search
+engram events --limit 10                   # recent events from the log
+engram history "Alice"                     # version-by-version timeline
+engram context "Engram roadmap" \
+  --strategy hybrid --max-tokens 2000      # same injection an agent would get
+engram maintenance --dry-run               # decay / archive / orphan preview
 
-# List all people
-engram nodes --type person
+# Multi-tenant
+engram --namespace work status
+engram --namespace personal nodes --type note
+engram namespaces                          # list all tenants in the DB
 
-# Inspect a specific entity
-engram node "Alice"
-
-# Search for something
-engram search "platform team"
-
-# See what the AI has been doing
-engram events --limit 10
-
-# View how a node changed over time
-engram history "Alice"
-
-# Get the same context an AI agent would see
-engram context "project status" --entities "Alice,Engram"
-
-# Run maintenance (decay stale nodes, archive, clean orphans)
-engram maintenance --dry-run
-
-# Multi-namespace workflows
-engram --namespace work status              # stats for 'work' namespace
-engram --namespace personal nodes --type person
-engram namespaces                           # list all namespaces
-
-# Merge duplicate entities (re-points edges, archives source)
-engram merge Alice-v1 Alice-v2
+# Dedupe
+engram merge Alice-v1 Alice-v2             # re-points edges + archives source
 
 # Backup / restore
-engram --namespace work export > backup.json
-engram import backup.json --target work-restored --strategy reassign
+engram --namespace work export > work.json
+engram import work.json --target backup --strategy reassign
+
+# Start the REST server
+engram serve --port 3333 --host 127.0.0.1
 ```
 
 ### REST API
 
-```bash
-# Start the API server
-engram serve --port 3333
+All endpoints accept `?namespace=xyz` query param or `X-Engram-Namespace` header for per-request tenant routing.
 
-# Then query from anywhere
-curl http://localhost:3333/api/status
-curl http://localhost:3333/api/nodes?type=person
-curl http://localhost:3333/api/nodes/Alice
-curl http://localhost:3333/api/search?q=engineer
-curl http://localhost:3333/api/events?limit=10
-curl http://localhost:3333/api/history/Alice
-curl -X POST http://localhost:3333/api/context \
-  -H 'Content-Type: application/json' \
-  -d '{"topic": "project status", "entities": ["Alice"]}'
-```
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/api/health` | Liveness probe (always public) |
+| `GET` | `/api/metrics` | Prometheus text format |
+| `GET` | `/api/status` | Graph stats for current namespace |
+| `GET` | `/api/namespaces` | List all namespaces in DB |
+| `GET` | `/api/nodes?type=&limit=` | List nodes (optionally filtered by type) |
+| `GET` | `/api/nodes/:id` | Node detail + in/out edges |
+| `GET` | `/api/edges/:nodeId` | Edges for a specific node |
+| `GET` | `/api/search?q=…` | FTS5 keyword search |
+| `GET` | `/api/events?limit=&type=` | Recent events |
+| `GET` | `/api/history/:nodeId` | Version history of a node |
+| `POST` | `/api/context` | Build injection context for a topic/entities |
+| `POST` | `/api/merge` | `{ source, target }` — merge duplicates |
+| `GET` | `/api/export?archived=&events=&history=` | Full namespace dump |
+| `POST` | `/api/import` | `{ bundle, strategy, targetNamespace }` |
+
+### MCP Tools
+
+| Tool | Purpose |
+|------|---------|
+| `mutate_state` | Create / update / delete nodes (batched, atomic) |
+| `link_entities` | Create / update / delete SPO edges (auto-upsert on triplet) |
+| `query_engram` | Lookup by id/name/type, or BFS graph traversal (depth ≤ 5) |
+| `get_context` | Primary read path — graph + semantic hybrid, token budgeted |
+| `search_memory` | Semantic KNN vector search (requires embedding provider) |
+| `log_event` | Append to immutable event log |
+| `merge_nodes` | Unify duplicate entities (re-points edges, archives source) |
+
+Tools validate inputs with Zod (size and count caps applied). Tool call failures return structured errors; the MCP server logs them and continues.
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│                     Engram MCP Server                    │
-│                                                          │
-│  ┌──────────┐  ┌─────────────┐  ┌────────────────────┐  │
-│  │  Tools   │  │   Engine    │  │    Embeddings      │  │
-│  │          │  │             │  │                    │  │
-│  │ mutate   │  │ BFS Graph   │  │ OpenAI / Local    │  │
-│  │ link     │  │ Context     │  │ Auto-embed on     │  │
-│  │ query    │  │ Cache (LRU) │  │ mutation          │  │
-│  │ context  │  │ Maintenance │  │                    │  │
-│  │ search   │  │ Conflict    │  │                    │  │
-│  │ log      │  │ Resolution  │  │                    │  │
-│  └────┬─────┘  └──────┬──────┘  └─────────┬──────────┘  │
-│       │               │                    │             │
-│  ┌────┴───────────────┴────────────────────┴──────────┐  │
-│  │              SQLite (WAL mode)                     │  │
-│  ├──────────────────────┬─────────────────────────────┤  │
-│  │    engram.db         │      engram-vec.db          │  │
-│  │                      │                             │  │
-│  │  events (immutable)  │  embeddings (metadata)      │  │
-│  │  nodes  (entities)   │  vec_embeddings (sqlite-vec)│  │
-│  │  edges  (triplets)   │                             │  │
-│  │  node_history (audit)│                             │  │
-│  │  _migrations         │                             │  │
-│  └──────────────────────┴─────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
+                         ┌────────────────────────┐
+                         │      Access Modes      │
+                         │ MCP / CLI / REST API   │
+                         └───────────┬────────────┘
+                                     │
+                         ┌───────────▼────────────┐
+                         │     Service Layer      │
+                         │  (src/service.ts)      │
+                         └───────────┬────────────┘
+                                     │
+          ┌──────────────────────────┼──────────────────────────┐
+          │                          │                          │
+   ┌──────▼───────┐          ┌───────▼────────┐         ┌───────▼────────┐
+   │   Engine     │          │   DB Layer     │         │  Embeddings    │
+   │              │          │                │         │                │
+   │ BFS graph    │          │ EventLog       │         │ OpenAI API     │
+   │ Context bld  │          │ StateTree      │         │ Local (hash)   │
+   │ LRU cache    │          │ VectorStore    │         │ Auto-embed on  │
+   │ Maintenance  │          │ (namespaced)   │         │  mutation      │
+   │ Conflict res │          │                │         │                │
+   └──────┬───────┘          └───────┬────────┘         └────────────────┘
+          │                          │
+          │                  ┌───────▼────────────────────────────┐
+          │                  │         SQLite (WAL mode)          │
+          │                  ├────────────────────┬───────────────┤
+          │                  │   engram.db        │ engram-vec.db │
+          │                  │                    │               │
+          │                  │ events             │ embeddings    │
+          │                  │ nodes              │ vec_embeddings│
+          │                  │ edges              │  (sqlite-vec) │
+          │                  │ node_history       │               │
+          │                  │ nodes_fts (FTS5)   │               │
+          │                  │ _migrations        │               │
+          └──────────────────┴────────────────────┴───────────────┘
 ```
 
 ### Three-Tier Memory
 
 | Tier | Role | Analogy | Storage |
 |------|------|---------|---------|
-| **Event Log** | What happened | Subconscious | Append-only table, SHA-256 checksum chain |
-| **Cognitive State** | What is true now | Conscious | Knowledge graph (nodes + edges as SPO triplets) |
-| **Vector Store** | What feels related | Intuition | sqlite-vec KNN search (optional) |
+| **Event Log** | What happened | Subconscious | Append-only, SHA-256 checksum chain per namespace |
+| **Cognitive State** | What is true now | Conscious | Nodes + edges (SPO triplets), FTS5-indexed |
+| **Vector Store** | What feels related | Intuition | sqlite-vec KNN over auto-generated embeddings |
 
 ### Design Principles
 
-1. **No O(N) Rewrites** — Updating one fact = one row update, not a document rewrite
+1. **No O(N) Rewrites** — Updating one fact = one row update
 2. **O(1) State Lookups** — Direct index/graph lookup, not search-and-hope
-3. **State Transitions** — AI emits atomic tool calls to patch specific nodes
-4. **Token Efficiency** — Pre-computed summaries, budget-controlled context injection
-5. **Immutable History** — Full audit trail with cryptographic integrity chain
-
-## MCP Tools
-
-### `mutate_state` — Create, update, delete entities
-
-```json
-{
-  "operations": [
-    {
-      "op": "create",
-      "type": "person",
-      "name": "Alice",
-      "properties": { "role": "engineer", "team": "platform" },
-      "summary": "Senior platform engineer, leads Engram project"
-    },
-    {
-      "op": "update",
-      "node_id": "01JXYZ...",
-      "set": { "role": "lead engineer" }
-    }
-  ]
-}
-```
-
-All operations run in a single atomic transaction. Duplicate names trigger a warning with the existing node ID.
-
-### `link_entities` — Connect entities with relationships
-
-```json
-{
-  "operations": [
-    {
-      "op": "create",
-      "source_id": "01JXYZ...",
-      "predicate": "works_on",
-      "target_id": "01JABC..."
-    }
-  ]
-}
-```
-
-Duplicate triplets are auto-upserted. Standard predicates: `works_on`, `knows`, `is_a`, `prefers`, `located_in`, `reports_to`, `uses`.
-
-### `query_engram` — Look up entities or traverse the graph
-
-```json
-{
-  "node_name": "Alice",
-  "traverse": {
-    "from": "Alice",
-    "direction": "outgoing",
-    "depth": 2,
-    "predicates": ["works_on", "knows"]
-  }
-}
-```
-
-BFS traversal up to depth 5 with predicate filtering, direction control, and cycle detection.
-
-### `get_context` — Fetch relevant context for prompt injection
-
-```json
-{
-  "topic": "project status",
-  "entities": ["Alice", "Engram"],
-  "max_tokens": 2000,
-  "strategy": "hybrid"
-}
-```
-
-The primary read-path tool. Combines graph traversal and semantic search, ranks by confidence and recency, serializes to a token-efficient format within the specified budget.
-
-### `search_memory` — Semantic vector search
-
-```json
-{
-  "query": "who works on the AI project",
-  "limit": 5,
-  "min_similarity": 0.7
-}
-```
-
-Requires an embedding provider (OpenAI or local). Embeddings are auto-generated on node creation/update.
-
-### `log_event` — Append to the immutable event log
-
-```json
-{
-  "type": "observation",
-  "source": "agent",
-  "content": { "note": "User prefers dark mode" }
-}
-```
+3. **Explicit State Transitions** — Agents emit atomic tool calls, not prose
+4. **Token Efficiency** — Pre-computed summaries + budget-controlled injection
+5. **Immutable History** — Full audit trail with cryptographic integrity
+6. **Tenant Isolation** — Namespaces separate nodes, edges, events, history, embeddings, and event chains
 
 ## Configuration
 
-### Environment Variables
+All settings come from env vars (or `.env`, if you source one — see `.env.example`).
+
+### Storage
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ENGRAM_DATA_DIR` | `./data` | Directory for database files |
-| `ENGRAM_DB_FILENAME` | `engram.db` | Main database filename |
-| `ENGRAM_VEC_DB_FILENAME` | `engram-vec.db` | Vector database filename |
-| `ENGRAM_NAMESPACE` | `default` | Memory namespace (multi-tenant isolation) |
+| `ENGRAM_DB_FILENAME` | `engram.db` | Main DB filename |
+| `ENGRAM_VEC_DB_FILENAME` | `engram-vec.db` | Vector DB filename |
+
+### Multi-Tenancy
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGRAM_NAMESPACE` | `default` | Namespace used when no override is provided |
+| `ENGRAM_NAMESPACE_ALLOWLIST` | — | Comma-separated list; if set, rejects per-request namespaces not in the list |
+| `ENGRAM_CORE_CACHE_SIZE` | `32` | Max concurrent namespace cores held in memory (LRU) |
+
+### Embedding / Semantic Search
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `ENGRAM_EMBEDDING_PROVIDER` | `none` | `openai`, `local`, or `none` |
-| `OPENAI_API_KEY` | — | Auto-enables OpenAI embeddings when set |
+| `OPENAI_API_KEY` | — | Setting this auto-enables OpenAI embeddings |
 | `OPENAI_BASE_URL` | — | Custom OpenAI-compatible endpoint |
-| `ENGRAM_API_TOKEN` | — | Bearer token(s) for REST API (comma-separated) |
-| `ENGRAM_RATE_BURST` | `60` | Rate limit: burst capacity |
-| `ENGRAM_RATE_PER_SEC` | `10` | Rate limit: sustained rate per second |
+
+### REST API Security / Limits
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `ENGRAM_API_TOKEN` | — | Bearer token(s) for REST API (comma-separated). Unset = auth off |
+| `ENGRAM_TRUST_PROXY` | — | Set to `1` to honor `X-Forwarded-For` (only behind a trusted proxy) |
+| `ENGRAM_RATE_BURST` | `60` | Token-bucket burst capacity |
+| `ENGRAM_RATE_PER_SEC` | `10` | Sustained refill rate |
 | `ENGRAM_RATE_LIMIT` | — | Set to `off` to disable rate limiting |
-| `ENGRAM_CORS_ORIGIN` | `*` | CORS origin for REST API |
+| `ENGRAM_CORS_ORIGIN` | `*` | CORS origin for REST |
+| `ENGRAM_CONTEXT_MAX_BYTES` | `64000` | `POST /api/context` body limit |
+| `ENGRAM_IMPORT_MAX_BYTES` | `16777216` | `POST /api/import` body limit |
+
+### Observability
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `ENGRAM_LOG_LEVEL` | `info` | `debug` / `info` / `warn` / `error` |
 | `ENGRAM_LOG_FORMAT` | `json` | `json` or `pretty` |
+| `ENGRAM_METRIC_NAMESPACES` | — | Comma-separated allowlist for `namespace=` metric labels; unknown values collapse to `_other` |
 
-### Production Deployment
+## Production Deployment
 
 ```bash
-# Typical production REST API setup
-export ENGRAM_DATA_DIR=/var/lib/engram
-export ENGRAM_API_TOKEN="$(openssl rand -hex 32)"
-export ENGRAM_RATE_BURST=100
-export ENGRAM_RATE_PER_SEC=20
-export ENGRAM_CORS_ORIGIN=https://app.example.com
-export ENGRAM_LOG_LEVEL=info
-export ENGRAM_LOG_FORMAT=json
-export OPENAI_API_KEY=sk-...
+# /etc/engram.env
+ENGRAM_DATA_DIR=/var/lib/engram
+ENGRAM_API_TOKEN=$(openssl rand -hex 32)
+ENGRAM_NAMESPACE_ALLOWLIST=default,acme-prod,acme-staging
+ENGRAM_METRIC_NAMESPACES=default,acme-prod,acme-staging
+ENGRAM_RATE_BURST=120
+ENGRAM_RATE_PER_SEC=30
+ENGRAM_TRUST_PROXY=1          # only if behind a real reverse proxy
+ENGRAM_CORS_ORIGIN=https://app.example.com
+ENGRAM_LOG_FORMAT=json
+ENGRAM_EMBEDDING_PROVIDER=openai
+OPENAI_API_KEY=sk-...
 
 engram serve --port 3333 --host 0.0.0.0
 ```
 
-Observability endpoints:
-- `GET /api/health` — liveness probe (always public, exempt from auth/rate-limit)
-- `GET /api/metrics` — Prometheus text format (requires auth if configured)
+### Observability endpoints
 
-Scrape `/api/metrics` with Prometheus; the exposed metrics include mutation
-and context latency histograms, cache hit rates, embedding success/failure,
-and per-endpoint request/error counters.
+- `GET /api/health` — always-public liveness probe (exempt from auth & rate-limit)
+- `GET /api/metrics` — Prometheus text format, includes:
+  - `engram_mutations_total{namespace, kind}`
+  - `engram_context_requests_total{namespace, strategy}`
+  - `engram_cache_hits_total / engram_cache_misses_total{kind}`
+  - `engram_embeddings_total / engram_embedding_failures_total{namespace}`
+  - `engram_api_requests_total{method, path, status}`
+  - `engram_api_errors_total`
+  - `engram_auth_failures_total{reason}`
+  - `engram_mutation_duration_seconds` / `engram_context_duration_seconds` histograms
 
-### Semantic Search Setup
+Every response sets `X-Request-ID` so structured logs can be correlated.
 
-Engram works without any API keys — graph-based memory is fully functional out of the box. To enable semantic (fuzzy) search:
+### Security model
 
-```bash
-# Option 1: OpenAI embeddings (recommended)
-export OPENAI_API_KEY=sk-...
-
-# Option 2: Local deterministic embeddings (no API, for testing)
-export ENGRAM_EMBEDDING_PROVIDER=local
-```
+- **Auth**: Bearer token via `Authorization: Bearer <token>`. Multiple tokens (comma-separated) supported for rotation. Comparison is `crypto.timingSafeEqual`. `/api/health` is exempt; everything else requires a valid token when `ENGRAM_API_TOKEN` is set.
+- **Rate limiting**: Token bucket per client. Client identity = token fingerprint (SHA-256 truncated) if authed, else socket remote address. Only honors `X-Forwarded-For` when `ENGRAM_TRUST_PROXY=1`.
+- **Namespace isolation**: Node IDs, edge triplets, event chains, history, embeddings — all per-namespace. Imports refuse to clobber nodes in another namespace. `link_entities` rejects cross-namespace source/target refs.
+- **Input caps**: Zod schemas cap operation counts, property counts, string lengths, array sizes. Body limits per endpoint.
 
 ## Development
 
 ```bash
-bun install            # Install dependencies
-bun run dev            # Start dev server (tsx)
-bun run build          # Compile TypeScript
-bun run test           # Run tests (50 tests)
-bun run test:watch     # Watch mode
-bun run typecheck      # Type check only
+bun install                    # Install dependencies
+bun run dev                    # Start dev MCP server via tsx
+bun run build                  # Compile TypeScript + copy migrations
+bun run test                   # Run all tests (79 currently)
+bun run test:watch             # Watch mode
+bun run typecheck              # Type check only
 ```
 
 ### Project Structure
 
 ```
 src/
-  config/         Config loader with Zod validation
-  db/             SQLite layer: EventLog, StateTree, VectorStore
-    migrations/   SQL schema migrations (version-tracked)
-  engine/         Graph traversal, context builder, cache, maintenance
-  embeddings/     OpenAI and local embedding providers
-  tools/          6 MCP tool handlers
-  server.ts       MCP server creation and wiring
-  index.ts        Entry point (stdio transport)
+  config/                      Zod-validated config, env precedence
+  db/                          SQLite layer (namespace-scoped)
+    migrations/                SQL schema migrations (tracked)
+    event-log.ts               Immutable log with per-namespace SHA-256 chain
+    state-tree.ts              Node/edge CRUD, history, FTS5, merge
+    vector-store.ts            sqlite-vec KNN
+  engine/                      Pure algorithms
+    graph-traversal.ts         BFS (≤ depth 5), cycle detection
+    context-builder.ts         Token-budgeted serialization
+    cache.ts                   In-memory node + LRU context
+    maintenance.ts             Decay, archive, orphan GC
+    conflict-resolver.ts       Duplicate detection
+  embeddings/                  Provider abstraction
+    openai.ts                  OpenAI embedding API
+    local.ts                   Deterministic hash (testing)
+  tools/                       7 MCP tool handlers
+  cli/                         CLI commands + colorized formatters
+  api/                         Hono REST app (auth, rate-limit, CORS)
+  service.ts                   Shared layer for CLI + REST + MCP
+  server.ts                    MCP server factory
+  metrics.ts                   Prometheus registry (zero-dep)
+  logger.ts                    Structured JSON logger
+  rate-limit.ts                Token-bucket limiter
+  port.ts                      JSON import/export
+  utils.ts                     safeJsonParse
+  index.ts                     Entry — auto-routes MCP (piped stdin) vs CLI
 tests/
-  unit/           Unit tests for each module
-  integration/    End-to-end lifecycle tests
-  fixtures/       Test graph data
+  unit/                        Per-module tests
+  integration/                 End-to-end lifecycle
+  fixtures/                    Test graph data
+scripts/
+  populate-test-data.ts        Seed data for manual E2E
+  populate-ns.ts               Multi-namespace test data
+  verify-advanced.ts           Advanced feature verification
+  bench-fts.ts                 FTS5 benchmark
+```
+
+### Running a scenario end-to-end
+
+```bash
+# 1. Seed a test graph
+ENGRAM_DATA_DIR=/tmp/engram-demo \
+  ENGRAM_EMBEDDING_PROVIDER=local \
+  bun run src/index.ts  # (or npx tsx scripts/populate-test-data.ts)
+
+# 2. Browse via CLI
+ENGRAM_DATA_DIR=/tmp/engram-demo engram status
+ENGRAM_DATA_DIR=/tmp/engram-demo engram context "AI memory" --strategy hybrid
+
+# 3. Start REST and query
+ENGRAM_DATA_DIR=/tmp/engram-demo engram serve --port 3333 &
+curl http://localhost:3333/api/status
+curl -X POST http://localhost:3333/api/context \
+  -H 'Content-Type: application/json' \
+  -d '{"topic":"AI memory","max_tokens":500}'
+
+# 4. Connect via MCP (e.g., Claude Desktop)
+#    → see Quick Start
 ```
 
 ## How It Works
 
 ```
-User says: "Alice just moved to the platform team"
+User: "Alice just moved to the platform team."
 
-1. Agent calls get_context({ entities: ["Alice"] })
-   → Engram returns Alice's current state from the graph
+Agent flow:
+1. get_context({ entities: ["Alice"] })
+   → Engram returns Alice's current state + 1-hop neighbors
 
-2. Agent calls mutate_state({
+2. mutate_state({
      operations: [{ op: "update", node_id: "...", set: { team: "platform" } }]
    })
-   → Node updated atomically
-   → Old state preserved in node_history
-   → Mutation logged to immutable event log
-   → Cache invalidated
-   → Embedding auto-regenerated
+   → Atomic transaction:
+     - Snapshot old state to node_history (rowid tracked)
+     - UPDATE nodes SET ... WHERE id = ? AND namespace = ?
+     - Append mutation event (per-namespace SHA-256 chain)
+     - Link event_id back to both node and history row
+     - Invalidate cache entries for this node
+     - Fire onMutate callback → re-embed in background
 
-3. Next conversation, agent calls get_context({ topic: "platform team" })
-   → Alice appears in results with updated team
-   → No re-indexing, no document rewrite, no token waste
+3. Next conversation:
+   get_context({ topic: "platform team" })
+   → FTS5 finds Alice (name + summary + properties match)
+   → Semantic search finds semantically related nodes
+   → BFS expands 1 hop from anchors
+   → Context builder serializes within token budget
 ```
 
 ## License
