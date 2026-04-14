@@ -1,6 +1,7 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { z } from 'zod';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import type { EngramCore } from '../service.js';
 import { createEngramCore } from '../service.js';
 import * as svc from '../service.js';
@@ -25,6 +26,39 @@ function safeInt(val: string | undefined, fallback: number): number {
 
 function validateNamespace(ns: string): boolean {
   return /^[a-zA-Z0-9_\-.]+$/.test(ns) && ns.length >= 1 && ns.length <= 64;
+}
+
+/**
+ * Resolve rate-limiter key. Priority:
+ * 1. Bearer token fingerprint (SHA-256 truncated) — H-B4 fix, no prefix collisions
+ * 2. X-Forwarded-For first hop (only when ENGRAM_TRUST_PROXY=1)
+ * 3. Socket remote address via Hono conninfo
+ * 4. 'anon' fallback
+ */
+async function resolveClientKey(
+  c: any,
+  trustProxy: boolean,
+  getConnInfo: (c: any) => { remote?: { address?: string; port?: number } },
+): Promise<string> {
+  const authHeader = c.req.header('authorization') ?? '';
+  if (authHeader.startsWith('Bearer ')) {
+    const token = authHeader.slice(7);
+    const hash = createHash('sha256').update(token).digest('hex').slice(0, 16);
+    return `token:${hash}`;
+  }
+
+  if (trustProxy) {
+    const fwd = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
+    if (fwd) return `ip:${fwd}`;
+  }
+
+  try {
+    const info = getConnInfo(c);
+    if (info.remote?.address) return `ip:${info.remote.address}`;
+  } catch {
+    // conninfo not wired — fall through
+  }
+  return 'anon';
 }
 
 /** Normalize /api/nodes/01HXYZ to /api/nodes/:id for metric cardinality */
@@ -127,20 +161,21 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
   const rlConfig = opts.rateLimit ?? envRateLimit();
   const limiter = rlConfig === false ? null : new RateLimiter(rlConfig);
 
+  // C-B1: only trust X-Forwarded-For when explicitly opted-in
+  const trustProxy = process.env['ENGRAM_TRUST_PROXY'] === '1'
+    || process.env['ENGRAM_TRUST_PROXY'] === 'true';
+
   if (limiter) {
+    // Lazy import so tests without @hono/node-server still run
+    const conninfoPromise = import('@hono/node-server/conninfo').then(m => m.getConnInfo);
+
     app.use('*', async (c, next) => {
-      // Skip health & metrics endpoints (monitoring shouldn't trigger limits)
+      // Monitoring endpoints exempt
       if (c.req.path === '/api/health' || c.req.path === '/api/metrics') {
         return next();
       }
 
-      // Identify client: auth token > forwarded-for > unknown
-      const authHeader = c.req.header('authorization') ?? '';
-      const fwd = c.req.header('x-forwarded-for')?.split(',')[0]?.trim();
-      const key = authHeader.startsWith('Bearer ')
-        ? `token:${authHeader.slice(7, 20)}` // fingerprint, don't log full token
-        : fwd ?? 'anon';
-
+      const key = await resolveClientKey(c, trustProxy, await conninfoPromise);
       const { allowed, retryAfterMs } = limiter.tryConsume(key);
       if (!allowed) {
         c.header('Retry-After', String(Math.ceil(retryAfterMs / 1000)));
@@ -148,7 +183,6 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
         c.header('X-RateLimit-Refill-Per-Sec', String(limiter.config.refillPerSecond));
         return c.json({ error: 'Too many requests', retry_after_ms: retryAfterMs }, 429);
       }
-
       return next();
     });
   }
