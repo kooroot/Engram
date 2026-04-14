@@ -174,20 +174,37 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
   const corsOrigin = process.env['ENGRAM_CORS_ORIGIN'] ?? '*';
   app.use('*', cors({ origin: corsOrigin }));
 
-  // Auth: Bearer token. Applied BEFORE rate limit so unauthenticated requests
-  // don't consume rate budget.
+  // Auth: Bearer token. Runs BEFORE rate limit so unauthenticated requests
+  // don't consume legit user rate budget. Failures are metered/logged so
+  // brute-force attempts are visible.
   const tokens = resolveAuthTokens(opts.authTokens);
+  // M4: warn if ENGRAM_API_TOKEN is set but produced no valid tokens
+  if (process.env['ENGRAM_API_TOKEN'] !== undefined && tokens.size === 0) {
+    log.warn('auth_misconfigured', {
+      hint: 'ENGRAM_API_TOKEN is set but no valid token parsed — auth is DISABLED',
+    });
+  }
+
   if (tokens.size > 0) {
+    // Pre-compute token buffers for timing-safe compare (M5)
+    const tokenBuffers = [...tokens].map(t => Buffer.from(t));
+
     app.use('*', async (c, next) => {
-      // Exempt health from auth so load balancers / monitors can probe
       if (c.req.path === '/api/health') return next();
 
       const header = c.req.header('authorization') ?? '';
       if (!header.startsWith('Bearer ')) {
+        metrics.authFailures.inc({ reason: 'missing' });
+        log.warn('auth_missing', { path: c.req.path });
         return c.json({ error: 'Missing Authorization header' }, 401);
       }
-      const provided = header.slice(7).trim();
-      if (!tokens.has(provided)) {
+      const provided = Buffer.from(header.slice(7).trim());
+      const ok = tokenBuffers.some(buf =>
+        buf.length === provided.length && timingSafeEqual(buf, provided)
+      );
+      if (!ok) {
+        metrics.authFailures.inc({ reason: 'invalid' });
+        log.warn('auth_invalid', { path: c.req.path });
         return c.json({ error: 'Invalid token' }, 403);
       }
       return next();

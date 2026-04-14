@@ -189,6 +189,10 @@ export const metrics = {
     'engram_api_errors_total',
     'REST API error responses (4xx, 5xx)'
   ),
+  authFailures: new Counter(
+    'engram_auth_failures_total',
+    'REST auth failures (missing or invalid Bearer token)'
+  ),
 
   // Gauges
   activeNodes: new Gauge(
