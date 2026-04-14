@@ -18,10 +18,14 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
     cache: overrides.cache,
     embedding: {
       provider: overrides.embedding?.provider ?? env['ENGRAM_EMBEDDING_PROVIDER'],
-      dimension: overrides.embedding?.dimension,
+      dimension: overrides.embedding?.dimension
+        ?? (env['ENGRAM_EMBEDDING_DIMENSION'] ? Number(env['ENGRAM_EMBEDDING_DIMENSION']) : undefined),
       model: overrides.embedding?.model,
       apiKey: overrides.embedding?.apiKey ?? env['OPENAI_API_KEY'],
       baseUrl: overrides.embedding?.baseUrl ?? env['OPENAI_BASE_URL'],
+      shellCmd: overrides.embedding?.shellCmd ?? env['ENGRAM_EMBEDDING_CMD'],
+      shellTimeoutMs: overrides.embedding?.shellTimeoutMs
+        ?? (env['ENGRAM_EMBEDDING_TIMEOUT_MS'] ? Number(env['ENGRAM_EMBEDDING_TIMEOUT_MS']) : undefined),
     },
     maintenance: overrides.maintenance,
   };

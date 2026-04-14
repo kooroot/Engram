@@ -18,6 +18,7 @@ import type { Node, Edge, Event, EventType } from './types/index.js';
 import type { EmbeddingProvider } from './embeddings/index.js';
 import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
 import { LocalEmbeddingProvider } from './embeddings/local.js';
+import { ShellEmbeddingProvider } from './embeddings/shell.js';
 import { safeJsonParse } from './utils.js';
 import { metrics, startTimer, safeNamespaceLabel } from './metrics.js';
 import { log } from './logger.js';
@@ -87,6 +88,17 @@ export function resolveEmbeddingProvider(
       });
     case 'local':
       return new LocalEmbeddingProvider(config.embedding.dimension);
+    case 'shell':
+      if (!config.embedding.shellCmd) {
+        throw new Error(
+          "Embedding provider 'shell' requires ENGRAM_EMBEDDING_CMD (e.g. \"codex embed --stdin\")",
+        );
+      }
+      return new ShellEmbeddingProvider({
+        command: config.embedding.shellCmd,
+        dimension: config.embedding.dimension,
+        timeoutMs: config.embedding.shellTimeoutMs,
+      });
     case 'none':
     default:
       if (config.embedding.apiKey) {

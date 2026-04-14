@@ -44,18 +44,28 @@ Agent needs context about Alice
 
 ## Quick Start
 
+### Install (recommended)
+
+```bash
+bun install -g @kooroot/engram     # or: npm i -g / pnpm add -g / yarn global add
+engram onboard                      # interactive wizard: data dir, namespace, embedding, MCP install
+engram doctor                       # verify the setup
+```
+
+`engram onboard` auto-detects `codex`/OpenAI key, creates `~/.engram/`, writes an env file, and registers the MCP server with Claude Code if the CLI is present.
+
+### From source (development)
+
 ```bash
 git clone https://github.com/kooroot/Engram.git
 cd Engram
 bun install
 bun run build
-
-# Use as global CLI
 bun link
-engram status
+engram onboard
 ```
 
-### Hook into an agent
+### Manual agent wiring (if you skip `onboard`)
 
 **Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
 
@@ -63,8 +73,8 @@ engram status
 {
   "mcpServers": {
     "engram": {
-      "command": "node",
-      "args": ["/absolute/path/to/Engram/dist/index.js"],
+      "command": "engram",
+      "args": ["mcp"],
       "env": { "ENGRAM_DATA_DIR": "/path/to/data" }
     }
   }
@@ -74,10 +84,10 @@ engram status
 **Claude Code:**
 
 ```bash
-claude mcp add engram node /absolute/path/to/Engram/dist/index.js
+claude mcp add engram --env ENGRAM_DATA_DIR=$HOME/.engram -- engram mcp
 ```
 
-**Cursor / any MCP-compatible client:** point `command` at `node /path/to/Engram/dist/index.js`.
+**Cursor / any MCP-compatible client:** point `command` at the `engram` binary with `mcp` as the argument.
 
 ## Three Interfaces, One Memory
 

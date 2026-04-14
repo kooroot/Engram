@@ -10,3 +10,5 @@ data/
 .DS_Store
 coverage/
 .test-data/
+.claude/
+.npmrc

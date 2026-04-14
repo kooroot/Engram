@@ -17,11 +17,13 @@ export const ConfigSchema = z.object({
   }).default({}),
 
   embedding: z.object({
-    provider: z.enum(['openai', 'local', 'none']).default('none'),
+    provider: z.enum(['openai', 'local', 'shell', 'none']).default('none'),
     dimension: z.number().int().positive().default(1536),
     model: z.string().default('text-embedding-3-small'),
     apiKey: z.string().optional(),
     baseUrl: z.string().optional(),
+    shellCmd: z.string().optional(),
+    shellTimeoutMs: z.number().int().positive().default(30_000),
   }).default({}),
 
   maintenance: z.object({

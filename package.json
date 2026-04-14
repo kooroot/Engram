@@ -1,22 +1,52 @@
 {
-  "name": "engram",
+  "name": "@kooroot/engram",
   "version": "0.1.0",
-  "description": "AI-native persistent memory space with state-transition architecture",
+  "description": "AI-native persistent memory for agents — knowledge graph, not files, not RAG. MCP server + CLI + REST.",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "bin": {
     "engram": "dist/index.js"
   },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "build": "tsc && cp -r src/db/migrations dist/db/",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run typecheck && bun run test && bun run build"
   },
-  "keywords": ["mcp", "memory", "ai", "graph", "state-machine"],
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "ai",
+    "agent",
+    "knowledge-graph",
+    "state-machine",
+    "persistent-memory",
+    "vector-search",
+    "sqlite"
+  ],
+  "author": "kooroot",
   "license": "MIT",
+  "homepage": "https://github.com/kooroot/Engram#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kooroot/Engram.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kooroot/Engram/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "engines": {
     "node": ">=20.0.0"
   },

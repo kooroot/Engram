@@ -3,6 +3,8 @@ import { createEngramCore, type EngramCore } from '../service.js';
 import * as svc from '../service.js';
 import * as fmt from './formatters.js';
 import type { EventType } from '../types/index.js';
+import { runOnboard } from './onboard.js';
+import { runDoctor } from './doctor.js';
 
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
@@ -30,6 +32,24 @@ export function registerCLICommands(program: Command): void {
   program.option('-n, --namespace <name>', 'Namespace to operate on (default: from ENGRAM_NAMESPACE or "default")');
 
   const ns = () => (program.opts() as { namespace?: string }).namespace;
+
+  // ─── onboard ─────────────────────────────────────
+
+  program
+    .command('onboard')
+    .description('Interactive setup wizard (data dir, namespace, embedding, Claude Code MCP)')
+    .action(async () => {
+      await runOnboard();
+    });
+
+  // ─── doctor ──────────────────────────────────────
+
+  program
+    .command('doctor')
+    .description('Diagnose Engram installation (build, data dir, embeddings, MCP registration)')
+    .action(async () => {
+      await runDoctor();
+    });
 
   // ─── status ──────────────────────────────────────
 
