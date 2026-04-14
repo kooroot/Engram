@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { bodyLimit } from 'hono/body-limit';
 import { z } from 'zod';
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { EngramCore } from '../service.js';
@@ -18,10 +19,28 @@ const contextBodySchema = z.object({
   strategy: z.enum(['graph', 'semantic', 'hybrid']).optional(),
 });
 
+// M1: strict validation for import bundles. Caps array sizes so an
+// attacker can't send a 10M-node payload that parses before limits.
+const MAX_BUNDLE_ARRAY = 100_000;
+const bundleSchema = z.object({
+  version: z.number(),
+  namespace: z.string().min(1).max(64).regex(/^[a-zA-Z0-9_\-.]+$/),
+  exported_at: z.string(),
+  nodes: z.array(z.unknown()).max(MAX_BUNDLE_ARRAY),
+  edges: z.array(z.unknown()).max(MAX_BUNDLE_ARRAY),
+  events: z.array(z.unknown()).max(MAX_BUNDLE_ARRAY),
+  history: z.array(z.unknown()).max(MAX_BUNDLE_ARRAY),
+});
+
 function safeInt(val: string | undefined, fallback: number): number {
-  if (!val) return fallback;
+  if (val === undefined || val === '') return fallback;
   const n = Number(val);
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/** M3: robustly parse env var as positive number with fallback */
+function envInt(name: string, fallback: number): number {
+  return safeInt(process.env[name], fallback);
 }
 
 function validateNamespace(ns: string): boolean {
@@ -98,12 +117,12 @@ function resolveAuthTokens(opt?: string | string[]): Set<string> {
   return new Set(env.split(',').map(t => t.trim()).filter(Boolean));
 }
 
-/** Extract rate limit config from env vars */
+/** Extract rate limit config from env vars (M3: NaN-safe) */
 function envRateLimit(): RateLimitConfig | false {
   if (process.env['ENGRAM_RATE_LIMIT'] === 'off') return false;
   return {
-    burst: Number(process.env['ENGRAM_RATE_BURST'] ?? 60),
-    refillPerSecond: Number(process.env['ENGRAM_RATE_PER_SEC'] ?? 10),
+    burst: envInt('ENGRAM_RATE_BURST', 60),
+    refillPerSecond: envInt('ENGRAM_RATE_PER_SEC', 10),
     idleTimeoutMs: 300_000,
   };
 }
@@ -114,7 +133,7 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
 
   // H-B3: Bounded LRU cache for per-request namespace cores.
   // Eviction closes the DB connection so descriptors/memory stay capped.
-  const CORE_CACHE_MAX = Number(process.env['ENGRAM_CORE_CACHE_SIZE']) || 32;
+  const CORE_CACHE_MAX = envInt('ENGRAM_CORE_CACHE_SIZE', 32);
   const namespaceAllowlist = parseAllowlist(process.env['ENGRAM_NAMESPACE_ALLOWLIST']);
   const coreCache = new Map<string, EngramCore>();
   coreCache.set(defaultCore.config.namespace, defaultCore);
@@ -341,7 +360,13 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
 
   // ─── Context ───────────────────────────────────
 
-  app.post('/api/context', async (c) => {
+  // M11: body size limits (smaller for context, larger for import)
+  const MAX_CONTEXT_BYTES = envInt('ENGRAM_CONTEXT_MAX_BYTES', 64_000);
+  const MAX_IMPORT_BYTES = envInt('ENGRAM_IMPORT_MAX_BYTES', 16 * 1024 * 1024);
+
+  app.post('/api/context',
+    bodyLimit({ maxSize: MAX_CONTEXT_BYTES, onError: (c) => c.json({ error: 'Payload too large' }, 413) }),
+    async (c) => {
     const core = resolveCore(c);
     let body: z.infer<typeof contextBodySchema>;
     try {
@@ -401,12 +426,14 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
   });
 
   const importBodySchema = z.object({
-    bundle: z.record(z.unknown()),
+    bundle: bundleSchema,
     strategy: z.enum(['skip', 'overwrite', 'merge', 'reassign']).optional(),
     targetNamespace: z.string().max(64).optional(),
   });
 
-  app.post('/api/import', async (c) => {
+  app.post('/api/import',
+    bodyLimit({ maxSize: MAX_IMPORT_BYTES, onError: (c) => c.json({ error: 'Bundle too large' }, 413) }),
+    async (c) => {
     let body: z.infer<typeof importBodySchema>;
     try {
       body = importBodySchema.parse(await c.req.json());

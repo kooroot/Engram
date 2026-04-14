@@ -135,19 +135,37 @@ export function createEngramCore(
 
   if (embeddingProvider && vectorStore.isVecEnabled && !options.disableAutoEmbed) {
     stateTree.onMutate(async (nodeIds) => {
+      // M6: batch embedding requests — one API call per mutation instead of N
+      // M7: skip archived/deleted nodes to avoid wasted API calls
+      const pending: Array<{ nodeId: string; text: string }> = [];
       for (const nodeId of nodeIds) {
         const node = stateTree.getNode(nodeId);
-        if (!node) continue;
+        if (!node || node.archived) continue;
         const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
-        try {
-          const embedding = await embeddingProvider.embed(text);
-          vectorStore.removeBySource('node', nodeId);
-          vectorStore.store({ source_type: 'node', source_id: nodeId, text, embedding });
+        pending.push({ nodeId, text });
+      }
+      if (pending.length === 0) return;
+
+      try {
+        const embeddings = await embeddingProvider.embedBatch(pending.map(p => p.text));
+        for (let i = 0; i < pending.length; i++) {
+          const p = pending[i];
+          vectorStore.removeBySource('node', p.nodeId);
+          vectorStore.store({
+            source_type: 'node',
+            source_id: p.nodeId,
+            text: p.text,
+            embedding: embeddings[i],
+          });
           metrics.embeddings.inc({ namespace: safeNamespaceLabel(ns) });
-        } catch (err) {
-          metrics.embeddingFailures.inc({ namespace: safeNamespaceLabel(ns) });
-          log.warn('auto-embed failed', { namespace: ns, node_id: nodeId, error: String(err) });
         }
+      } catch (err) {
+        metrics.embeddingFailures.inc({ namespace: safeNamespaceLabel(ns) }, pending.length);
+        log.warn('auto-embed batch failed', {
+          namespace: ns,
+          count: pending.length,
+          error: String(err),
+        });
       }
     });
   }
