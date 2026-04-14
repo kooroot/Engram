@@ -254,31 +254,59 @@ export function getEdgesForNode(
 
 // ─── Search ──────────────────────────────────────────────
 
+/**
+ * Keyword search via FTS5 (fast, indexed) with fallback to JS filter
+ * if FTS5 parsing fails on unusual input.
+ */
 export function searchNodes(
   core: EngramCore,
   query: string,
   limit: number = 20,
 ): Node[] {
+  const sanitized = sanitizeFtsQuery(query);
+  if (!sanitized) return [];
+  try {
+    return core.stateTree.searchFts(sanitized, limit);
+  } catch {
+    return fallbackSearch(core, query, limit);
+  }
+}
+
+/**
+ * Sanitize user input for FTS5. Quoted phrases are preserved as-is;
+ * plain tokens are prefix-matched (`engi*` matches engineer/engineering)
+ * and joined with OR so any match wins.
+ */
+function sanitizeFtsQuery(input: string): string {
+  const trimmed = input.trim();
+  if (!trimmed) return '';
+  const out: string[] = [];
+  const regex = /"([^"]+)"|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while ((m = regex.exec(trimmed)) !== null) {
+    if (m[1]) {
+      out.push(`"${m[1]}"`);
+    } else if (m[2]) {
+      const cleaned = m[2].replace(/["()\-*:^]/g, '');
+      if (cleaned) out.push(`${cleaned}*`);
+    }
+  }
+  return out.join(' OR ');
+}
+
+function fallbackSearch(core: EngramCore, query: string, limit: number): Node[] {
   const keywords = query.toLowerCase().split(/\s+/);
   const allActive = core.stateTree.searchAllNodes(500);
   const results: Node[] = [];
-
   for (const node of allActive) {
-    const nameLower = node.name.toLowerCase();
-    const typeLower = node.type.toLowerCase();
-    const summaryLower = (node.summary ?? '').toLowerCase();
-    const propsStr = JSON.stringify(node.properties).toLowerCase();
-
-    if (keywords.some(kw =>
-      nameLower.includes(kw) ||
-      typeLower.includes(kw) ||
-      summaryLower.includes(kw) ||
-      propsStr.includes(kw)
-    )) {
-      results.push(node);
-    }
+    const hay = [
+      node.name,
+      node.type,
+      node.summary ?? '',
+      JSON.stringify(node.properties),
+    ].join(' ').toLowerCase();
+    if (keywords.some(kw => hay.includes(kw))) results.push(node);
   }
-
   return results.slice(0, limit);
 }
 

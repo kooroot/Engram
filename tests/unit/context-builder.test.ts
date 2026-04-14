@@ -18,7 +18,7 @@ function setupDb(): Database.Database {
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   const migrationsDir = path.join(import.meta.dirname, '..', '..', 'src', 'db', 'migrations');
-  for (const file of ['001_init_events.sql', '002_init_state_tree.sql', '003_init_node_history.sql', '005_add_namespaces.sql']) {
+  for (const file of ['001_init_events.sql', '002_init_state_tree.sql', '003_init_node_history.sql', '005_add_namespaces.sql', '007_add_fts5.sql']) {
     db.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf-8'));
   }
   return db;

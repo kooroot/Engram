@@ -168,6 +168,26 @@ export class StateTree {
     return rows.map(nodeFromRow);
   }
 
+  /**
+   * FTS5-backed full-text search across node name, type, summary, and properties.
+   * Orders by BM25 relevance. Scoped to this namespace.
+   *
+   * Query syntax supports FTS5 operators: `AND`, `OR`, `NOT`, phrase `"..."`, prefix `foo*`.
+   * Plain words are treated as AND by default.
+   */
+  searchFts(query: string, limit: number = 50): Node[] {
+    // FTS5 tokenizes and matches across all indexed columns
+    const rows = this.db.prepare(`
+      SELECT n.* FROM nodes_fts f
+      INNER JOIN nodes n ON n.id = f.id
+      WHERE f.nodes_fts MATCH ? AND f.namespace = ?
+        AND n.archived = 0
+      ORDER BY rank
+      LIMIT ?
+    `).all(query, this.namespace, limit) as NodeRow[];
+    return rows.map(nodeFromRow);
+  }
+
   // ─── Edge Operations ─────────────────────────────────────────
 
   getEdge(id: string): Edge | null {

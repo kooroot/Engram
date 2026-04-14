@@ -22,6 +22,7 @@ function setupDb(): Database.Database {
     '002_init_state_tree.sql',
     '003_init_node_history.sql',
     '005_add_namespaces.sql',
+    '007_add_fts5.sql',
   ]) {
     db.exec(fs.readFileSync(path.join(migrationsDir, file), 'utf-8'));
   }

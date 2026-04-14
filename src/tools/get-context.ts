@@ -128,28 +128,33 @@ function expandFromNode(
 }
 
 /**
- * H1 fix: Search ALL active nodes, not a hardcoded list of types.
- * Matches against name, summary, and properties.
+ * Fast FTS5-backed keyword search (with JS fallback).
  */
 function findNodesByKeywords(stateTree: StateTree, keywords: string[]): Node[] {
-  const allActive = stateTree.searchAllNodes(500);
-  const results: Node[] = [];
+  if (keywords.length === 0) return [];
 
-  for (const node of allActive) {
-    const nameLower = node.name.toLowerCase();
-    const typeLower = node.type.toLowerCase();
-    const summaryLower = (node.summary ?? '').toLowerCase();
-    const propsStr = JSON.stringify(node.properties).toLowerCase();
+  // Build FTS5 OR query with prefix match per keyword
+  const sanitized = keywords
+    .map(kw => kw.replace(/["()\-*:^]/g, ''))
+    .filter(Boolean)
+    .map(kw => `${kw}*`)
+    .join(' OR ');
 
-    if (keywords.some(kw =>
-      nameLower.includes(kw) ||
-      typeLower.includes(kw) ||
-      summaryLower.includes(kw) ||
-      propsStr.includes(kw)
-    )) {
-      results.push(node);
+  if (!sanitized) return [];
+
+  try {
+    return stateTree.searchFts(sanitized, 100);
+  } catch {
+    // Fallback: linear scan
+    const allActive = stateTree.searchAllNodes(500);
+    const results: Node[] = [];
+    for (const node of allActive) {
+      const hay = [
+        node.name, node.type, node.summary ?? '',
+        JSON.stringify(node.properties),
+      ].join(' ').toLowerCase();
+      if (keywords.some(kw => hay.includes(kw))) results.push(node);
     }
+    return results;
   }
-
-  return results;
 }
