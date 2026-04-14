@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
+import { createRequire } from 'node:module';
 import chalk from 'chalk';
 import { loadConfig } from '../config/index.js';
 import { resolveEmbeddingProvider } from '../service.js';
@@ -197,7 +198,17 @@ function getPackageDir(): string {
   return path.resolve(path.dirname(here), '..', '..');
 }
 
-async function runRebuild(cmd: string, args: string[], cwd: string): Promise<boolean> {
+function findNativeModuleDir(name: string, fromDir: string): string | null {
+  try {
+    const req = createRequire(path.join(fromDir, 'package.json'));
+    const pkgJsonPath = req.resolve(`${name}/package.json`);
+    return path.dirname(pkgJsonPath);
+  } catch {
+    return null;
+  }
+}
+
+async function runCommand(cmd: string, args: string[], cwd: string): Promise<boolean> {
   return new Promise(resolve => {
     console.log(chalk.dim(`  $ cd ${cwd}`));
     console.log(chalk.dim(`  $ ${cmd} ${args.join(' ')}`));
@@ -207,34 +218,104 @@ async function runRebuild(cmd: string, args: string[], cwd: string): Promise<boo
   });
 }
 
+// Probes bindings in a fresh child process so parent's module cache doesn't hide a freshly-built .node
+async function probeBindingsInChild(fromDir: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const script = `
+      (async () => {
+        try {
+          const m = await import('better-sqlite3');
+          const C = m.default ?? m;
+          const db = new C(':memory:');
+          db.close();
+          process.exit(0);
+        } catch { process.exit(1); }
+      })();
+    `;
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      stdio: 'ignore',
+      cwd: fromDir,
+    });
+    child.on('error', () => resolve(false));
+    child.on('exit', code => resolve(code === 0));
+  });
+}
+
 async function attemptAutoFix(): Promise<boolean> {
   const pkgDir = getPackageDir();
   console.log(chalk.bold('\n  Attempting auto-fix for native modules…\n'));
 
+  const bsqDir = findNativeModuleDir('better-sqlite3', pkgDir);
+  const vecDir = findNativeModuleDir('sqlite-vec', pkgDir);
+
+  if (!bsqDir) {
+    console.log(chalk.red('  Could not locate better-sqlite3 module via require.resolve.'));
+    console.log(chalk.cyan('  Fix manually: npm install -g @kooroot/engram'));
+    return false;
+  }
+  console.log(chalk.dim(`  Found better-sqlite3 at ${bsqDir}`));
+  if (vecDir) console.log(chalk.dim(`  Found sqlite-vec at ${vecDir}`));
+  console.log('');
+
   const hasNpm = await hasCommand('npm');
   const hasBun = await hasCommand('bun');
 
-  // Strategy 1: npm rebuild (most reliable for native modules)
+  // Strategy 1 (primary): npm install in the module dir.
+  // `npm install` runs the package's install lifecycle script; for better-sqlite3 that means
+  // `prebuild-install || npm run build-release`, which downloads the prebuilt .node binary.
+  // This is the ONLY reliable way — `npm rebuild` would try to compile from source and needs a toolchain.
   if (hasNpm) {
-    console.log(chalk.dim('  Strategy 1: npm rebuild'));
-    const ok = await runRebuild('npm', ['rebuild', 'better-sqlite3', 'sqlite-vec'], pkgDir);
-    if (ok) return true;
-    console.log(chalk.yellow('  npm rebuild failed — trying next strategy…\n'));
+    console.log(chalk.dim('  Strategy 1: npm install in better-sqlite3 dir (runs install script → downloads prebuilt)'));
+    const bsqOk = await runCommand('npm', ['install', '--no-save'], bsqDir);
+    let vecOk = true;
+    if (vecDir && bsqOk) {
+      console.log('');
+      console.log(chalk.dim('  Also: npm install in sqlite-vec dir'));
+      vecOk = await runCommand('npm', ['install', '--no-save'], vecDir);
+    }
+    if (bsqOk && vecOk) {
+      console.log('');
+      console.log(chalk.dim('  Re-probing bindings in a fresh process…'));
+      if (await probeBindingsInChild(pkgDir)) return true;
+      console.log(chalk.yellow('  Bindings still not loading — trying next strategy…\n'));
+    } else {
+      console.log(chalk.yellow('  npm install in module dir failed — trying next strategy…\n'));
+    }
   }
 
-  // Strategy 2: reinstall in place via bun (runs install scripts in that context)
+  // Strategy 2: invoke prebuild-install directly if it's present in the module's nested deps.
+  const prebuildBin = path.join(bsqDir, 'node_modules', '.bin', 'prebuild-install');
+  if (fs.existsSync(prebuildBin)) {
+    console.log(chalk.dim('  Strategy 2: prebuild-install directly'));
+    const ok = await runCommand(prebuildBin, ['-r', 'napi'], bsqDir);
+    if (ok) {
+      console.log('');
+      console.log(chalk.dim('  Re-probing bindings in a fresh process…'));
+      if (await probeBindingsInChild(pkgDir)) return true;
+    }
+  }
+
+  // Strategy 3: bun install with forced scripts in the module dir.
   if (hasBun) {
-    console.log(chalk.dim('  Strategy 2: bun install --ignore-scripts=false'));
-    const ok = await runRebuild('bun', ['install', '--ignore-scripts=false', '--force'], pkgDir);
-    if (ok) return true;
-    console.log(chalk.yellow('  bun install failed — trying next strategy…\n'));
+    console.log(chalk.dim('  Strategy 3: bun install --force in better-sqlite3 dir'));
+    const ok = await runCommand('bun', ['install', '--force'], bsqDir);
+    if (ok) {
+      console.log('');
+      console.log(chalk.dim('  Re-probing bindings in a fresh process…'));
+      if (await probeBindingsInChild(pkgDir)) return true;
+    }
   }
 
-  // Strategy 3: raw npm install in place
+  // Strategy 4: full reinstall via npm at the engram package (last resort)
   if (hasNpm) {
-    console.log(chalk.dim('  Strategy 3: npm install'));
-    const ok = await runRebuild('npm', ['install', '--no-save'], pkgDir);
-    if (ok) return true;
+    console.log('');
+    console.log(chalk.dim('  Strategy 4: npm install at engram package root (full reinstall of deps)'));
+    const ok = await runCommand('npm', ['install', '--no-save'], pkgDir);
+    if (ok) {
+      console.log('');
+      console.log(chalk.dim('  Re-probing bindings in a fresh process…'));
+      if (await probeBindingsInChild(pkgDir)) return true;
+    }
   }
 
   return false;
@@ -276,29 +357,27 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<void> {
 
   console.log('');
 
-  // Auto-fix path: re-run bindings check after fix attempt
+  // Auto-fix path: attemptAutoFix verifies success via a child process probe,
+  // so we don't need an in-process recheck (which can hit stale module caches).
   if (options.fix && bindingsResult.status === 'fail') {
     const fixed = await attemptAutoFix();
+    console.log('');
     if (fixed) {
+      console.log(chalk.green('  ✓ Native modules rebuilt successfully.'));
+      console.log(chalk.dim('  Run `engram doctor` again (without --fix) to see the green check.'));
       console.log('');
-      const retry = await checkSqliteBindings();
-      if (retry.status === 'ok') {
-        console.log(chalk.green('  ✓ Native modules rebuilt successfully. Run `engram status` to verify.'));
-        console.log('');
-        process.exitCode = 0;
-        return;
-      }
-      bindingsResult = retry;
-      console.log(chalk.yellow(`  Rebuild completed but probe still fails: ${retry.detail}`));
-      console.log('');
-    } else {
-      console.log(chalk.red('  Auto-fix failed. Manual options:'));
-      console.log(chalk.cyan(`    cd ${getPackageDir()} && npm install`));
-      console.log(chalk.cyan(`    npm install -g @kooroot/engram         # full reinstall via npm`));
-      console.log('');
-      process.exitCode = 1;
+      process.exitCode = 0;
       return;
     }
+    console.log(chalk.red('  Auto-fix did not succeed. Manual options:'));
+    const bsqDir = findNativeModuleDir('better-sqlite3', getPackageDir());
+    if (bsqDir) {
+      console.log(chalk.cyan(`    cd ${bsqDir} && npm install`));
+    }
+    console.log(chalk.cyan(`    npm install -g @kooroot/engram          # full reinstall via npm`));
+    console.log('');
+    process.exitCode = 1;
+    return;
   }
 
   if (fails > 0) {
