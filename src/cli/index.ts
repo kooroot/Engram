@@ -180,6 +180,44 @@ export function registerCLICommands(program: Command): void {
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     }, ns())());
 
+  // ─── export ──────────────────────────────────────
+
+  program
+    .command('export')
+    .description('Export the current namespace as JSON (writes to stdout)')
+    .option('--no-archived', 'Exclude archived nodes')
+    .option('--no-events', 'Exclude event log')
+    .option('--no-history', 'Exclude node history')
+    .action((opts) => withCore((core) => {
+      const bundle = svc.exportNamespace(core, {
+        includeArchived: opts.archived,
+        includeEvents: opts.events,
+        includeHistory: opts.history,
+      });
+      console.log(JSON.stringify(bundle, null, 2));
+    }, ns())());
+
+  // ─── import ──────────────────────────────────────
+
+  program
+    .command('import <file>')
+    .description('Import a JSON bundle into a namespace')
+    .option('--target <ns>', 'Override target namespace (default: bundle.namespace)')
+    .option('--strategy <s>', 'Conflict strategy: skip|overwrite|merge|reassign', 'skip')
+    .action(async (file, opts) => {
+      const fs = await import('node:fs');
+      const raw = fs.readFileSync(file, 'utf-8');
+      const bundle = JSON.parse(raw);
+      const targetNs = opts.target ?? bundle.namespace;
+      await withCore((core) => {
+        const result = svc.importBundle(core, bundle, {
+          targetNamespace: opts.target,
+          conflictStrategy: opts.strategy,
+        });
+        console.log(JSON.stringify(result, null, 2));
+      }, targetNs)();
+    });
+
   // ─── serve ───────────────────────────────────────
 
   program

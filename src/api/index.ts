@@ -155,6 +155,58 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
     return c.json({ context, namespace: core.config.namespace });
   });
 
+  // ─── Export / Import ───────────────────────────
+
+  app.get('/api/export', (c) => {
+    const core = resolveCore(c);
+    const includeArchived = c.req.query('archived') !== 'false';
+    const includeEvents = c.req.query('events') !== 'false';
+    const includeHistory = c.req.query('history') !== 'false';
+    const bundle = svc.exportNamespace(core, { includeArchived, includeEvents, includeHistory });
+    return c.json(bundle);
+  });
+
+  const importBodySchema = z.object({
+    bundle: z.record(z.unknown()),
+    strategy: z.enum(['skip', 'overwrite', 'merge', 'reassign']).optional(),
+    targetNamespace: z.string().max(64).optional(),
+  });
+
+  app.post('/api/import', async (c) => {
+    let body: z.infer<typeof importBodySchema>;
+    try {
+      body = importBodySchema.parse(await c.req.json());
+    } catch (err) {
+      const message = err instanceof z.ZodError
+        ? err.errors.map(e => e.message).join(', ')
+        : 'Invalid JSON body';
+      return c.json({ error: message }, 400);
+    }
+
+    const targetNs = body.targetNamespace ?? (body.bundle as any).namespace;
+    // Import writes go into the namespaced core — resolve explicitly
+    const targetCore = (() => {
+      if (!targetNs || targetNs === defaultCore.config.namespace) return defaultCore;
+      if (!validateNamespace(targetNs)) throw new Error('Invalid target namespace format');
+      let cached = coreCache.get(targetNs);
+      if (!cached) {
+        cached = createEngramCore({ namespace: targetNs });
+        coreCache.set(targetNs, cached);
+      }
+      return cached;
+    })();
+
+    try {
+      const result = svc.importBundle(targetCore, body.bundle as unknown as svc.ExportBundle, {
+        targetNamespace: body.targetNamespace,
+        conflictStrategy: body.strategy,
+      });
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+  });
+
   // ─── History ───────────────────────────────────
 
   app.get('/api/history/:nodeId', (c) => {

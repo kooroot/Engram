@@ -20,6 +20,9 @@ import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
 import { LocalEmbeddingProvider } from './embeddings/local.js';
 import { safeJsonParse } from './utils.js';
 
+export { exportNamespace, importBundle } from './port.js';
+export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from './port.js';
+
 export interface EngramCore {
   config: Config;
   mainDb: DatabaseConnection;
