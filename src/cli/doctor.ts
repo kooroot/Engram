@@ -14,6 +14,28 @@ interface CheckResult {
   fix?: string;
 }
 
+async function checkSqliteBindings(): Promise<CheckResult> {
+  try {
+    const mod = await import('better-sqlite3');
+    const DatabaseCtor = (mod.default ?? mod) as unknown as new (p: string) => { close: () => void };
+    const db = new DatabaseCtor(':memory:');
+    db.close();
+    return { status: 'ok', label: 'sqlite bindings', detail: 'better-sqlite3 native module loaded' };
+  } catch (err) {
+    const msg = (err as Error).message;
+    const isMissingBindings = /Could not locate the bindings file/i.test(msg) || /bindings/i.test(msg);
+    return {
+      status: 'fail',
+      label: 'sqlite bindings',
+      detail: isMissingBindings
+        ? 'better-sqlite3 native module not compiled (bun skipped install scripts)'
+        : `load error: ${msg.slice(0, 120)}`,
+      fix: 'Reinstall with scripts enabled: `bun install -g @kooroot/engram@latest --trust` '
+        + 'or `npm install -g @kooroot/engram`',
+    };
+  }
+}
+
 async function hasCommand(cmd: string): Promise<boolean> {
   return new Promise(resolve => {
     const child = spawn(process.platform === 'win32' ? 'where' : 'which', [cmd], { stdio: 'ignore' });
@@ -180,10 +202,15 @@ export async function runDoctor(): Promise<void> {
   const results: CheckResult[] = [];
   results.push(await checkNode());
   results.push(checkBuild());
+  const bindingsResult = await checkSqliteBindings();
+  results.push(bindingsResult);
   results.push(checkDataDir(dataDir));
   results.push(checkDbFile(mainDb, 'main db'));
   results.push(checkDbFile(vecDb, 'vector db'));
-  results.push(await checkEmbeddingProvider());
+  // Skip provider probe if bindings are broken — it would fail for unrelated reasons
+  if (bindingsResult.status !== 'fail') {
+    results.push(await checkEmbeddingProvider());
+  }
   results.push(await checkMcpRegistration());
 
   results.forEach(printRow);

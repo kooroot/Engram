@@ -14,6 +14,8 @@ interface OnboardAnswers {
   installClaude: boolean;
 }
 
+const CLAUDE_MCP_TIMEOUT_MS = 30_000;
+
 function expandHome(input: string): string {
   const s = input.trim();
   if (s === '~') return os.homedir();
@@ -55,10 +57,11 @@ function writeEnvFile(dataDir: string, answers: OnboardAnswers): string {
   return envPath;
 }
 
-async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<{ ok: boolean; message: string }> {
+async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<{ ok: boolean; message: string; output: string }> {
   return new Promise(resolve => {
     const args = [
       'mcp', 'add', 'engram',
+      '--scope', 'user',   // avoid interactive scope prompt on newer claude CLIs
       '--env', `ENGRAM_DATA_DIR=${answers.dataDir}`,
       '--env', `ENGRAM_NAMESPACE=${answers.namespace}`,
       '--env', `ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
@@ -68,13 +71,27 @@ async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<
     args.push('--', 'node', entry);
 
     const child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
     let stderr = '';
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', d => { stderr += d; });
-    child.on('error', err => resolve({ ok: false, message: err.message }));
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', d => { stdout += d; });
+    child.stderr?.on('data', d => { stderr += d; });
+
+    const timer = setTimeout(() => {
+      child.kill('SIGTERM');
+      resolve({ ok: false, message: `timed out after ${CLAUDE_MCP_TIMEOUT_MS / 1000}s`, output: (stdout + stderr).trim() });
+    }, CLAUDE_MCP_TIMEOUT_MS);
+
+    child.on('error', err => {
+      clearTimeout(timer);
+      resolve({ ok: false, message: err.message, output: (stdout + stderr).trim() });
+    });
     child.on('close', code => {
-      if (code === 0) resolve({ ok: true, message: 'registered' });
-      else resolve({ ok: false, message: stderr.slice(0, 240) || `claude exited ${code}` });
+      clearTimeout(timer);
+      const output = (stdout + stderr).trim();
+      if (code === 0) resolve({ ok: true, message: 'registered', output });
+      else resolve({ ok: false, message: `claude exited ${code}`, output });
     });
   });
 }
@@ -89,6 +106,18 @@ function ensureNotCancelled<T>(value: T | symbol): asserts value is T {
 export async function runOnboard(): Promise<void> {
   console.clear();
   p.intro('🧠  Engram onboarding');
+
+  p.note(
+    [
+      'This wizard configures:',
+      '  • Data directory + namespace',
+      '  • Semantic search provider (optional)',
+      '  • Claude Code MCP registration (optional)',
+      '',
+      'Takes ~30 seconds. Press Ctrl+C at any point to cancel.',
+    ].join('\n'),
+    'What this does',
+  );
 
   const hasCodex = await hasCommand('codex');
   const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
@@ -106,7 +135,7 @@ export async function runOnboard(): Promise<void> {
   const dataDir = path.resolve(expandHome(dataDirInput as string));
 
   const namespace = await p.text({
-    message: 'Namespace',
+    message: 'Namespace (separates memory pools; use "default" unless you know you want multi-tenant)',
     placeholder: 'default',
     initialValue: 'default',
     validate: value => {
@@ -118,7 +147,7 @@ export async function runOnboard(): Promise<void> {
   ensureNotCancelled(namespace);
 
   const providerChoice = await p.select<'none' | 'codex' | 'openai' | 'shell' | 'local'>({
-    message: 'Semantic search provider',
+    message: 'Semantic search provider  (can be changed later by editing engram.env)',
     initialValue: 'none',
     options: [
       { value: 'none', label: 'none', hint: 'graph + FTS only — no external deps (recommended to start)' },
@@ -185,7 +214,7 @@ export async function runOnboard(): Promise<void> {
   let installClaude = false;
   if (hasClaudeCli) {
     const confirmInstall = await p.confirm({
-      message: 'Install into Claude Code MCP?',
+      message: 'Install into Claude Code MCP?  (runs `claude mcp add engram --scope user ...`)',
       initialValue: true,
     });
     ensureNotCancelled(confirmInstall);
@@ -203,47 +232,78 @@ export async function runOnboard(): Promise<void> {
     installClaude,
   };
 
-  const s = p.spinner();
+  // ─── Review ──────────────────────────────────────────
+  p.note(
+    [
+      `Data dir:     ${dataDir}`,
+      `Namespace:    ${namespace}`,
+      `Provider:     ${provider}${shellCmd ? `  (cmd: ${shellCmd})` : ''}`,
+      `Claude MCP:   ${installClaude ? 'yes (scope=user)' : 'no'}`,
+    ].join('\n'),
+    'Review — about to apply',
+  );
 
-  s.start('Creating data directory');
+  // ─── Fast, instant operations — use p.log so output is always visible ───
   fs.mkdirSync(dataDir, { recursive: true });
-  s.stop(`Data directory  ${dataDir}`);
+  p.log.success(`Data directory ready  ${dataDir}`);
 
-  s.start('Writing env file');
   const envPath = writeEnvFile(dataDir, answers);
-  s.stop(`Env file        ${envPath}`);
+  p.log.success(`Env file written      ${envPath}`);
 
-  s.start('Locating engram binary');
   const entry = findEngramEntry();
   if (!fs.existsSync(entry)) {
-    s.stop(`Build missing — run \`bun run build\` first`);
+    p.log.warn(`Engram binary not found at ${entry} — if you installed from source, run \`bun run build\``);
   } else {
-    s.stop(`Engram binary   ${entry}`);
+    p.log.info(`Engram binary         ${entry}`);
   }
 
+  // ─── Slow operation: claude mcp add (with spinner + timeout) ─────────────
   if (installClaude) {
-    s.start('Registering MCP server with Claude Code');
+    const s = p.spinner();
+    s.start('Registering Engram with Claude Code  (up to 30s)');
     const result = await runClaudeMcpAdd(entry, answers);
     if (result.ok) {
-      s.stop('Claude MCP      registered');
+      s.stop('Claude Code MCP registered ✓');
+      if (result.output) p.log.info(result.output);
     } else {
-      s.stop(`Claude MCP      failed (${result.message})`);
+      s.stop(`Claude Code MCP registration failed — ${result.message}`);
+      if (result.output) p.log.error(result.output);
       printManualMcpInstructions(entry, answers);
     }
   } else if (!hasClaudeCli) {
     printManualMcpInstructions(entry, answers);
   }
 
+  // ─── Rich next steps ─────────────────────────────────────────────────────
   p.note(
     [
-      `source ${envPath}`,
-      'engram status',
-      'engram doctor',
+      '1. Activate env in your shell:',
+      `     source ${envPath}`,
+      '',
+      '2. Verify the install:',
+      '     engram doctor',
+      '',
+      '3. See your memory graph stats:',
+      '     engram status',
+      '',
+      ...(installClaude
+        ? [
+          '4. Open Claude Code and run /mcp — `engram` should appear in the list.',
+          '   Try: "remember that I prefer TypeScript"',
+          '        then later: "what languages do I prefer?"',
+          '',
+        ]
+        : [
+          '4. Register Engram with your MCP client (see Manual MCP install above).',
+          '',
+        ]),
+      `Edit ${envPath} later to change provider, namespace, or other settings.`,
+      'Learn more: https://github.com/kooroot/Engram#readme',
     ].join('\n'),
     'Next steps',
   );
 
-  p.outro('Done.');
+  p.outro('Setup complete.');
 }
 
 function printManualMcpInstructions(entry: string, answers: OnboardAnswers): void {
@@ -253,6 +313,11 @@ function printManualMcpInstructions(entry: string, answers: OnboardAnswers): voi
     `--env ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
   ];
   if (answers.shellCmd) envFlags.push(`--env ENGRAM_EMBEDDING_CMD=${quoteShell(answers.shellCmd)}`);
-  const lines = ['claude mcp add engram \\', ...envFlags.map(f => `  ${f} \\`), `  -- node ${entry}`];
+  if (answers.embeddingDimension) envFlags.push(`--env ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
+  const lines = [
+    'claude mcp add engram --scope user \\',
+    ...envFlags.map(f => `  ${f} \\`),
+    `  -- node ${entry}`,
+  ];
   p.note(lines.join('\n'), 'Manual MCP install');
 }
