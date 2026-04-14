@@ -456,4 +456,133 @@ export class StateTree {
       await Promise.allSettled([...this.pendingCallbacks]);
     }
   }
+
+  /**
+   * Merge sourceId into targetId:
+   * - Re-points all edges where source_id=sourceId to source_id=targetId
+   * - Re-points all edges where target_id=sourceId to target_id=targetId
+   * - Merges source.properties into target.properties (target wins on conflict)
+   * - Appends source.summary to target.summary if target has no summary
+   * - Archives source node (keeps audit trail)
+   * - Deduplicates edges that become identical after re-point
+   *
+   * Returns affected edge count and the merged target state.
+   */
+  mergeNodes(sourceId: string, targetId: string): {
+    target_id: string;
+    merged_edges: number;
+    dedup_edges: number;
+  } {
+    if (sourceId === targetId) {
+      throw new Error('Cannot merge a node into itself');
+    }
+
+    const source = this.getNodeByIdStmt.get(sourceId, this.namespace) as NodeRow | undefined;
+    const target = this.getNodeByIdStmt.get(targetId, this.namespace) as NodeRow | undefined;
+    if (!source) throw new Error(`Source node not found: ${sourceId}`);
+    if (!target) throw new Error(`Target node not found: ${targetId}`);
+
+    let mergedEdges = 0;
+    let dedupEdges = 0;
+
+    const txn = this.db.transaction(() => {
+      // 1. Snapshot target before merge
+      this.insertHistoryStmt.run({
+        node_id: target.id,
+        version: target.version,
+        properties: target.properties,
+        changed_by: null,
+        namespace: this.namespace,
+      });
+
+      // 2. Merge properties (target wins on key conflict — target is the canonical entity)
+      const sourceProps = safeJsonParse(source.properties);
+      const targetProps = safeJsonParse(target.properties);
+      const merged = { ...sourceProps, ...targetProps };
+
+      const mergedSummary = target.summary ?? source.summary;
+
+      this.updateNodeStmt.run({
+        id: target.id,
+        name: target.name,
+        properties: JSON.stringify(merged),
+        summary: mergedSummary,
+        confidence: target.confidence,
+        event_id: null,
+        namespace: this.namespace,
+      });
+
+      // 3. Re-point edges from source to target
+      // Outgoing edges: source --predicate--> X becomes target --predicate--> X
+      //   If target --predicate--> X already exists: delete the source edge (dedup)
+      const outEdges = this.getEdgesBySourceStmt.all(source.id, this.namespace) as EdgeRow[];
+      for (const e of outEdges) {
+        const existing = this.getEdgeByTripletStmt.get(
+          target.id, e.predicate, e.target_id, this.namespace
+        ) as EdgeRow | undefined;
+        if (existing && existing.id !== e.id) {
+          this.deleteEdgeByIdStmt.run(e.id, this.namespace);
+          dedupEdges++;
+        } else {
+          this.db.prepare(
+            'UPDATE edges SET source_id = ? WHERE id = ? AND namespace = ?'
+          ).run(target.id, e.id, this.namespace);
+          mergedEdges++;
+        }
+      }
+
+      // Incoming edges: X --predicate--> source becomes X --predicate--> target
+      const inEdges = this.getEdgesByTargetStmt.all(source.id, this.namespace) as EdgeRow[];
+      for (const e of inEdges) {
+        const existing = this.getEdgeByTripletStmt.get(
+          e.source_id, e.predicate, target.id, this.namespace
+        ) as EdgeRow | undefined;
+        if (existing && existing.id !== e.id) {
+          this.deleteEdgeByIdStmt.run(e.id, this.namespace);
+          dedupEdges++;
+        } else {
+          this.db.prepare(
+            'UPDATE edges SET target_id = ? WHERE id = ? AND namespace = ?'
+          ).run(target.id, e.id, this.namespace);
+          mergedEdges++;
+        }
+      }
+
+      // 4. Archive source (keeps history, excludes from active queries)
+      this.db.prepare(
+        'UPDATE nodes SET archived = 1, updated_at = strftime(\'%Y-%m-%dT%H:%M:%f\',\'now\') WHERE id = ? AND namespace = ?'
+      ).run(source.id, this.namespace);
+    });
+
+    txn();
+
+    // Log merge event
+    const event = this.eventLog.append({
+      type: 'mutation',
+      source: 'agent',
+      content: {
+        operation: 'merge_nodes',
+        source_id: sourceId,
+        target_id: targetId,
+        merged_edges: mergedEdges,
+        dedup_edges: dedupEdges,
+      },
+      state_ref: [sourceId, targetId],
+    });
+
+    // Reference the event on target and history
+    this.db.prepare('UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?')
+      .run(event.id, target.id, this.namespace);
+    this.db.prepare('UPDATE node_history SET changed_by = ? WHERE node_id = ? AND namespace = ? AND changed_by IS NULL')
+      .run(event.id, target.id, this.namespace);
+
+    // Fire callbacks for both nodes (cache invalidation, re-embed)
+    this.fireCallbacks([sourceId, targetId]);
+
+    return {
+      target_id: targetId,
+      merged_edges: mergedEdges,
+      dedup_edges: dedupEdges,
+    };
+  }
 }

@@ -11,6 +11,7 @@ import { registerLinkEntities } from './link-entities.js';
 import { registerQueryEngram } from './query-engram.js';
 import { registerSearchMemory } from './search-memory.js';
 import { registerGetContext } from './get-context.js';
+import { registerMergeNodes } from './merge-nodes.js';
 
 export function registerAllTools(
   server: McpServer,
@@ -26,4 +27,5 @@ export function registerAllTools(
   registerQueryEngram(server, stateTree);
   registerSearchMemory(server, vectorStore, embeddingProvider);
   registerGetContext(server, stateTree, vectorStore, cache, embeddingProvider);
+  registerMergeNodes(server, stateTree, cache);
 }

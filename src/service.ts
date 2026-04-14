@@ -23,6 +23,27 @@ import { safeJsonParse } from './utils.js';
 export { exportNamespace, importBundle } from './port.js';
 export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from './port.js';
 
+/** Resolve a node by ID or name */
+function resolveNode(core: EngramCore, idOrName: string): Node | null {
+  return core.stateTree.getNode(idOrName) ?? core.stateTree.getNodeByName(idOrName);
+}
+
+/**
+ * Merge source into target. Both can be IDs or names.
+ * Returns counts of edges re-pointed and deduplicated.
+ */
+export function mergeNodes(
+  core: EngramCore,
+  source: string,
+  target: string,
+): { target_id: string; merged_edges: number; dedup_edges: number } {
+  const srcNode = resolveNode(core, source);
+  const tgtNode = resolveNode(core, target);
+  if (!srcNode) throw new Error(`Source not found: ${source}`);
+  if (!tgtNode) throw new Error(`Target not found: ${target}`);
+  return core.stateTree.mergeNodes(srcNode.id, tgtNode.id);
+}
+
 export interface EngramCore {
   config: Config;
   mainDb: DatabaseConnection;

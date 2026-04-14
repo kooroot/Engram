@@ -155,6 +155,32 @@ export function createApp(defaultCore: EngramCore, opts: ApiOptions = {}): Hono 
     return c.json({ context, namespace: core.config.namespace });
   });
 
+  // ─── Merge ─────────────────────────────────────
+
+  const mergeBodySchema = z.object({
+    source: z.string().min(1).max(512),
+    target: z.string().min(1).max(512),
+  });
+
+  app.post('/api/merge', async (c) => {
+    const core = resolveCore(c);
+    let body: z.infer<typeof mergeBodySchema>;
+    try {
+      body = mergeBodySchema.parse(await c.req.json());
+    } catch (err) {
+      const message = err instanceof z.ZodError
+        ? err.errors.map(e => e.message).join(', ')
+        : 'Invalid JSON body';
+      return c.json({ error: message }, 400);
+    }
+    try {
+      const result = svc.mergeNodes(core, body.source, body.target);
+      return c.json(result);
+    } catch (err) {
+      return c.json({ error: err instanceof Error ? err.message : String(err) }, 400);
+    }
+  });
+
   // ─── Export / Import ───────────────────────────
 
   app.get('/api/export', (c) => {

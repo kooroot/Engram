@@ -180,6 +180,23 @@ export function registerCLICommands(program: Command): void {
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     }, ns())());
 
+  // ─── merge ───────────────────────────────────────
+
+  program
+    .command('merge <source> <target>')
+    .description('Merge source node into target (re-points edges, archives source)')
+    .action((source, target) => withCore((core) => {
+      try {
+        const result = svc.mergeNodes(core, source, target);
+        console.log(`Merged ${source} → ${target}`);
+        console.log(`  edges re-pointed: ${result.merged_edges}`);
+        console.log(`  edges deduplicated: ${result.dedup_edges}`);
+      } catch (err) {
+        console.error('Merge failed:', err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+      }
+    }, ns())());
+
   // ─── export ──────────────────────────────────────
 
   program
