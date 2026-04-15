@@ -1,17 +1,18 @@
-import fs from 'node:fs';
-import path from 'node:path';
 import * as p from '@clack/prompts';
 import chalk from 'chalk';
 import type { EngramCore } from '../service.js';
 import { listNamespaces } from '../service.js';
+import { createBackup } from './backup.js';
 
 export interface ResetOptions {
   /** When true, reset every namespace in the DB instead of just the current one. */
   all?: boolean;
-  /** Skip the interactive confirmation prompt. */
+  /** Skip ALL prompts (confirmation + backup question). With --yes, defaults to backup=true. */
   yes?: boolean;
-  /** Copy main + vec DB files to .bak-<timestamp> before deleting. */
+  /** Force backup ON regardless of prompts. */
   backup?: boolean;
+  /** Force backup OFF (overrides --backup; with --yes makes it truly silent). */
+  noBackup?: boolean;
 }
 
 interface NamespaceCounts {
@@ -48,6 +49,35 @@ export async function runReset(core: EngramCore, opts: ResetOptions): Promise<vo
   const preview = previewCounts(core, targets);
   printPreview(targets, preview);
 
+  // Decide on backup:
+  //   --no-backup           → never backup
+  //   --backup              → always backup
+  //   --yes (alone)         → backup ON by default (safe CI default)
+  //   otherwise             → ask interactively
+  let shouldBackup: boolean;
+  if (opts.noBackup) {
+    shouldBackup = false;
+  } else if (opts.backup) {
+    shouldBackup = true;
+  } else if (opts.yes) {
+    shouldBackup = true;
+  } else {
+    const choice = await p.select<'yes' | 'no' | 'cancel'>({
+      message: 'Backup current state before deleting?',
+      initialValue: 'yes',
+      options: [
+        { value: 'yes',    label: 'Yes — backup, then delete (recommended)' },
+        { value: 'no',     label: 'No — delete without backup' },
+        { value: 'cancel', label: 'Cancel' },
+      ],
+    });
+    if (p.isCancel(choice) || choice === 'cancel') {
+      console.log(chalk.gray('Cancelled — no data deleted.'));
+      return;
+    }
+    shouldBackup = choice === 'yes';
+  }
+
   if (!opts.yes) {
     const confirmed = await p.confirm({
       message: `This will permanently delete the rows above. Continue?`,
@@ -59,11 +89,8 @@ export async function runReset(core: EngramCore, opts: ResetOptions): Promise<vo
     }
   }
 
-  if (opts.backup) {
-    const backups = backupDbFiles(core);
-    for (const b of backups) {
-      console.log(chalk.dim(`  backup: ${b}`));
-    }
+  if (shouldBackup) {
+    createBackup(core, { label: 'pre-reset', silent: false });
   }
 
   // Delete (per-namespace, in transactions).
@@ -134,23 +161,6 @@ function deleteNamespace(core: EngramCore, ns: string): NamespaceCounts {
   core.cache.clear();
 
   return counts;
-}
-
-function backupDbFiles(core: EngramCore): string[] {
-  const ts = new Date().toISOString().replace(/[:.]/g, '-');
-  const dataDir = core.config.dataDir;
-  const targets = [
-    path.join(dataDir, core.config.dbFilename),
-    path.join(dataDir, core.config.vecDbFilename),
-  ];
-  const created: string[] = [];
-  for (const src of targets) {
-    if (!fs.existsSync(src)) continue;
-    const dest = `${src}.bak-${ts}`;
-    fs.copyFileSync(src, dest);
-    created.push(dest);
-  }
-  return created;
 }
 
 function printPreview(namespaces: string[], counts: Record<string, NamespaceCounts>): void {

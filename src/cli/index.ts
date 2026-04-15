@@ -8,6 +8,8 @@ import { runDoctor } from './doctor.js';
 import { runUsage, type Period, type Breakdown } from './usage.js';
 import { runTui } from './tui.js';
 import { runReset } from './reset.js';
+import { runBackup, runListBackups } from './backup.js';
+import { runRestore } from './restore.js';
 
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
@@ -45,16 +47,53 @@ export function registerCLICommands(program: Command): void {
       await runOnboard();
     });
 
+  // ─── backup / backups / restore ─────────────────
+
+  program
+    .command('backup')
+    .description('Create a snapshot of the engram DB (auto-prunes oldest beyond --keep)')
+    .option('-l, --label <label>', 'Human-readable label appended to the backup folder name')
+    .option('-k, --keep <n>', 'Keep newest N backups (default 5; or set ENGRAM_BACKUP_KEEP env var)')
+    .action((opts: { label?: string; keep?: string }) => withCore((core) => {
+      const keep = opts.keep ? Number(opts.keep) : undefined;
+      runBackup(core, { label: opts.label, keep });
+    }, ns())());
+
+  program
+    .command('backups')
+    .description('List all backups for the current data directory')
+    .action(() => withCore((core) => runListBackups(core), ns())());
+
+  program
+    .command('restore [id]')
+    .description('Restore a backup (interactive picker if no id given). Creates a safety backup of current state by default.')
+    .option('--latest', 'Restore the most recent backup (no picker)', false)
+    .option('-y, --yes', 'Skip confirmation prompt', false)
+    .option('--no-safety-backup', "Don't create a safety backup of current state before restoring (DANGEROUS)")
+    .action((id: string | undefined, opts: { latest?: boolean; yes?: boolean; safetyBackup?: boolean }) => withCore(async (core) => {
+      // commander turns --no-safety-backup into safetyBackup=false (default true)
+      const noSafety = opts.safetyBackup === false;
+      await runRestore(core, { id, latest: opts.latest, yes: opts.yes, noSafetyBackup: noSafety });
+    }, ns())());
+
   // ─── reset ───────────────────────────────────────
 
   program
     .command('reset')
-    .description('Delete all data for a namespace (nodes, edges, events, history, usage, embeddings)')
+    .description('Delete all data for a namespace (asks whether to backup first; safe by default)')
     .option('-a, --all', 'Reset every namespace in the DB, not just the current one', false)
-    .option('-y, --yes', 'Skip confirmation prompt (DANGEROUS — use with care)', false)
-    .option('--backup', 'Copy DB files to *.bak-<timestamp> before deleting', false)
+    .option('-y, --yes', 'Skip confirm prompt. Defaults to backup ON unless --no-backup is also passed.', false)
+    .option('--no-backup', "Don't create a backup before deleting (skips the backup question)")
     .action((opts: { all?: boolean; yes?: boolean; backup?: boolean }) => withCore(async (core) => {
-      await runReset(core, { all: opts.all, yes: opts.yes, backup: opts.backup });
+      // commander: declaring `--no-backup` makes opts.backup default to true
+      // and become false only when --no-backup is explicitly passed.
+      const noBackup = opts.backup === false;
+      await runReset(core, {
+        all: opts.all,
+        yes: opts.yes,
+        backup: false,   // never auto-on; the runReset logic handles --yes default
+        noBackup,
+      });
     }, ns())());
 
   // ─── doctor ──────────────────────────────────────
