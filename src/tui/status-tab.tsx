@@ -3,17 +3,20 @@ import { Box, Text } from 'ink';
 import type { EngramCore } from '../service.js';
 import { getStatus } from '../service.js';
 
-interface StatusTabProps { core: EngramCore; }
+interface StatusTabProps {
+  core: EngramCore;
+  namespace: string | null;
+}
 
-export function StatusTab({ core }: StatusTabProps): React.ReactElement {
+export function StatusTab({ core, namespace }: StatusTabProps): React.ReactElement {
   const status = useMemo(() => getStatus(core), [core]);
+  const ns = namespace ?? '(all)';
+  void ns;
 
   return (
     <Box flexDirection="column">
-      <Text color="cyan" bold>Status</Text>
-
-      <Box marginTop={1} flexDirection="column">
-        <Text color="cyan" bold>Memory graph</Text>
+      <Box flexDirection="column">
+        <Text bold color="cyan">Memory graph</Text>
         <Box marginTop={1} flexDirection="column">
           <Row label="Active nodes"   value={String(status.activeNodes)} />
           <Row label="Archived nodes" value={String(status.archivedNodes)} />
@@ -23,7 +26,7 @@ export function StatusTab({ core }: StatusTabProps): React.ReactElement {
       </Box>
 
       <Box marginTop={1} flexDirection="column">
-        <Text color="cyan" bold>Configuration</Text>
+        <Text bold color="cyan">Configuration</Text>
         <Box marginTop={1} flexDirection="column">
           <Row label="Namespace"       value={status.namespace} />
           <Row label="Data dir"        value={status.dataDir} />
@@ -34,14 +37,14 @@ export function StatusTab({ core }: StatusTabProps): React.ReactElement {
 
       {core.config.embedding.provider === 'shell' && core.config.embedding.shellCmd ? (
         <Box marginTop={1} flexDirection="column">
-          <Text color="cyan" bold>Embedding command</Text>
+          <Text bold color="cyan">Embedding command</Text>
           <Text color="gray">  {core.config.embedding.shellCmd}</Text>
         </Box>
       ) : null}
 
       {core.config.embedding.provider === 'ollama' ? (
         <Box marginTop={1} flexDirection="column">
-          <Text color="cyan" bold>Ollama</Text>
+          <Text bold color="cyan">Ollama</Text>
           <Box marginTop={1} flexDirection="column">
             <Row label="URL"   value={core.config.embedding.ollamaUrl ?? 'http://localhost:11434'} />
             <Row label="Model" value={core.config.embedding.ollamaModel ?? 'nomic-embed-text'} />
