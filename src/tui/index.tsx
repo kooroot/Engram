@@ -36,17 +36,18 @@ export function App({ core, initialTab = 'stats' }: AppProps): React.ReactElemen
   useInput((input, key) => {
     if (input === 'q' || (key.ctrl && input === 'c')) { exit(); return; }
     if (input === '?') { setShowHelp(s => !s); return; }
-    // Number keys for tab switch
+    // Number keys for direct tab jump
     const tab = TABS.find(t => t.key === input);
     if (tab) { setActive(tab.id); return; }
-    // Tab / shift-tab navigation
-    if (key.tab && !key.shift) {
-      const idx = TABS.findIndex(t => t.id === active);
+    // Tab / shift-tab + left/right arrow nav.
+    // Up/down arrows are NOT consumed here so the active tab can use them
+    // for in-tab cursor movement (e.g. Browse list).
+    const idx = TABS.findIndex(t => t.id === active);
+    if ((key.tab && !key.shift) || key.rightArrow) {
       setActive(TABS[(idx + 1) % TABS.length].id);
       return;
     }
-    if (key.tab && key.shift) {
-      const idx = TABS.findIndex(t => t.id === active);
+    if ((key.tab && key.shift) || key.leftArrow) {
       setActive(TABS[(idx - 1 + TABS.length) % TABS.length].id);
       return;
     }
@@ -99,7 +100,7 @@ function Footer({ showHelp, active }: { showHelp: boolean; active: TabId }): Rea
     <Box flexDirection="column" marginTop={1}>
       <Text color="gray">─────────────────────────────────────────────────────────────</Text>
       <Text color="gray">
-        <Text color="cyan">{'tab'}</Text> next  <Text color="cyan">{'1-4'}</Text> tab  <Text color="cyan">{'?'}</Text> help  <Text color="cyan">{'q'}</Text> quit  <Text color="white">│</Text>  {tabHints[active]}
+        <Text color="cyan">{'←/→'}</Text> tab  <Text color="cyan">{'1-4'}</Text> jump  <Text color="cyan">{'?'}</Text> help  <Text color="cyan">{'q'}</Text> quit  <Text color="white">│</Text>  {tabHints[active]}
       </Text>
       {showHelp ? (
         <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="gray" paddingX={1}>

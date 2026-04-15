@@ -55,28 +55,34 @@ export function registerCLICommands(program: Command): void {
       await runDoctor({ fix: opts.fix, quiet: opts.quiet });
     });
 
-  // ─── tui ─────────────────────────────────────────
-
-  program
-    .command('tui')
-    .description('Interactive dashboard — heatmap, stats, browse, status (multi-tab TUI)')
-    .action(() => withCore(async (core) => {
-      await runTui(core);
-    }, ns())());
-
   // ─── usage ───────────────────────────────────────
+  // Default: interactive multi-tab TUI (Stats / Usage / Browse / Status).
+  // --plain or non-TTY: static text output (CI-friendly).
 
   program
     .command('usage')
-    .description('Show token usage and tool-call activity (heatmap + stats by default)')
-    .option('-p, --period <period>', 'Time window for stats: day | week | month', 'week')
-    .option('-b, --by <breakdown>', 'Breakdown: tool | day | namespace', 'tool')
-    .option('-a, --all', 'Include all namespaces (otherwise current namespace only)', false)
-    .option('--plain', 'Static layout — totals + breakdown only (CI-friendly, no heatmap)', false)
-    .action((opts: { period: string; by: string; all?: boolean; plain?: boolean }) => withCore((core) => {
+    .description('Interactive dashboard — heatmap, stats, browse, status. Pass --plain for static output.')
+    .option('-p, --period <period>', '(--plain only) Time window: day | week | month', 'week')
+    .option('-b, --by <breakdown>', '(--plain only) Breakdown: tool | day | namespace', 'tool')
+    .option('-a, --all', '(--plain only) Include all namespaces', false)
+    .option('--plain', 'Static text layout — totals + breakdown only (CI-friendly)', false)
+    .action((opts: { period: string; by: string; all?: boolean; plain?: boolean }) => withCore(async (core) => {
+      const useTui = !opts.plain && process.stdout.isTTY;
+      if (useTui) {
+        await runTui(core);
+        return;
+      }
       const period = (['day', 'week', 'month'].includes(opts.period) ? opts.period : 'week') as Period;
       const breakdown = (['tool', 'day', 'namespace'].includes(opts.by) ? opts.by : 'tool') as Breakdown;
-      runUsage(core, { period, breakdown, allNamespaces: !!opts.all, plain: !!opts.plain });
+      runUsage(core, { period, breakdown, allNamespaces: !!opts.all, plain: true });
+    }, ns())());
+
+  // Keep `engram tui` as a hidden alias so existing muscle memory still works.
+  program
+    .command('tui', { hidden: true })
+    .description('Alias for `engram usage` (interactive dashboard)')
+    .action(() => withCore(async (core) => {
+      await runTui(core);
     }, ns())());
 
   // ─── status ──────────────────────────────────────
