@@ -6,6 +6,20 @@ import { fileURLToPath } from 'node:url';
 import * as p from '@clack/prompts';
 import { renderBanner } from './banner.js';
 
+type McpClientId = 'claude' | 'codex' | 'gemini';
+
+interface McpClient {
+  id: McpClientId;
+  binary: string;
+  label: string;
+}
+
+const MCP_CLIENTS: readonly McpClient[] = [
+  { id: 'claude', binary: 'claude', label: 'Claude Code' },
+  { id: 'codex',  binary: 'codex',  label: 'Codex CLI' },
+  { id: 'gemini', binary: 'gemini', label: 'Gemini CLI' },
+] as const;
+
 interface OnboardAnswers {
   dataDir: string;
   namespace: string;
@@ -14,10 +28,10 @@ interface OnboardAnswers {
   ollamaUrl?: string;
   ollamaModel?: string;
   embeddingDimension?: number;
-  installClaude: boolean;
+  installClients: McpClientId[];
 }
 
-const CLAUDE_MCP_TIMEOUT_MS = 30_000;
+const MCP_ADD_TIMEOUT_MS = 30_000;
 const PROVIDER_TEST_TIMEOUT_MS = 15_000;
 
 function expandHome(input: string): string {
@@ -123,22 +137,54 @@ function writeEnvFile(dataDir: string, answers: OnboardAnswers): string {
   return envPath;
 }
 
-async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<{ ok: boolean; message: string; output: string }> {
-  return new Promise(resolve => {
-    const args = [
-      'mcp', 'add', 'engram',
-      '--scope', 'user',
-      '--env', `ENGRAM_DATA_DIR=${answers.dataDir}`,
-      '--env', `ENGRAM_NAMESPACE=${answers.namespace}`,
-      '--env', `ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
-    ];
-    if (answers.shellCmd) args.push('--env', `ENGRAM_EMBEDDING_CMD=${answers.shellCmd}`);
-    if (answers.ollamaUrl) args.push('--env', `OLLAMA_URL=${answers.ollamaUrl}`);
-    if (answers.ollamaModel) args.push('--env', `OLLAMA_MODEL=${answers.ollamaModel}`);
-    if (answers.embeddingDimension) args.push('--env', `ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
-    args.push('--', 'node', entry);
+function collectEnvPairs(answers: OnboardAnswers): Array<[string, string]> {
+  const pairs: Array<[string, string]> = [
+    ['ENGRAM_DATA_DIR', answers.dataDir],
+    ['ENGRAM_NAMESPACE', answers.namespace],
+    ['ENGRAM_EMBEDDING_PROVIDER', answers.provider],
+  ];
+  if (answers.shellCmd) pairs.push(['ENGRAM_EMBEDDING_CMD', answers.shellCmd]);
+  if (answers.ollamaUrl) pairs.push(['OLLAMA_URL', answers.ollamaUrl]);
+  if (answers.ollamaModel) pairs.push(['OLLAMA_MODEL', answers.ollamaModel]);
+  if (answers.embeddingDimension) pairs.push(['ENGRAM_EMBEDDING_DIMENSION', String(answers.embeddingDimension)]);
+  return pairs;
+}
 
-    const child = spawn('claude', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+/**
+ * Build the per-client `mcp add` argv. Each CLI has slightly different syntax:
+ *   - claude:  claude mcp add <name> --scope user --env K=V -- <cmd> [args...]
+ *   - codex:   codex  mcp add <name> --env K=V -- <cmd> [args...]
+ *   - gemini:  gemini mcp add -s user -e K=V <name> <cmd> [args...]   (no `--`, name/cmd are positional)
+ */
+function buildMcpAddArgs(client: McpClient, entry: string, answers: OnboardAnswers): string[] {
+  const envPairs = collectEnvPairs(answers);
+  switch (client.id) {
+    case 'claude': {
+      const args = ['mcp', 'add', 'engram', '--scope', 'user'];
+      for (const [k, v] of envPairs) args.push('--env', `${k}=${v}`);
+      args.push('--', 'node', entry);
+      return args;
+    }
+    case 'codex': {
+      const args = ['mcp', 'add', 'engram'];
+      for (const [k, v] of envPairs) args.push('--env', `${k}=${v}`);
+      args.push('--', 'node', entry);
+      return args;
+    }
+    case 'gemini': {
+      // Gemini: options first, then positionals (name, command, ...args)
+      const args = ['mcp', 'add', '-s', 'user'];
+      for (const [k, v] of envPairs) args.push('-e', `${k}=${v}`);
+      args.push('engram', 'node', entry);
+      return args;
+    }
+  }
+}
+
+async function runMcpAdd(client: McpClient, entry: string, answers: OnboardAnswers): Promise<{ ok: boolean; message: string; output: string }> {
+  return new Promise(resolve => {
+    const args = buildMcpAddArgs(client, entry, answers);
+    const child = spawn(client.binary, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
     let stderr = '';
     child.stdout?.setEncoding('utf8');
@@ -148,8 +194,8 @@ async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<
 
     const timer = setTimeout(() => {
       child.kill('SIGTERM');
-      resolve({ ok: false, message: `timed out after ${CLAUDE_MCP_TIMEOUT_MS / 1000}s`, output: (stdout + stderr).trim() });
-    }, CLAUDE_MCP_TIMEOUT_MS);
+      resolve({ ok: false, message: `timed out after ${MCP_ADD_TIMEOUT_MS / 1000}s`, output: (stdout + stderr).trim() });
+    }, MCP_ADD_TIMEOUT_MS);
 
     child.on('error', err => {
       clearTimeout(timer);
@@ -159,7 +205,7 @@ async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<
       clearTimeout(timer);
       const output = (stdout + stderr).trim();
       if (code === 0) resolve({ ok: true, message: 'registered', output });
-      else resolve({ ok: false, message: `claude exited ${code}`, output });
+      else resolve({ ok: false, message: `${client.binary} exited ${code}`, output });
     });
   });
 }
@@ -354,8 +400,13 @@ export async function runOnboard(): Promise<void> {
   );
 
   const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
-  const hasClaudeCli = await hasCommand('claude');
   const ollamaReachable = await checkUrl('http://localhost:11434');
+
+  // Detect which MCP-supporting CLIs are installed.
+  const detectedClients: McpClient[] = [];
+  for (const c of MCP_CLIENTS) {
+    if (await hasCommand(c.binary)) detectedClients.push(c);
+  }
 
   // Pre-flight: warn if shell already has Engram-managed vars.
   // They will override anything we save here unless the user clears them.
@@ -405,7 +456,7 @@ export async function runOnboard(): Promise<void> {
       ollamaUrl: providerResult.ollamaUrl,
       ollamaModel: providerResult.ollamaModel,
       embeddingDimension: providerResult.embeddingDimension,
-      installClaude: false,
+      installClients: [],
     };
 
     if (providerResult.provider === 'none') break;
@@ -437,16 +488,22 @@ export async function runOnboard(): Promise<void> {
     // retry → loop continues
   }
 
-  let installClaude = false;
-  if (hasClaudeCli) {
-    const confirmInstall = await p.confirm({
-      message: 'Install into Claude Code MCP?  (runs `claude mcp add engram --scope user ...`)',
-      initialValue: true,
-    });
-    ensureNotCancelled(confirmInstall);
-    installClaude = confirmInstall as boolean;
+  let installClients: McpClientId[] = [];
+  if (detectedClients.length === 0) {
+    p.log.info('No MCP-capable CLIs detected (claude/codex/gemini) — skipping automatic registration');
   } else {
-    p.log.info('claude CLI not found — skipping automatic MCP registration');
+    const selected = await p.multiselect<McpClientId>({
+      message: `Register Engram with which MCP clients?  (space to toggle, enter to confirm)`,
+      initialValues: detectedClients.map(c => c.id),
+      required: false,
+      options: detectedClients.map(c => ({
+        value: c.id,
+        label: c.label,
+        hint: `${c.binary} mcp add engram …`,
+      })),
+    });
+    ensureNotCancelled(selected);
+    installClients = selected as McpClientId[];
   }
 
   const answers: OnboardAnswers = {
@@ -457,15 +514,21 @@ export async function runOnboard(): Promise<void> {
     ollamaUrl: providerResult.ollamaUrl,
     ollamaModel: providerResult.ollamaModel,
     embeddingDimension: providerResult.embeddingDimension,
-    installClaude,
+    installClients,
   };
+
+  const clientsLabel = installClients.length === 0
+    ? 'none'
+    : installClients
+        .map(id => MCP_CLIENTS.find(c => c.id === id)?.label ?? id)
+        .join(', ');
 
   p.note(
     [
       `Data dir:     ${dataDir}`,
       `Namespace:    ${namespace}`,
       `Provider:     ${providerResult.provider}` + providerSummary(providerResult),
-      `Claude MCP:   ${installClaude ? 'yes (scope=user)' : 'no'}`,
+      `MCP clients:  ${clientsLabel}`,
     ].join('\n'),
     'Review — about to apply',
   );
@@ -498,20 +561,39 @@ export async function runOnboard(): Promise<void> {
     p.log.info(`Engram binary         ${entry}`);
   }
 
-  if (installClaude) {
+  const registrationResults: Array<{ client: McpClient; ok: boolean; message: string }> = [];
+  for (const id of installClients) {
+    const client = MCP_CLIENTS.find(c => c.id === id);
+    if (!client) continue;
     const s = p.spinner();
-    s.start('Registering Engram with Claude Code  (up to 30s)');
-    const result = await runClaudeMcpAdd(entry, answers);
+    s.start(`Registering Engram with ${client.label}  (up to 30s)`);
+    const result = await runMcpAdd(client, entry, answers);
     if (result.ok) {
-      s.stop('Claude Code MCP registered ✓');
+      s.stop(`${client.label} MCP registered ✓`);
       if (result.output) p.log.info(result.output);
     } else {
-      s.stop(`Claude Code MCP registration failed — ${result.message}`);
+      s.stop(`${client.label} MCP registration failed — ${result.message}`);
       if (result.output) p.log.error(result.output);
-      printManualMcpInstructions(entry, answers);
     }
-  } else if (!hasClaudeCli) {
-    printManualMcpInstructions(entry, answers);
+    registrationResults.push({ client, ok: result.ok, message: result.message });
+  }
+
+  // For any detected client we did NOT register, or any failure, print manual fallback instructions.
+  const needsManual = registrationResults.some(r => !r.ok)
+    || (detectedClients.length > installClients.length);
+  if (needsManual) {
+    printManualMcpInstructions(entry, answers, detectedClients);
+  }
+
+  const verifySteps: string[] = [];
+  if (installClients.includes('claude')) {
+    verifySteps.push('   Claude Code: /mcp menu → engram should appear');
+  }
+  if (installClients.includes('codex')) {
+    verifySteps.push('   Codex CLI:   `codex mcp list` → engram should appear');
+  }
+  if (installClients.includes('gemini')) {
+    verifySteps.push('   Gemini CLI:  `gemini mcp list` → engram should appear');
   }
 
   p.note(
@@ -522,9 +604,10 @@ export async function runOnboard(): Promise<void> {
       '2. See your memory graph stats:',
       '     engram status',
       '',
-      ...(installClaude
+      ...(installClients.length > 0
         ? [
-          '3. Open Claude Code and run /mcp — `engram` should appear in the list.',
+          '3. Test in your AI client(s):',
+          ...verifySteps,
           '   Try: "remember that I prefer TypeScript"',
           '        then later: "what languages do I prefer?"',
           '',
@@ -555,20 +638,47 @@ function providerSummary(r: ProviderResult): string {
   return '';
 }
 
-function printManualMcpInstructions(entry: string, answers: OnboardAnswers): void {
-  const envFlags = [
-    `--env ENGRAM_DATA_DIR=${answers.dataDir}`,
-    `--env ENGRAM_NAMESPACE=${answers.namespace}`,
-    `--env ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
-  ];
-  if (answers.shellCmd) envFlags.push(`--env ENGRAM_EMBEDDING_CMD=${quoteShell(answers.shellCmd)}`);
-  if (answers.ollamaUrl) envFlags.push(`--env OLLAMA_URL=${answers.ollamaUrl}`);
-  if (answers.ollamaModel) envFlags.push(`--env OLLAMA_MODEL=${answers.ollamaModel}`);
-  if (answers.embeddingDimension) envFlags.push(`--env ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
-  const lines = [
-    'claude mcp add engram --scope user \\',
-    ...envFlags.map(f => `  ${f} \\`),
-    `  -- node ${entry}`,
-  ];
-  p.note(lines.join('\n'), 'Manual MCP install');
+function printManualMcpInstructions(
+  entry: string,
+  answers: OnboardAnswers,
+  detected: readonly McpClient[],
+): void {
+  // Show command for each client; mark which ones aren't installed locally.
+  const sections: string[] = [];
+  for (const client of MCP_CLIENTS) {
+    const installed = detected.some(d => d.id === client.id);
+    const cmd = formatMcpAddCommand(client, entry, answers);
+    sections.push(`# ${client.label}${installed ? '' : '  (not installed locally)'}`);
+    sections.push(cmd);
+    sections.push('');
+  }
+  p.note(sections.join('\n').trimEnd(), 'Manual MCP install commands');
+}
+
+function formatMcpAddCommand(client: McpClient, entry: string, answers: OnboardAnswers): string {
+  const args = buildMcpAddArgs(client, entry, answers);
+  const lines: string[] = [client.binary];
+  let i = 0;
+  while (i < args.length) {
+    const a = args[i];
+    if ((a === '--env' || a === '-e') && i + 1 < args.length) {
+      lines.push(`${a} ${quoteIfNeeded(args[i + 1])}`);
+      i += 2;
+    } else if (a === '--scope' && i + 1 < args.length) {
+      lines.push(`${a} ${args[i + 1]}`);
+      i += 2;
+    } else if (a === '-s' && i + 1 < args.length) {
+      lines.push(`${a} ${args[i + 1]}`);
+      i += 2;
+    } else {
+      lines.push(quoteIfNeeded(a));
+      i += 1;
+    }
+  }
+  return lines.map((l, idx) => (idx === 0 ? l : `  ${l}`)).join(' \\\n');
+}
+
+function quoteIfNeeded(s: string): string {
+  if (/^[A-Za-z0-9_./:=@-]+$/.test(s)) return s;
+  return `'${s.replace(/'/g, `'\\''`)}'`;
 }

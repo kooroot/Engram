@@ -52,7 +52,7 @@ engram onboard                      # interactive wizard: data dir, namespace, e
 engram doctor                       # verify the setup
 ```
 
-`engram onboard` auto-detects `codex`/OpenAI key, creates `~/.engram/`, writes an env file, and registers the MCP server with Claude Code if the CLI is present.
+`engram onboard` detects every installed MCP-capable CLI (`claude`, `codex`, `gemini`), shows a multiselect of where to register Engram, and runs each tool's `mcp add` for you. Same memory, every assistant.
 
 ### From source (development)
 
@@ -65,9 +65,19 @@ bun link
 engram onboard
 ```
 
-### Manual agent wiring (if you skip `onboard`)
+### One memory, every AI CLI
 
-**Claude Desktop** (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+Engram registers as a stdio MCP server for any tool that speaks MCP. `engram onboard` does this automatically; the manual equivalents per tool:
+
+| Tool | Manual registration command |
+|------|-----------------------------|
+| **Claude Code** | `claude mcp add engram --scope user --env ENGRAM_DATA_DIR=$HOME/.engram -- engram mcp` |
+| **Codex CLI** | `codex mcp add engram --env ENGRAM_DATA_DIR=$HOME/.engram -- engram mcp` |
+| **Gemini CLI** | `gemini mcp add -s user -e ENGRAM_DATA_DIR=$HOME/.engram engram engram mcp` |
+| **Claude Desktop** | Add to `~/Library/Application Support/Claude/claude_desktop_config.json` (see below) |
+| **Cursor / any MCP client** | Point `command` at the `engram` binary with arg `mcp` |
+
+**Claude Desktop config:**
 
 ```json
 {
@@ -81,13 +91,7 @@ engram onboard
 }
 ```
 
-**Claude Code:**
-
-```bash
-claude mcp add engram --env ENGRAM_DATA_DIR=$HOME/.engram -- engram mcp
-```
-
-**Cursor / any MCP-compatible client:** point `command` at the `engram` binary with `mcp` as the argument.
+After registration verify with `engram doctor` — it shows the registration status of every detected client side-by-side.
 
 ## Three Interfaces, One Memory
 

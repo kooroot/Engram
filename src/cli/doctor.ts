@@ -46,16 +46,26 @@ async function hasCommand(cmd: string): Promise<boolean> {
   });
 }
 
-async function mcpList(): Promise<string | null> {
+async function mcpList(binary: string): Promise<string | null> {
   return new Promise(resolve => {
-    const child = spawn('claude', ['mcp', 'list'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    const child = spawn(binary, ['mcp', 'list'], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     child.stdout.setEncoding('utf8');
     child.stdout.on('data', d => { out += d; });
+    // Some CLIs print to stderr too; merge for matching purposes.
+    let err = '';
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', d => { err += d; });
     child.on('error', () => resolve(null));
-    child.on('close', code => resolve(code === 0 ? out : null));
+    child.on('close', code => resolve(code === 0 ? (out + err) : null));
   });
 }
+
+const MCP_CLIENT_BINARIES = [
+  { binary: 'claude', label: 'Claude Code' },
+  { binary: 'codex',  label: 'Codex CLI' },
+  { binary: 'gemini', label: 'Gemini CLI' },
+] as const;
 
 function icon(status: CheckStatus): string {
   if (status === 'ok') return chalk.green('✓');
@@ -168,22 +178,22 @@ async function checkEmbeddingProvider(): Promise<CheckResult> {
   }
 }
 
-async function checkMcpRegistration(): Promise<CheckResult> {
-  const hasCli = await hasCommand('claude');
+async function checkMcpClientRegistration(client: { binary: string; label: string }): Promise<CheckResult> {
+  const hasCli = await hasCommand(client.binary);
   if (!hasCli) {
-    return { status: 'warn', label: 'claude mcp', detail: 'claude CLI not found (skipped)' };
+    return { status: 'warn', label: `${client.binary} mcp`, detail: `${client.binary} CLI not found (skipped)` };
   }
-  const list = await mcpList();
+  const list = await mcpList(client.binary);
   if (list === null) {
-    return { status: 'warn', label: 'claude mcp', detail: '`claude mcp list` failed' };
+    return { status: 'warn', label: `${client.binary} mcp`, detail: `\`${client.binary} mcp list\` failed` };
   }
   if (/\bengram\b/.test(list)) {
-    return { status: 'ok', label: 'claude mcp', detail: 'engram is registered' };
+    return { status: 'ok', label: `${client.binary} mcp`, detail: `engram is registered (${client.label})` };
   }
   return {
     status: 'warn',
-    label: 'claude mcp',
-    detail: 'engram not registered',
+    label: `${client.binary} mcp`,
+    detail: `engram not registered with ${client.label}`,
     fix: 'Run: engram onboard',
   };
 }
@@ -348,7 +358,9 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<void> {
   if (bindingsResult.status !== 'fail') {
     results.push(await checkEmbeddingProvider());
   }
-  results.push(await checkMcpRegistration());
+  for (const client of MCP_CLIENT_BINARIES) {
+    results.push(await checkMcpClientRegistration(client));
+  }
 
   results.forEach(printRow);
 
