@@ -6,36 +6,73 @@ export const ENGRAM_START_MARKER = '<!-- engram:start -->';
 export const ENGRAM_END_MARKER = '<!-- engram:end -->';
 
 /**
- * Token-conscious instructions added to each AI CLI's global instruction file
- * (CLAUDE.md / AGENTS.md / GEMINI.md). The text is bounded by markers so we
- * can refresh in place without duplicating.
+ * Instructions added to each AI CLI's global instruction file
+ * (CLAUDE.md / AGENTS.md / GEMINI.md). Marker-bounded so re-running
+ * \`engram onboard\` refreshes in place without duplicating.
+ *
+ * Philosophy: Engram is the AI's long-term WORKING JOURNAL, not a
+ * dictation pad. It captures the substance of ongoing work by default
+ * so the next session can resume. Project identity is anchored to the
+ * current working directory.
  */
 export const ENGRAM_INSTRUCTIONS = `${ENGRAM_START_MARKER}
-## Persistent Memory (Engram)
+## Persistent Memory (Engram) — your long-term working journal
 
-You have access to the \`engram\` MCP server — a local persistent memory graph.
+You have access to \`engram\`, a persistent memory graph that survives
+across sessions. Treat it as your WORKING JOURNAL: write continuously
+as we work so the next session remembers what we were doing.
 
-USE engram when:
-- The user mentions a person, project, or decision that might already be stored
-- The user asks to remember something, or asks what you remember
-- You're building context on a topic worked on before
+### AT SESSION START
 
-DO NOT use engram for:
-- Trivial questions (time, general programming knowledge)
-- Pure code questions about the user's CURRENT file (use the file directly)
-- Things that won't matter beyond this conversation
+1. Detect the user's PROJECT context from the current working directory,
+   explicit mention, or recurring file paths.
+2. Call \`query_engram\` by project name or cwd. If a project node
+   exists, open with a one-line "where we left off" summary from its
+   \`summary\` field before asking the user for new input.
+3. If no project node exists but the user is actively working in a
+   directory, CREATE one:
+   - type: \`project\`
+   - name: short human-readable title (e.g. "Upbit SDK")
+   - properties: \`{ cwd: "/absolute/path" }\` plus language/stack if clear
+   - summary: 1–2 sentences on what it is and current state
 
-Token-conscious order:
-1. \`query_engram\` (structured, cheap) BEFORE \`get_context\` (semantic, expensive)
-2. Pass \`max_tokens=1500\` to read tools unless you really need more
-3. Don't call multiple read tools in parallel for the same query
+### WRITE CONTINUOUSLY (no "remember" needed) when the user:
 
-For writes: \`mutate_state\` proactively, but ONLY for facts worth keeping
-across conversations. Use \`link_entities\` for relationships
-(e.g. "Alice works on Project X").
+1. Starts/describes a PROJECT or TOPIC — create/update project node;
+   the \`summary\` field is a RUNNING NARRATIVE of state + next steps.
+2. Makes a DECISION or DESIGN CHOICE — create \`decision\` node with the
+   WHY; \`link_entities\` with predicate \`decided_in\` → project.
+3. DISCOVERS an INSIGHT or GOTCHA — create \`insight\`/\`fact\` node;
+   link \`discovered_in\` → project.
+4. Announces PROGRESS (completed/started something) — UPDATE the project
+   node's \`summary\`, don't create a new node.
+5. Shares a PREFERENCE, OPINION, or VALUE STATEMENT — save as
+   \`preference\` node; link to a \`self\` or \`user\` node if present.
+6. Introduces PEOPLE / TEAMS / EXTERNAL ENTITIES by name + role — create
+   nodes and \`link_entities\` for relationships (works_on, reports_to, etc.)
+7. Explicitly asks to REMEMBER — obvious case.
 
-The user can audit your token usage with \`engram usage\` (day / week / month).
-Be conservative — every read tool call is recorded.
+### PREFER UPDATE OVER DUPLICATE
+
+Before creating a node, \`query_engram\` by \`node_name\` + \`node_type\`.
+One project node per project — its summary evolves across sessions.
+One decision node per decision — update if the decision changes.
+
+### DO NOT save
+
+- Trivial Q&A (time, syntax lookups, general programming knowledge)
+- Your own prose when the user didn't introduce anything new
+- Intermediate debugging of the CURRENT file (the code is authoritative)
+- Ephemeral filler ("ok", "thanks", "got it")
+
+### TOKEN DISCIPLINE
+
+- \`query_engram\` (cheap, structured) before \`get_context\` (expensive).
+- Pass \`max_tokens=1500\` on reads unless you really need more.
+- Writes are CHEAP compared to losing next-session context. Over-saving
+  substance is far less bad than forgetting it.
+
+The user audits via \`engram usage\`. Save the substance, skip the fluff.
 ${ENGRAM_END_MARKER}`;
 
 export type ClientId = 'claude' | 'codex' | 'gemini';
