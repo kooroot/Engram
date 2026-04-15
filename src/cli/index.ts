@@ -58,14 +58,15 @@ export function registerCLICommands(program: Command): void {
 
   program
     .command('usage')
-    .description('Show token usage and tool-call activity over a time window')
-    .option('-p, --period <period>', 'Time window: day | week | month', 'week')
+    .description('Show token usage and tool-call activity (heatmap + stats by default)')
+    .option('-p, --period <period>', 'Time window for stats: day | week | month', 'week')
     .option('-b, --by <breakdown>', 'Breakdown: tool | day | namespace', 'tool')
     .option('-a, --all', 'Include all namespaces (otherwise current namespace only)', false)
-    .action((opts: { period: string; by: string; all?: boolean }) => withCore((core) => {
+    .option('--plain', 'Static layout — totals + breakdown only (CI-friendly, no heatmap)', false)
+    .action((opts: { period: string; by: string; all?: boolean; plain?: boolean }) => withCore((core) => {
       const period = (['day', 'week', 'month'].includes(opts.period) ? opts.period : 'week') as Period;
       const breakdown = (['tool', 'day', 'namespace'].includes(opts.by) ? opts.by : 'tool') as Breakdown;
-      runUsage(core, { period, breakdown, allNamespaces: !!opts.all });
+      runUsage(core, { period, breakdown, allNamespaces: !!opts.all, plain: !!opts.plain });
     }, ns())());
 
   // ─── status ──────────────────────────────────────

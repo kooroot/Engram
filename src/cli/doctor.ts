@@ -62,6 +62,77 @@ async function mcpList(binary: string): Promise<string | null> {
   });
 }
 
+/**
+ * Strip `//` line comments and `/* ... *\/` block comments from JSONC,
+ * respecting string boundaries and escape sequences. Gemini's settings.json
+ * is JSONC, so plain JSON.parse fails when users (or other tools) leave
+ * comments in the file.
+ */
+function stripJsonc(text: string): string {
+  let out = '';
+  let i = 0;
+  let inString = false;
+  let stringChar = '';
+  while (i < text.length) {
+    const c = text[i];
+    const next = text[i + 1];
+    if (inString) {
+      if (c === '\\' && i + 1 < text.length) {
+        out += c + next;
+        i += 2;
+        continue;
+      }
+      if (c === stringChar) inString = false;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inString = true;
+      stringChar = c;
+      out += c;
+      i += 1;
+      continue;
+    }
+    if (c === '/' && next === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '/' && next === '*') {
+      i += 2;
+      while (i < text.length - 1 && !(text[i] === '*' && text[i + 1] === '/')) i += 1;
+      i += 2;
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Direct check of Gemini's MCP config file. `gemini mcp list` only renders to
+ * a TTY — when piped it returns 0 with empty stdout, which made our shell-based
+ * check report "not registered" even when engram was actually configured.
+ */
+function geminiHasEngram(): boolean {
+  try {
+    const settingsPath = path.join(process.env['HOME'] ?? '', '.gemini', 'settings.json');
+    if (!fs.existsSync(settingsPath)) return false;
+    const raw = fs.readFileSync(settingsPath, 'utf8');
+    let json: { mcpServers?: Record<string, unknown> };
+    try {
+      json = JSON.parse(raw);
+    } catch {
+      // Settings file likely contains JSONC-style comments — strip them and retry.
+      json = JSON.parse(stripJsonc(raw));
+    }
+    return !!json.mcpServers?.['engram'];
+  } catch {
+    return false;
+  }
+}
+
 const MCP_CLIENT_BINARIES = [
   { binary: 'claude', label: 'Claude Code' },
   { binary: 'codex',  label: 'Codex CLI' },
@@ -213,6 +284,20 @@ async function checkMcpClientRegistration(client: { binary: string; label: strin
   if (!hasCli) {
     return { status: 'warn', label: `${client.binary} mcp`, detail: `${client.binary} CLI not found (skipped)` };
   }
+
+  // Gemini CLI: `gemini mcp list` only outputs in a TTY, so go straight to its config file.
+  if (client.binary === 'gemini') {
+    if (geminiHasEngram()) {
+      return { status: 'ok', label: `${client.binary} mcp`, detail: `engram is registered (${client.label})` };
+    }
+    return {
+      status: 'warn',
+      label: `${client.binary} mcp`,
+      detail: `engram not registered with ${client.label}`,
+      fix: 'Run: engram onboard',
+    };
+  }
+
   const list = await mcpList(client.binary);
   if (list === null) {
     return { status: 'warn', label: `${client.binary} mcp`, detail: `\`${client.binary} mcp list\` failed` };

@@ -116,6 +116,21 @@ export class UsageLog {
     return this.db.prepare(sql).all(sinceMs) as UsageByNamespace[];
   }
 
+  /**
+   * Lightweight per-row fetch for client-side analytics
+   * (sessions, streaks, heatmap, etc.). Keep payload narrow.
+   */
+  rangeRecords(sinceMs: number, namespace?: string): Array<{ ts: number; tool: string; estTokens: number; durationMs: number }> {
+    const sql = namespace
+      ? `SELECT ts, tool, est_tokens AS estTokens, duration_ms AS durationMs
+         FROM usage_log WHERE ts >= ? AND namespace = ? ORDER BY ts ASC`
+      : `SELECT ts, tool, est_tokens AS estTokens, duration_ms AS durationMs
+         FROM usage_log WHERE ts >= ? ORDER BY ts ASC`;
+    return (namespace
+      ? this.db.prepare(sql).all(sinceMs, namespace)
+      : this.db.prepare(sql).all(sinceMs)) as Array<{ ts: number; tool: string; estTokens: number; durationMs: number }>;
+  }
+
   /** Periodically prune entries older than the retention window (default 90d). */
   prune(retentionDays: number = 90): number {
     const cutoff = Date.now() - retentionDays * 86400 * 1000;
