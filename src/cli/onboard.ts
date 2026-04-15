@@ -59,6 +59,54 @@ function quoteShell(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
+const ENGRAM_MANAGED_VARS = [
+  'ENGRAM_DATA_DIR',
+  'ENGRAM_NAMESPACE',
+  'ENGRAM_EMBEDDING_PROVIDER',
+  'ENGRAM_EMBEDDING_CMD',
+  'ENGRAM_EMBEDDING_DIMENSION',
+  'ENGRAM_EMBEDDING_TIMEOUT_MS',
+  'OLLAMA_URL',
+  'OLLAMA_MODEL',
+] as const;
+
+function expectedFileEnv(answers: OnboardAnswers): Record<string, string> {
+  const out: Record<string, string> = {
+    ENGRAM_DATA_DIR: answers.dataDir,
+    ENGRAM_NAMESPACE: answers.namespace,
+    ENGRAM_EMBEDDING_PROVIDER: answers.provider,
+  };
+  if (answers.shellCmd) out['ENGRAM_EMBEDDING_CMD'] = answers.shellCmd;
+  if (answers.ollamaUrl) out['OLLAMA_URL'] = answers.ollamaUrl;
+  if (answers.ollamaModel) out['OLLAMA_MODEL'] = answers.ollamaModel;
+  if (answers.embeddingDimension) out['ENGRAM_EMBEDDING_DIMENSION'] = String(answers.embeddingDimension);
+  return out;
+}
+
+interface ShellConflict {
+  key: string;
+  shellValue: string;
+  fileValue: string | undefined;
+}
+
+function detectShellConflicts(answers: OnboardAnswers): ShellConflict[] {
+  const file = expectedFileEnv(answers);
+  const conflicts: ShellConflict[] = [];
+  for (const key of ENGRAM_MANAGED_VARS) {
+    const shellValue = process.env[key];
+    if (shellValue === undefined) continue;
+    const fileValue = file[key];
+    if (fileValue !== shellValue) {
+      conflicts.push({ key, shellValue, fileValue });
+    }
+  }
+  return conflicts;
+}
+
+function listStaleShellVars(): string[] {
+  return ENGRAM_MANAGED_VARS.filter(k => process.env[k] !== undefined);
+}
+
 function writeEnvFile(dataDir: string, answers: OnboardAnswers): string {
   const lines = [
     '# Engram config — source this file or set env vars',
@@ -309,6 +357,18 @@ export async function runOnboard(): Promise<void> {
   const hasClaudeCli = await hasCommand('claude');
   const ollamaReachable = await checkUrl('http://localhost:11434');
 
+  // Pre-flight: warn if shell already has Engram-managed vars.
+  // They will override anything we save here unless the user clears them.
+  const preExistingVars = listStaleShellVars();
+  if (preExistingVars.length > 0) {
+    p.log.warn(
+      `Your shell already has these Engram-managed env vars set:\n  ` +
+      preExistingVars.map(k => `${k}=${process.env[k]}`).join('\n  ') +
+      `\nPrecedence is shell > file, so these will OVERRIDE whatever you choose below.\n` +
+      `If you want a fresh setup to take effect, plan to unset them after onboarding.`,
+    );
+  }
+
   const dataDirInput = await p.text({
     message: 'Data directory',
     placeholder: '~/.engram',
@@ -415,6 +475,21 @@ export async function runOnboard(): Promise<void> {
 
   const envPath = writeEnvFile(dataDir, answers);
   p.log.success(`Env file written      ${envPath}`);
+
+  // Post-write conflict check — surface the stale-shell-vars footgun loudly.
+  const conflicts = detectShellConflicts(answers);
+  if (conflicts.length > 0) {
+    const lines = [
+      `${conflicts.length} env var${conflicts.length === 1 ? '' : 's'} in your shell will override the file:`,
+      ...conflicts.map(c => `  ${c.key}=${c.shellValue}    (file: ${c.fileValue ?? '(unset)'})`),
+      '',
+      'Run this in your current shell to use the file values:',
+      `  unset ${conflicts.map(c => c.key).join(' ')}`,
+      '',
+      'Or open a new terminal that does not have these set.',
+    ];
+    p.note(lines.join('\n'), 'Shell env conflicts');
+  }
 
   const entry = findEngramEntry();
   if (!fs.existsSync(entry)) {
