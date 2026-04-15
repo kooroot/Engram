@@ -7,6 +7,7 @@ import chalk from 'chalk';
 import { loadConfig } from '../config/index.js';
 import { resolveEmbeddingProvider } from '../service.js';
 import { renderBanner } from './banner.js';
+import { getInstructionStatuses } from './agent-instructions.js';
 
 type CheckStatus = 'ok' | 'warn' | 'fail';
 interface CheckResult {
@@ -176,6 +177,35 @@ async function checkEmbeddingProvider(): Promise<CheckResult> {
       detail: `${provider} — config error: ${(err as Error).message}`,
     };
   }
+}
+
+function checkAgentInstructions(): CheckResult {
+  const statuses = getInstructionStatuses();
+  const installed = statuses.filter(s => s.hasEngramSection).map(s => s.file.clientId);
+  const filesPresent = statuses.filter(s => s.exists).map(s => s.file.clientId);
+  if (filesPresent.length === 0) {
+    return {
+      status: 'warn',
+      label: 'agent instructions',
+      detail: 'no AI CLI instruction files found (CLAUDE.md / AGENTS.md / GEMINI.md)',
+    };
+  }
+  const missing = filesPresent.filter(id => !installed.includes(id));
+  if (missing.length === 0) {
+    return {
+      status: 'ok',
+      label: 'agent instructions',
+      detail: `Engram section installed in ${installed.join(', ')}`,
+    };
+  }
+  return {
+    status: 'warn',
+    label: 'agent instructions',
+    detail: installed.length > 0
+      ? `installed: ${installed.join(', ')}; missing: ${missing.join(', ')}`
+      : `not installed in ${missing.join(', ')}`,
+    fix: 'Run: engram onboard  (will offer to add the section to each file)',
+  };
 }
 
 async function checkMcpClientRegistration(client: { binary: string; label: string }): Promise<CheckResult> {
@@ -361,6 +391,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<void> {
   for (const client of MCP_CLIENT_BINARIES) {
     results.push(await checkMcpClientRegistration(client));
   }
+  results.push(checkAgentInstructions());
 
   results.forEach(printRow);
 

@@ -5,6 +5,12 @@ import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as p from '@clack/prompts';
 import { renderBanner } from './banner.js';
+import {
+  getInstructionFiles,
+  installInstructions,
+  type ClientId as InstructionClientId,
+  type InstructionFile,
+} from './agent-instructions.js';
 
 type McpClientId = 'claude' | 'codex' | 'gemini';
 
@@ -585,6 +591,12 @@ export async function runOnboard(): Promise<void> {
     printManualMcpInstructions(entry, answers, detectedClients);
   }
 
+  // Offer to write usage instructions into each client's global instruction file
+  // (CLAUDE.md / AGENTS.md / GEMINI.md). This is what makes auto-recall actually
+  // happen — without it, the AI sees the tools but rarely calls them proactively.
+  const installedInstructionFiles = await offerInstructionInstall(installClients);
+  void installedInstructionFiles;
+
   const verifySteps: string[] = [];
   if (installClients.includes('claude')) {
     verifySteps.push('   Claude Code: /mcp menu → engram should appear');
@@ -636,6 +648,54 @@ function providerSummary(r: ProviderResult): string {
     return `  (cmd: ${r.shellCmd}, dim=${r.embeddingDimension})`;
   }
   return '';
+}
+
+async function offerInstructionInstall(installedClientIds: McpClientId[]): Promise<InstructionFile[]> {
+  // Default to instruction files for clients we just registered with MCP;
+  // user can still toggle to include or exclude any.
+  const allFiles = getInstructionFiles();
+  if (allFiles.length === 0) return [];
+
+  const initialValues = allFiles
+    .filter(f => installedClientIds.includes(f.clientId as McpClientId))
+    .map(f => f.clientId);
+
+  const wantInstall = await p.confirm({
+    message: 'Add Engram usage instructions to your AI CLIs?  (token-conscious template, idempotent)',
+    initialValue: initialValues.length > 0,
+  });
+  ensureNotCancelled(wantInstall);
+  if (!wantInstall) {
+    return [];
+  }
+
+  const selected = await p.multiselect<InstructionClientId>({
+    message: 'Pick which instruction files to update:',
+    initialValues: initialValues as InstructionClientId[],
+    required: false,
+    options: allFiles.map(f => ({
+      value: f.clientId,
+      label: f.label,
+      hint: f.path,
+    })),
+  });
+  ensureNotCancelled(selected);
+  const picks = selected as InstructionClientId[];
+  const filesToUpdate = allFiles.filter(f => picks.includes(f.clientId));
+  if (filesToUpdate.length === 0) return [];
+
+  const updated: InstructionFile[] = [];
+  for (const file of filesToUpdate) {
+    try {
+      const result = installInstructions(file);
+      const verb = result.status === 'unchanged' ? 'already current' : result.status;
+      p.log.success(`${file.label} — ${verb}  (${file.path})`);
+      updated.push(file);
+    } catch (err) {
+      p.log.error(`${file.label} — failed: ${(err as Error).message}`);
+    }
+  }
+  return updated;
 }
 
 function printManualMcpInstructions(
