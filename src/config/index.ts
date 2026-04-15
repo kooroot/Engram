@@ -1,14 +1,18 @@
 import path from 'node:path';
 import { ConfigSchema, type Config } from './schema.js';
+import { autoLoadEngramEnv } from './load-env-file.js';
 
 export type { Config };
 
 /**
- * Precedence (highest → lowest): explicit overrides > env vars > defaults.
+ * Precedence (highest → lowest): explicit overrides > env vars > engram.env file > defaults.
  * Programmatic overrides must win so request-scoped settings (e.g., namespace
- * per REST request) aren't clobbered by ambient env.
+ * per REST request) aren't clobbered by ambient env. The env file is auto-loaded
+ * from `<dataDir>/engram.env` or `~/.engram/engram.env` (set `ENGRAM_NO_ENV_FILE=1`
+ * to disable). It NEVER overwrites already-set process.env entries.
  */
 export function loadConfig(overrides: Partial<Config> = {}): Config {
+  autoLoadEngramEnv(overrides.dataDir);
   const env = process.env;
   const raw = {
     dataDir: overrides.dataDir ?? env['ENGRAM_DATA_DIR'],

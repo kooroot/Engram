@@ -441,27 +441,27 @@ export async function runOnboard(): Promise<void> {
 
   p.note(
     [
-      '1. Activate env in your shell:',
-      `     source ${envPath}`,
-      '',
-      '2. Verify the install:',
+      '1. Verify the install:',
       '     engram doctor',
       '',
-      '3. See your memory graph stats:',
+      '2. See your memory graph stats:',
       '     engram status',
       '',
       ...(installClaude
         ? [
-          '4. Open Claude Code and run /mcp — `engram` should appear in the list.',
+          '3. Open Claude Code and run /mcp — `engram` should appear in the list.',
           '   Try: "remember that I prefer TypeScript"',
           '        then later: "what languages do I prefer?"',
           '',
         ]
         : [
-          '4. Register Engram with your MCP client (see Manual MCP install above).',
+          '3. Register Engram with your MCP client (see Manual MCP install above).',
           '',
         ]),
-      `Edit ${envPath} later to change provider, namespace, or other settings.`,
+      `Settings are auto-loaded from ${envPath} on every CLI run.`,
+      'Edit that file to change provider, namespace, or other settings later.',
+      `(Override at runtime with shell env vars, or set ENGRAM_NO_ENV_FILE=1 to skip auto-load.)`,
+      '',
       'Learn more: https://github.com/kooroot/Engram#readme',
     ].join('\n'),
     'Next steps',
