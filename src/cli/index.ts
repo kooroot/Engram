@@ -7,6 +7,7 @@ import { runOnboard } from './onboard.js';
 import { runDoctor } from './doctor.js';
 import { runUsage, type Period, type Breakdown } from './usage.js';
 import { runTui } from './tui.js';
+import { runReset } from './reset.js';
 
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
@@ -43,6 +44,18 @@ export function registerCLICommands(program: Command): void {
     .action(async () => {
       await runOnboard();
     });
+
+  // ─── reset ───────────────────────────────────────
+
+  program
+    .command('reset')
+    .description('Delete all data for a namespace (nodes, edges, events, history, usage, embeddings)')
+    .option('-a, --all', 'Reset every namespace in the DB, not just the current one', false)
+    .option('-y, --yes', 'Skip confirmation prompt (DANGEROUS — use with care)', false)
+    .option('--backup', 'Copy DB files to *.bak-<timestamp> before deleting', false)
+    .action((opts: { all?: boolean; yes?: boolean; backup?: boolean }) => withCore(async (core) => {
+      await runReset(core, { all: opts.all, yes: opts.yes, backup: opts.backup });
+    }, ns())());
 
   // ─── doctor ──────────────────────────────────────
 
