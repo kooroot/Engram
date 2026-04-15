@@ -26,6 +26,8 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
       shellCmd: overrides.embedding?.shellCmd ?? env['ENGRAM_EMBEDDING_CMD'],
       shellTimeoutMs: overrides.embedding?.shellTimeoutMs
         ?? (env['ENGRAM_EMBEDDING_TIMEOUT_MS'] ? Number(env['ENGRAM_EMBEDDING_TIMEOUT_MS']) : undefined),
+      ollamaUrl: overrides.embedding?.ollamaUrl ?? env['OLLAMA_URL'],
+      ollamaModel: overrides.embedding?.ollamaModel ?? env['OLLAMA_MODEL'],
     },
     maintenance: overrides.maintenance,
   };

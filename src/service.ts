@@ -19,6 +19,7 @@ import type { EmbeddingProvider } from './embeddings/index.js';
 import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
 import { LocalEmbeddingProvider } from './embeddings/local.js';
 import { ShellEmbeddingProvider } from './embeddings/shell.js';
+import { OllamaEmbeddingProvider } from './embeddings/ollama.js';
 import { safeJsonParse } from './utils.js';
 import { metrics, startTimer, safeNamespaceLabel } from './metrics.js';
 import { log } from './logger.js';
@@ -91,13 +92,19 @@ export function resolveEmbeddingProvider(
     case 'shell':
       if (!config.embedding.shellCmd) {
         throw new Error(
-          "Embedding provider 'shell' requires ENGRAM_EMBEDDING_CMD (e.g. \"codex embed --stdin\")",
+          "Embedding provider 'shell' requires ENGRAM_EMBEDDING_CMD",
         );
       }
       return new ShellEmbeddingProvider({
         command: config.embedding.shellCmd,
         dimension: config.embedding.dimension,
         timeoutMs: config.embedding.shellTimeoutMs,
+      });
+    case 'ollama':
+      return new OllamaEmbeddingProvider({
+        url: config.embedding.ollamaUrl,
+        model: config.embedding.ollamaModel,
+        dimension: config.embedding.dimension,
       });
     case 'none':
     default:

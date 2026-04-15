@@ -11,3 +11,4 @@ export interface EmbeddingProvider {
 export { OpenAIEmbeddingProvider } from './openai.js';
 export { LocalEmbeddingProvider } from './local.js';
 export { ShellEmbeddingProvider } from './shell.js';
+export { OllamaEmbeddingProvider } from './ollama.js';

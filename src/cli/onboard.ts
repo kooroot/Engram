@@ -9,13 +9,16 @@ import { renderBanner } from './banner.js';
 interface OnboardAnswers {
   dataDir: string;
   namespace: string;
-  provider: 'none' | 'openai' | 'shell' | 'local';
+  provider: 'none' | 'openai' | 'shell' | 'ollama' | 'local';
   shellCmd?: string;
+  ollamaUrl?: string;
+  ollamaModel?: string;
   embeddingDimension?: number;
   installClaude: boolean;
 }
 
 const CLAUDE_MCP_TIMEOUT_MS = 30_000;
+const PROVIDER_TEST_TIMEOUT_MS = 15_000;
 
 function expandHome(input: string): string {
   const s = input.trim();
@@ -30,6 +33,18 @@ async function hasCommand(cmd: string): Promise<boolean> {
     child.on('exit', code => resolve(code === 0));
     child.on('error', () => resolve(false));
   });
+}
+
+async function checkUrl(url: string): Promise<boolean> {
+  try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 1500);
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    return res.ok || res.status < 500;
+  } catch {
+    return false;
+  }
 }
 
 function findEngramEntry(): string {
@@ -52,6 +67,8 @@ function writeEnvFile(dataDir: string, answers: OnboardAnswers): string {
     `export ENGRAM_EMBEDDING_PROVIDER=${quoteShell(answers.provider)}`,
   ];
   if (answers.shellCmd) lines.push(`export ENGRAM_EMBEDDING_CMD=${quoteShell(answers.shellCmd)}`);
+  if (answers.ollamaUrl) lines.push(`export OLLAMA_URL=${quoteShell(answers.ollamaUrl)}`);
+  if (answers.ollamaModel) lines.push(`export OLLAMA_MODEL=${quoteShell(answers.ollamaModel)}`);
   if (answers.embeddingDimension) lines.push(`export ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
   const envPath = path.join(dataDir, 'engram.env');
   fs.writeFileSync(envPath, lines.join('\n') + '\n', { mode: 0o600 });
@@ -62,12 +79,14 @@ async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<
   return new Promise(resolve => {
     const args = [
       'mcp', 'add', 'engram',
-      '--scope', 'user',   // avoid interactive scope prompt on newer claude CLIs
+      '--scope', 'user',
       '--env', `ENGRAM_DATA_DIR=${answers.dataDir}`,
       '--env', `ENGRAM_NAMESPACE=${answers.namespace}`,
       '--env', `ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
     ];
     if (answers.shellCmd) args.push('--env', `ENGRAM_EMBEDDING_CMD=${answers.shellCmd}`);
+    if (answers.ollamaUrl) args.push('--env', `OLLAMA_URL=${answers.ollamaUrl}`);
+    if (answers.ollamaModel) args.push('--env', `OLLAMA_MODEL=${answers.ollamaModel}`);
     if (answers.embeddingDimension) args.push('--env', `ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
     args.push('--', 'node', entry);
 
@@ -97,10 +116,175 @@ async function runClaudeMcpAdd(entry: string, answers: OnboardAnswers): Promise<
   });
 }
 
+/**
+ * Live-test the chosen embedding provider in a child process so the parent's
+ * import cache and config singletons aren't touched.
+ */
+async function testProvider(answers: OnboardAnswers): Promise<{ ok: boolean; message: string }> {
+  if (answers.provider === 'none') return { ok: true, message: 'skipped (provider=none)' };
+
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    ENGRAM_DATA_DIR: answers.dataDir,
+    ENGRAM_NAMESPACE: answers.namespace,
+    ENGRAM_EMBEDDING_PROVIDER: answers.provider,
+  };
+  if (answers.shellCmd) env['ENGRAM_EMBEDDING_CMD'] = answers.shellCmd;
+  if (answers.ollamaUrl) env['OLLAMA_URL'] = answers.ollamaUrl;
+  if (answers.ollamaModel) env['OLLAMA_MODEL'] = answers.ollamaModel;
+  if (answers.embeddingDimension) env['ENGRAM_EMBEDDING_DIMENSION'] = String(answers.embeddingDimension);
+
+  const here = fileURLToPath(import.meta.url);
+  const servicePath = path.resolve(path.dirname(here), '..', 'service.js');
+  const configPath = path.resolve(path.dirname(here), '..', 'config', 'index.js');
+
+  // Use a child Node process so dynamic imports happen with the new env.
+  return new Promise(resolve => {
+    const script = `
+import('${configPath.replace(/\\/g, '\\\\')}').then(async cfg => {
+  const svc = await import('${servicePath.replace(/\\/g, '\\\\')}');
+  try {
+    const config = cfg.loadConfig();
+    const prov = svc.resolveEmbeddingProvider(config);
+    if (!prov) { console.error('no provider instantiated'); process.exit(2); }
+    const vec = await prov.embed('engram onboard test');
+    if (!Array.isArray(vec) || vec.length === 0) { console.error('empty embedding'); process.exit(3); }
+    process.stdout.write('dim=' + vec.length);
+    process.exit(0);
+  } catch (err) {
+    console.error(err && err.message ? err.message : String(err));
+    process.exit(1);
+  }
+});
+    `.trim();
+
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script], {
+      env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    let stderr = '';
+    child.stdout?.setEncoding('utf8');
+    child.stderr?.setEncoding('utf8');
+    child.stdout?.on('data', d => { stdout += d; });
+    child.stderr?.on('data', d => { stderr += d; });
+
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+      resolve({ ok: false, message: `timed out after ${PROVIDER_TEST_TIMEOUT_MS / 1000}s` });
+    }, PROVIDER_TEST_TIMEOUT_MS);
+
+    child.on('error', err => {
+      clearTimeout(timer);
+      resolve({ ok: false, message: err.message });
+    });
+    child.on('close', code => {
+      clearTimeout(timer);
+      if (code === 0) resolve({ ok: true, message: stdout.trim() || 'OK' });
+      else resolve({ ok: false, message: stderr.trim().slice(0, 400) || `exit ${code}` });
+    });
+  });
+}
+
 function ensureNotCancelled<T>(value: T | symbol): asserts value is T {
   if (p.isCancel(value)) {
     p.cancel('Setup cancelled.');
     process.exit(0);
+  }
+}
+
+type ProviderId = 'none' | 'openai' | 'ollama' | 'shell' | 'local';
+
+interface ProviderResult {
+  provider: OnboardAnswers['provider'];
+  shellCmd?: string;
+  ollamaUrl?: string;
+  ollamaModel?: string;
+  embeddingDimension?: number;
+}
+
+async function pickProvider(env: { hasOpenAIKey: boolean; ollamaReachable: boolean }): Promise<ProviderResult> {
+  while (true) {
+    const choice = await p.select<ProviderId>({
+      message: 'Semantic search provider  (skip with "none" — you can change later)',
+      initialValue: 'none',
+      options: [
+        { value: 'none', label: 'none', hint: 'graph + FTS only — works without any external service' },
+        {
+          value: 'ollama',
+          label: 'Ollama (local, free)',
+          hint: env.ollamaReachable
+            ? 'detected at http://localhost:11434 ✓'
+            : 'requires `ollama serve` and `ollama pull nomic-embed-text`',
+        },
+        {
+          value: 'openai',
+          label: 'OpenAI API key',
+          hint: env.hasOpenAIKey ? 'OPENAI_API_KEY detected ✓' : 'requires OPENAI_API_KEY env var',
+        },
+        { value: 'shell', label: 'custom: shell cmd', hint: 'bring your own embedding command (advanced)' },
+        { value: 'local', label: 'local: hash', hint: 'deterministic; low quality, testing only' },
+      ],
+    });
+    ensureNotCancelled(choice);
+
+    if (choice === 'none' || choice === 'local') {
+      return { provider: choice };
+    }
+
+    if (choice === 'openai') {
+      if (!env.hasOpenAIKey) {
+        p.log.warn('OPENAI_API_KEY is not set in this shell. Set it and re-run, or pick another provider.');
+        continue;
+      }
+      return { provider: 'openai' };
+    }
+
+    if (choice === 'ollama') {
+      const url = await p.text({
+        message: 'Ollama URL',
+        initialValue: 'http://localhost:11434',
+        validate: v => { if (!/^https?:\/\//.test(v as string)) return 'Must start with http:// or https://'; },
+      });
+      ensureNotCancelled(url);
+      const model = await p.text({
+        message: 'Ollama embedding model  (e.g. nomic-embed-text=768, mxbai-embed-large=1024)',
+        initialValue: 'nomic-embed-text',
+        validate: v => { if (!(v as string)?.trim()) return 'Model name required'; },
+      });
+      ensureNotCancelled(model);
+      const dim = await p.text({
+        message: 'Embedding dimension  (must match the model)',
+        initialValue: '768',
+        validate: v => { if (!/^\d+$/.test(v as string)) return 'Must be a positive integer'; },
+      });
+      ensureNotCancelled(dim);
+      return {
+        provider: 'ollama',
+        ollamaUrl: url as string,
+        ollamaModel: model as string,
+        embeddingDimension: Number(dim),
+      };
+    }
+
+    // shell
+    const cmd = await p.text({
+      message: 'Shell command  (reads text on stdin, outputs JSON embedding on stdout)',
+      placeholder: 'curl -sS http://localhost:8080/embed -d @-',
+      validate: v => { if (!(v as string)?.trim()) return 'Command required'; },
+    });
+    ensureNotCancelled(cmd);
+    const dim = await p.text({
+      message: 'Embedding dimension',
+      initialValue: '1536',
+      validate: v => { if (!/^\d+$/.test(v as string)) return 'Must be a positive integer'; },
+    });
+    ensureNotCancelled(dim);
+    return {
+      provider: 'shell',
+      shellCmd: cmd as string,
+      embeddingDimension: Number(dim),
+    };
   }
 }
 
@@ -113,7 +297,7 @@ export async function runOnboard(): Promise<void> {
     [
       'This wizard configures:',
       '  • Data directory + namespace',
-      '  • Semantic search provider (optional)',
+      '  • Semantic search provider (optional, live-tested)',
       '  • Claude Code MCP registration (optional)',
       '',
       'Takes ~30 seconds. Press Ctrl+C at any point to cancel.',
@@ -121,9 +305,9 @@ export async function runOnboard(): Promise<void> {
     'What this does',
   );
 
-  const hasCodex = await hasCommand('codex');
   const hasOpenAIKey = !!process.env['OPENAI_API_KEY'];
   const hasClaudeCli = await hasCommand('claude');
+  const ollamaReachable = await checkUrl('http://localhost:11434');
 
   const dataDirInput = await p.text({
     message: 'Data directory',
@@ -148,69 +332,49 @@ export async function runOnboard(): Promise<void> {
   });
   ensureNotCancelled(namespace);
 
-  const providerChoice = await p.select<'none' | 'codex' | 'openai' | 'shell' | 'local'>({
-    message: 'Semantic search provider  (can be changed later by editing engram.env)',
-    initialValue: 'none',
-    options: [
-      { value: 'none', label: 'none', hint: 'graph + FTS only — no external deps (recommended to start)' },
-      {
-        value: 'codex',
-        label: 'subscription: Codex',
-        hint: hasCodex ? 'codex CLI detected ✓  — uses OAuth' : 'install `codex` CLI first',
-      },
-      {
-        value: 'openai',
-        label: 'api key: OpenAI',
-        hint: hasOpenAIKey ? 'OPENAI_API_KEY detected ✓' : 'requires OPENAI_API_KEY env var',
-      },
-      { value: 'shell', label: 'custom: shell cmd', hint: 'bring your own embedding command' },
-      { value: 'local', label: 'local: hash', hint: 'deterministic; low quality, testing only' },
-    ],
-  });
-  ensureNotCancelled(providerChoice);
+  // Loop: pick provider → live-test → on failure offer to re-pick or save anyway
+  let providerResult: ProviderResult;
+  while (true) {
+    providerResult = await pickProvider({ hasOpenAIKey, ollamaReachable });
 
-  let provider: OnboardAnswers['provider'] = 'none';
-  let shellCmd: string | undefined;
-  let embeddingDimension: number | undefined;
+    const tentative: OnboardAnswers = {
+      dataDir,
+      namespace: namespace as string,
+      provider: providerResult.provider,
+      shellCmd: providerResult.shellCmd,
+      ollamaUrl: providerResult.ollamaUrl,
+      ollamaModel: providerResult.ollamaModel,
+      embeddingDimension: providerResult.embeddingDimension,
+      installClaude: false,
+    };
 
-  if (providerChoice === 'codex') {
-    if (!hasCodex) {
-      p.log.warn('codex CLI not found. Install it first, then run `engram onboard` again.');
-      p.outro('Aborted.');
-      return;
+    if (providerResult.provider === 'none') break;
+
+    const s = p.spinner();
+    s.start(`Testing ${providerResult.provider} provider with a sample embedding…`);
+    const result = await testProvider(tentative);
+    if (result.ok) {
+      s.stop(`Provider OK  (${result.message})`);
+      break;
     }
-    const cmd = await p.text({
-      message: 'Shell command for codex embedding',
-      initialValue: 'codex embed --stdin --json',
+    s.stop(`Provider test failed: ${result.message}`);
+
+    const action = await p.select<'retry' | 'save' | 'none'>({
+      message: 'How would you like to proceed?',
+      initialValue: 'retry',
+      options: [
+        { value: 'retry', label: 'Pick a different provider' },
+        { value: 'none', label: 'Skip semantic search (provider=none)' },
+        { value: 'save', label: 'Save this config anyway (you can fix it later in engram.env)' },
+      ],
     });
-    ensureNotCancelled(cmd);
-    const dim = await p.text({
-      message: 'Embedding dimension',
-      initialValue: '1536',
-      validate: v => { if (!/^\d+$/.test(v as string)) return 'Must be a positive integer'; },
-    });
-    ensureNotCancelled(dim);
-    provider = 'shell';
-    shellCmd = cmd as string;
-    embeddingDimension = Number(dim);
-  } else if (providerChoice === 'shell') {
-    const cmd = await p.text({
-      message: 'Shell command (reads text on stdin, outputs JSON embedding)',
-      placeholder: 'ollama run nomic-embed-text',
-      validate: v => { if (!(v as string)?.trim()) return 'Command required'; },
-    });
-    ensureNotCancelled(cmd);
-    const dim = await p.text({
-      message: 'Embedding dimension',
-      initialValue: '1536',
-      validate: v => { if (!/^\d+$/.test(v as string)) return 'Must be a positive integer'; },
-    });
-    ensureNotCancelled(dim);
-    provider = 'shell';
-    shellCmd = cmd as string;
-    embeddingDimension = Number(dim);
-  } else if (providerChoice === 'openai' || providerChoice === 'local' || providerChoice === 'none') {
-    provider = providerChoice;
+    ensureNotCancelled(action);
+    if (action === 'save') break;
+    if (action === 'none') {
+      providerResult = { provider: 'none' };
+      break;
+    }
+    // retry → loop continues
   }
 
   let installClaude = false;
@@ -228,24 +392,24 @@ export async function runOnboard(): Promise<void> {
   const answers: OnboardAnswers = {
     dataDir,
     namespace: namespace as string,
-    provider,
-    shellCmd,
-    embeddingDimension,
+    provider: providerResult.provider,
+    shellCmd: providerResult.shellCmd,
+    ollamaUrl: providerResult.ollamaUrl,
+    ollamaModel: providerResult.ollamaModel,
+    embeddingDimension: providerResult.embeddingDimension,
     installClaude,
   };
 
-  // ─── Review ──────────────────────────────────────────
   p.note(
     [
       `Data dir:     ${dataDir}`,
       `Namespace:    ${namespace}`,
-      `Provider:     ${provider}${shellCmd ? `  (cmd: ${shellCmd})` : ''}`,
+      `Provider:     ${providerResult.provider}` + providerSummary(providerResult),
       `Claude MCP:   ${installClaude ? 'yes (scope=user)' : 'no'}`,
     ].join('\n'),
     'Review — about to apply',
   );
 
-  // ─── Fast, instant operations — use p.log so output is always visible ───
   fs.mkdirSync(dataDir, { recursive: true });
   p.log.success(`Data directory ready  ${dataDir}`);
 
@@ -259,7 +423,6 @@ export async function runOnboard(): Promise<void> {
     p.log.info(`Engram binary         ${entry}`);
   }
 
-  // ─── Slow operation: claude mcp add (with spinner + timeout) ─────────────
   if (installClaude) {
     const s = p.spinner();
     s.start('Registering Engram with Claude Code  (up to 30s)');
@@ -276,7 +439,6 @@ export async function runOnboard(): Promise<void> {
     printManualMcpInstructions(entry, answers);
   }
 
-  // ─── Rich next steps ─────────────────────────────────────────────────────
   p.note(
     [
       '1. Activate env in your shell:',
@@ -308,6 +470,16 @@ export async function runOnboard(): Promise<void> {
   p.outro('Setup complete.');
 }
 
+function providerSummary(r: ProviderResult): string {
+  if (r.provider === 'ollama') {
+    return `  (${r.ollamaModel} @ ${r.ollamaUrl}, dim=${r.embeddingDimension})`;
+  }
+  if (r.provider === 'shell') {
+    return `  (cmd: ${r.shellCmd}, dim=${r.embeddingDimension})`;
+  }
+  return '';
+}
+
 function printManualMcpInstructions(entry: string, answers: OnboardAnswers): void {
   const envFlags = [
     `--env ENGRAM_DATA_DIR=${answers.dataDir}`,
@@ -315,6 +487,8 @@ function printManualMcpInstructions(entry: string, answers: OnboardAnswers): voi
     `--env ENGRAM_EMBEDDING_PROVIDER=${answers.provider}`,
   ];
   if (answers.shellCmd) envFlags.push(`--env ENGRAM_EMBEDDING_CMD=${quoteShell(answers.shellCmd)}`);
+  if (answers.ollamaUrl) envFlags.push(`--env OLLAMA_URL=${answers.ollamaUrl}`);
+  if (answers.ollamaModel) envFlags.push(`--env OLLAMA_MODEL=${answers.ollamaModel}`);
   if (answers.embeddingDimension) envFlags.push(`--env ENGRAM_EMBEDDING_DIMENSION=${answers.embeddingDimension}`);
   const lines = [
     'claude mcp add engram --scope user \\',
