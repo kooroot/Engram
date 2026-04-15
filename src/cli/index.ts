@@ -6,6 +6,7 @@ import type { EventType } from '../types/index.js';
 import { runOnboard } from './onboard.js';
 import { runDoctor } from './doctor.js';
 import { runUsage, type Period, type Breakdown } from './usage.js';
+import { runTui } from './tui.js';
 
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
@@ -53,6 +54,15 @@ export function registerCLICommands(program: Command): void {
     .action(async (opts: { fix?: boolean; quiet?: boolean }) => {
       await runDoctor({ fix: opts.fix, quiet: opts.quiet });
     });
+
+  // ─── tui ─────────────────────────────────────────
+
+  program
+    .command('tui')
+    .description('Interactive dashboard — heatmap, stats, browse, status (multi-tab TUI)')
+    .action(() => withCore(async (core) => {
+      await runTui(core);
+    }, ns())());
 
   // ─── usage ───────────────────────────────────────
 
