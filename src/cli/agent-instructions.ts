@@ -10,69 +10,84 @@ export const ENGRAM_END_MARKER = '<!-- engram:end -->';
  * (CLAUDE.md / AGENTS.md / GEMINI.md). Marker-bounded so re-running
  * \`engram onboard\` refreshes in place without duplicating.
  *
- * Philosophy: Engram is the AI's long-term WORKING JOURNAL, not a
- * dictation pad. It captures the substance of ongoing work by default
- * so the next session can resume. Project identity is anchored to the
- * current working directory.
+ * Philosophy: Engram is the AI's working journal, not a dictation pad.
+ * The user should NEVER have to consciously frame work as "this is a
+ * project" — the AI itself recognizes substantive work and captures it.
+ * Default behavior is WRITE; skipping is the exception.
  */
 export const ENGRAM_INSTRUCTIONS = `${ENGRAM_START_MARKER}
 ## Persistent Memory (Engram) — your long-term working journal
 
 You have access to \`engram\`, a persistent memory graph that survives
-across sessions. Treat it as your WORKING JOURNAL: write continuously
-as we work so the next session remembers what we were doing.
+across sessions. Treat it as YOUR working journal: capture substance
+proactively so the next session resumes without losing context.
 
-### AT SESSION START
+The user should NOT have to say "remember this" or frame things as
+"a project". YOU recognize the work and capture it.
 
-1. Detect the user's PROJECT context from the current working directory,
-   explicit mention, or recurring file paths.
-2. Call \`query_engram\` by project name or cwd. If a project node
-   exists, open with a one-line "where we left off" summary from its
-   \`summary\` field before asking the user for new input.
-3. If no project node exists but the user is actively working in a
-   directory, CREATE one:
+### AT SESSION START — MANDATORY
+
+1. Detect PROJECT context from cwd, file paths, or what the user is
+   discussing.
+2. Call \`query_engram\` by project name or cwd basename. If a project
+   node exists, open with a one-line "where we left off" summary from
+   its \`summary\` field.
+3. If no project node and the user is asking you to do real work
+   (build, design, debug, implement, plan, research, write), CREATE a
+   project node IMMEDIATELY at the start of your work — don't wait for
+   the user to "frame" it:
    - type: \`project\`
-   - name: short human-readable title (e.g. "Upbit SDK")
-   - properties: \`{ cwd: "/absolute/path" }\` plus language/stack if clear
-   - summary: 1–2 sentences on what it is and current state
+   - name: short human-readable title (e.g. "Bloomberg Dashboard Prototype")
+   - properties: \`{ cwd, stack, theme, ... whatever describes the work }\`
+   - summary: 1–2 sentences on what it is + current state
 
-### WRITE CONTINUOUSLY (no "remember" needed) when the user:
+### WRITE PROACTIVELY — your DEFAULT is to capture
 
-1. Starts/describes a PROJECT or TOPIC — create/update project node;
-   the \`summary\` field is a RUNNING NARRATIVE of state + next steps.
-2. Makes a DECISION or DESIGN CHOICE — create \`decision\` node with the
-   WHY; \`link_entities\` with predicate \`decided_in\` → project.
-3. DISCOVERS an INSIGHT or GOTCHA — create \`insight\`/\`fact\` node;
-   link \`discovered_in\` → project.
-4. Announces PROGRESS (completed/started something) — UPDATE the project
-   node's \`summary\`, don't create a new node.
-5. Shares a PREFERENCE, OPINION, or VALUE STATEMENT — save as
-   \`preference\` node; link to a \`self\` or \`user\` node if present.
-6. Introduces PEOPLE / TEAMS / EXTERNAL ENTITIES by name + role — create
-   nodes and \`link_entities\` for relationships (works_on, reports_to, etc.)
-7. Explicitly asks to REMEMBER — obvious case.
+USER triggers (obvious):
+- Starts/describes a project, topic, or task
+- Makes a decision or design choice
+- Shares a preference, opinion, or value statement
+- Introduces a person, team, or external entity by name
+- Explicitly asks to remember
 
-### PREFER UPDATE OVER DUPLICATE
+YOUR-OWN-WORK triggers (this is the part you must internalize):
+- You make a meaningful design decision while working (color, font,
+  layout, library, framework, architecture, data structure, API shape)
+  → save as \`decision\` linked to project (\`decided_in\`)
+- You discover a non-obvious gotcha or insight while working
+  ("turns out X requires Y", "the fix is Z")
+  → save as \`insight\`/\`fact\` linked to project (\`discovered_in\`)
+- You complete a substantive milestone (auth done, scaffold ready,
+  bug fixed, prototype built)
+  → UPDATE project.summary to reflect new state, don't fork
 
-Before creating a node, \`query_engram\` by \`node_name\` + \`node_type\`.
-One project node per project — its summary evolves across sessions.
-One decision node per decision — update if the decision changes.
+ANY user request to BUILD / CREATE / MAKE / DESIGN / IMPLEMENT / WRITE
+counts as project work — create a project node first, then save your
+ongoing decisions and insights to it.
 
 ### DO NOT save
 
-- Trivial Q&A (time, syntax lookups, general programming knowledge)
-- Your own prose when the user didn't introduce anything new
-- Intermediate debugging of the CURRENT file (the code is authoritative)
-- Ephemeral filler ("ok", "thanks", "got it")
+- Pure trivia (time, syntax lookups, general programming knowledge)
+- Filler acknowledgments ("ok", "thanks", "got it")
+- Your own clarifying questions back to the user
+- Read-only inspection of the CURRENT file (the code is authoritative)
+
+### PREFER UPDATE OVER DUPLICATE
+
+Before creating, \`query_engram\` by \`node_name\` + \`node_type\`. One
+project node per project — its \`summary\` is a RUNNING NARRATIVE that
+evolves across sessions. One decision node per decision — update in
+place if it changes. Never fork (no v2 nodes).
 
 ### TOKEN DISCIPLINE
 
-- \`query_engram\` (cheap, structured) before \`get_context\` (expensive).
-- Pass \`max_tokens=1500\` on reads unless you really need more.
-- Writes are CHEAP compared to losing next-session context. Over-saving
-  substance is far less bad than forgetting it.
+- \`query_engram\` (cheap, structured) before \`get_context\` (expensive)
+- Pass \`max_tokens=1500\` on reads unless you really need more
+- Writes average ~170 tokens — cheap insurance against losing context.
+  Over-saving substance is far less bad than forgetting it next session.
 
-The user audits via \`engram usage\`. Save the substance, skip the fluff.
+The user audits via \`engram usage\` and prunes via \`engram maintenance\`.
+They WANT proactive capture. Default action: SAVE.
 ${ENGRAM_END_MARKER}`;
 
 export type ClientId = 'claude' | 'codex' | 'gemini';

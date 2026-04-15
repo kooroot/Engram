@@ -250,6 +250,33 @@ async function checkEmbeddingProvider(): Promise<CheckResult> {
   }
 }
 
+function checkMemoryHealth(dataDir: string): CheckResult {
+  // Quick health hint: if the main DB exists and is large, suggest periodic maintenance.
+  // We don't actually open the DB here (doctor stays read-only safe), just sanity-check size.
+  const mainDb = path.join(dataDir, 'engram.db');
+  if (!fs.existsSync(mainDb)) {
+    return { status: 'ok', label: 'memory health', detail: 'no DB yet (will initialize on first use)' };
+  }
+  const stat = fs.statSync(mainDb);
+  const sizeMb = stat.size / (1024 * 1024);
+  if (sizeMb < 5) {
+    return { status: 'ok', label: 'memory health', detail: `${sizeMb.toFixed(1)} MB — small, no action needed` };
+  }
+  if (sizeMb < 50) {
+    return {
+      status: 'ok',
+      label: 'memory health',
+      detail: `${sizeMb.toFixed(1)} MB — periodic \`engram maintenance\` keeps low-confidence/old nodes pruned`,
+    };
+  }
+  return {
+    status: 'warn',
+    label: 'memory health',
+    detail: `${sizeMb.toFixed(1)} MB — consider \`engram maintenance\` to decay/archive stale nodes`,
+    fix: 'Run: engram maintenance --dry-run  (preview before applying)',
+  };
+}
+
 function checkAgentInstructions(): CheckResult {
   const statuses = getInstructionStatuses();
   const installed = statuses.filter(s => s.hasEngramSection).map(s => s.file.clientId);
@@ -477,6 +504,7 @@ export async function runDoctor(options: DoctorOptions = {}): Promise<void> {
     results.push(await checkMcpClientRegistration(client));
   }
   results.push(checkAgentInstructions());
+  results.push(checkMemoryHealth(config.dataDir));
 
   results.forEach(printRow);
 
