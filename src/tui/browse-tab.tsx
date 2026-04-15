@@ -28,8 +28,11 @@ export function BrowseTab({ core }: BrowseTabProps): React.ReactElement {
   React.useEffect(() => { setCursor(0); setSelected(null); }, [typeFilter]);
 
   useInput((input, key) => {
+    // Global keys (esc / q / ctrl-c) are handled by App's useInput and quit
+    // the whole TUI — don't shadow them here. Use enter or backspace to close
+    // the node detail view.
     if (selected) {
-      if (key.escape || input === 'q' || key.return) setSelected(null);
+      if (key.return || key.backspace || key.delete) setSelected(null);
       return;
     }
     if (key.upArrow) setCursor(c => Math.max(0, c - 1));
@@ -148,7 +151,7 @@ function NodeDetail({ node, core }: { node: Node; core: EngramCore }): React.Rea
       ) : null}
 
       <Box marginTop={1}>
-        <Text color="gray">enter / esc / q to go back</Text>
+        <Text color="gray">enter or backspace to go back  ·  esc/q to quit</Text>
       </Box>
     </Box>
   );

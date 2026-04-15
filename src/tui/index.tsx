@@ -34,7 +34,7 @@ export function App({ core, initialTab = 'stats' }: AppProps): React.ReactElemen
   }, []);
 
   useInput((input, key) => {
-    if (input === 'q' || (key.ctrl && input === 'c')) { exit(); return; }
+    if (input === 'q' || key.escape || (key.ctrl && input === 'c')) { exit(); return; }
     if (input === '?') { setShowHelp(s => !s); return; }
     // Number keys for direct tab jump
     const tab = TABS.find(t => t.key === input);
@@ -92,15 +92,15 @@ function TabBar({ active }: { active: TabId }): React.ReactElement {
 function Footer({ showHelp, active }: { showHelp: boolean; active: TabId }): React.ReactElement {
   const tabHints: Record<TabId, string> = {
     stats:  'r cycle period · t toggle by-tool',
-    usage:  'r cycle period · b cycle breakdown',
-    browse: '↑/↓ scroll · t cycle type · enter view',
+    usage:  'r cycle period · b cycle breakdown · a all-namespaces',
+    browse: '↑/↓ scroll · t cycle type · enter view · backspace back',
     status: '(no tab-specific keys)',
   };
   return (
     <Box flexDirection="column" marginTop={1}>
       <Text color="gray">─────────────────────────────────────────────────────────────</Text>
       <Text color="gray">
-        <Text color="cyan">{'←/→'}</Text> tab  <Text color="cyan">{'1-4'}</Text> jump  <Text color="cyan">{'?'}</Text> help  <Text color="cyan">{'q'}</Text> quit  <Text color="white">│</Text>  {tabHints[active]}
+        <Text color="cyan">{'←/→'}</Text> tab  <Text color="cyan">{'1-4'}</Text> jump  <Text color="cyan">{'?'}</Text> help  <Text color="cyan">{'q/esc'}</Text> quit  <Text color="white">│</Text>  {tabHints[active]}
       </Text>
       {showHelp ? (
         <Box flexDirection="column" marginTop={1} borderStyle="single" borderColor="gray" paddingX={1}>
