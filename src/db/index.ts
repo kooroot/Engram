@@ -67,6 +67,7 @@ export function initMainDb(config: Config): DatabaseConnection {
     '005_add_namespaces.sql',
     '007_add_fts5.sql',
     '008_namespace_scope_fixes.sql',
+    '009_add_usage_log.sql',
   ]);
 
   return {

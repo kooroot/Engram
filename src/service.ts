@@ -10,6 +10,7 @@ import { initMainDb, initVecDb, type DatabaseConnection } from './db/index.js';
 import { EventLog } from './db/event-log.js';
 import { StateTree } from './db/state-tree.js';
 import { VectorStore } from './db/vector-store.js';
+import { UsageLog } from './db/usage-log.js';
 import { EngineCache } from './engine/cache.js';
 import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/maintenance.js';
 import { traverseGraph } from './engine/graph-traversal.js';
@@ -58,6 +59,7 @@ export interface EngramCore {
   vectorStore: VectorStore;
   cache: EngineCache;
   embeddingProvider: EmbeddingProvider | null;
+  usageLog: UsageLog;
   /** Synchronous close — does NOT wait for pending async callbacks */
   close(): void;
   /** Wait for all pending async callbacks (auto-embeds) then close */
@@ -142,6 +144,7 @@ export function createEngramCore(
   const dim = embeddingProvider?.dimension ?? config.embedding.dimension;
   const vectorStore = new VectorStore(vecDb.db, dim, ns);
   const cache = new EngineCache(config.cache);
+  const usageLog = new UsageLog(mainDb.db);
 
   // Enable sqlite-vec (single source of truth; removed duplication from server.ts)
   try {
@@ -199,6 +202,7 @@ export function createEngramCore(
     vectorStore,
     cache,
     embeddingProvider,
+    usageLog,
     close() {
       mainDb.close();
       vecDb.close();

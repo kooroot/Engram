@@ -5,6 +5,7 @@ import * as fmt from './formatters.js';
 import type { EventType } from '../types/index.js';
 import { runOnboard } from './onboard.js';
 import { runDoctor } from './doctor.js';
+import { runUsage, type Period, type Breakdown } from './usage.js';
 
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
@@ -52,6 +53,20 @@ export function registerCLICommands(program: Command): void {
     .action(async (opts: { fix?: boolean; quiet?: boolean }) => {
       await runDoctor({ fix: opts.fix, quiet: opts.quiet });
     });
+
+  // ─── usage ───────────────────────────────────────
+
+  program
+    .command('usage')
+    .description('Show token usage and tool-call activity over a time window')
+    .option('-p, --period <period>', 'Time window: day | week | month', 'week')
+    .option('-b, --by <breakdown>', 'Breakdown: tool | day | namespace', 'tool')
+    .option('-a, --all', 'Include all namespaces (otherwise current namespace only)', false)
+    .action((opts: { period: string; by: string; all?: boolean }) => withCore((core) => {
+      const period = (['day', 'week', 'month'].includes(opts.period) ? opts.period : 'week') as Period;
+      const breakdown = (['tool', 'day', 'namespace'].includes(opts.by) ? opts.by : 'tool') as Breakdown;
+      runUsage(core, { period, breakdown, allNamespaces: !!opts.all });
+    }, ns())());
 
   // ─── status ──────────────────────────────────────
 

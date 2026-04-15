@@ -33,6 +33,9 @@ Token-conscious order:
 For writes: \`mutate_state\` proactively, but ONLY for facts worth keeping
 across conversations. Use \`link_entities\` for relationships
 (e.g. "Alice works on Project X").
+
+The user can audit your token usage with \`engram usage\` (day / week / month).
+Be conservative — every read tool call is recorded.
 ${ENGRAM_END_MARKER}`;
 
 export type ClientId = 'claude' | 'codex' | 'gemini';

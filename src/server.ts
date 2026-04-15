@@ -68,6 +68,7 @@ export function createEngramServer(
     core.vectorStore,
     core.cache,
     core.embeddingProvider,
+    { usageLog: core.usageLog, namespace: core.config.namespace },
   );
 
   return {
