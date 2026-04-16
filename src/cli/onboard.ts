@@ -592,10 +592,14 @@ export async function runOnboard(): Promise<void> {
   }
 
   // Offer to write usage instructions into each client's global instruction file
-  // (CLAUDE.md / AGENTS.md / GEMINI.md). This is what makes auto-recall actually
-  // happen — without it, the AI sees the tools but rarely calls them proactively.
   const installedInstructionFiles = await offerInstructionInstall(installClients);
   void installedInstructionFiles;
+
+  // Offer to install Claude Code hooks for auto-capture.
+  // These are the HARD mechanism — instructions alone aren't reliable.
+  if (installClients.includes('claude') || await hasCommand('claude')) {
+    await offerHookInstall(dataDir);
+  }
 
   const verifySteps: string[] = [];
   if (installClients.includes('claude')) {
@@ -741,4 +745,119 @@ function formatMcpAddCommand(client: McpClient, entry: string, answers: OnboardA
 function quoteIfNeeded(s: string): string {
   if (/^[A-Za-z0-9_./:=@-]+$/.test(s)) return s;
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+// ─── Hook installation (Claude Code only) ────────────────────────
+
+// Hook scripts use execFileSync (not exec) to avoid shell injection.
+const SESSION_START_HOOK = `#!/usr/bin/env node
+// Engram SessionStart hook — injects project context from memory so the AI
+// knows "where we left off" without calling query_engram itself.
+import { execFileSync } from 'node:child_process';
+import { basename } from 'node:path';
+
+const project = basename(process.cwd());
+try {
+  const ctx = execFileSync(
+    'engram', ['context', project, '--strategy', 'graph', '--max-tokens', '1000'],
+    { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] },
+  ).trim();
+  if (ctx && !ctx.includes('No relevant context')) {
+    const out = {
+      hookSpecificOutput: {
+        hookEventName: 'SessionStart',
+        additionalContext:
+          '[Engram Memory] Project "' + project + '" from previous sessions:\\n\\n' +
+          ctx +
+          '\\n\\nUse this to help the user. Save new substance via engram mutate_state.',
+      },
+    };
+    process.stdout.write(JSON.stringify(out));
+  }
+} catch { /* silent — don't block session start */ }
+`;
+
+const PROMPT_NUDGE_HOOK = `#!/usr/bin/env node
+// Engram UserPromptSubmit hook — injects a brief save-reminder into every
+// turn so the AI doesn't forget to use engram for substantive work.
+const out = {
+  hookSpecificOutput: {
+    hookEventName: 'UserPromptSubmit',
+    additionalContext:
+      '[Engram] If the user just discussed a project, decision, preference, ' +
+      'insight, or progress — save it via engram mutate_state. ' +
+      'If trivial (greeting, simple Q&A), skip. Be proactive.',
+  },
+};
+process.stdout.write(JSON.stringify(out));
+`;
+
+async function offerHookInstall(dataDir: string): Promise<void> {
+  const wantHooks = await p.confirm({
+    message: 'Install auto-capture hooks for Claude Code?  (injects memory context + save reminders per turn)',
+    initialValue: true,
+  });
+  ensureNotCancelled(wantHooks);
+  if (!wantHooks) return;
+
+  const hooksDir = path.join(dataDir, 'hooks');
+  fs.mkdirSync(hooksDir, { recursive: true });
+
+  // Write hook scripts
+  const sessionStartPath = path.join(hooksDir, 'session-start.mjs');
+  fs.writeFileSync(sessionStartPath, SESSION_START_HOOK, { mode: 0o755 });
+
+  const promptNudgePath = path.join(hooksDir, 'prompt-nudge.mjs');
+  fs.writeFileSync(promptNudgePath, PROMPT_NUDGE_HOOK, { mode: 0o755 });
+
+  p.log.success(`Hook scripts written to ${hooksDir}`);
+
+  // Merge into ~/.claude/settings.json
+  const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
+  let settings: Record<string, unknown> = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch {
+      p.log.warn(`Could not parse ${settingsPath} — skipping hook install. Fix JSON and re-run.`);
+      return;
+    }
+  }
+
+  const hooks = (settings['hooks'] ?? {}) as Record<string, unknown[]>;
+
+  // Remove any existing engram hook entry from an event array, then add ours.
+  function mergeHookEntry(event: string, newEntry: Record<string, unknown>): void {
+    if (!Array.isArray(hooks[event])) hooks[event] = [];
+    hooks[event] = (hooks[event] as Array<Record<string, unknown>>).filter(h => {
+      const cmds = (h['hooks'] as Array<Record<string, unknown>>) ?? [];
+      return !cmds.some(c => typeof c['command'] === 'string' && (c['command'] as string).includes('.engram/hooks/'));
+    });
+    (hooks[event] as unknown[]).push(newEntry);
+  }
+
+  mergeHookEntry('SessionStart', {
+    hooks: [{
+      type: 'command',
+      command: `node ${sessionStartPath}`,
+      timeout: 10,
+      statusMessage: 'Loading engram memory…',
+    }],
+  });
+
+  mergeHookEntry('UserPromptSubmit', {
+    hooks: [{
+      type: 'command',
+      command: `node ${promptNudgePath}`,
+      timeout: 5,
+      async: true,
+    }],
+  });
+
+  settings['hooks'] = hooks;
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+  p.log.success('Claude Code hooks installed  (SessionStart + UserPromptSubmit)');
+  p.log.info('SessionStart → injects "where we left off" project context');
+  p.log.info('UserPromptSubmit → reminds AI to save substance each turn');
 }
