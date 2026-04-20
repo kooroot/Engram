@@ -9,8 +9,25 @@ export interface AutosaveReport {
   updated: number;
   skipped: number;
   linksCreated: number;
+  /** Items dropped because an earlier item in the same batch had the same name. */
+  duplicatesInBatch: number;
   errors: string[];
 }
+
+/**
+ * Known limitations (Phase 1, deferred to later phases):
+ *
+ * - Cross-process race: `getNodeByName` → `mutate({op:'create'})` is not
+ *   atomic and the `nodes` table has no UNIQUE(name) constraint, so two
+ *   autosaves running concurrently against the same DB could each insert
+ *   a duplicate "Foo" node. In Phase 1 the Stop hook fires once per
+ *   session so collisions are rare; multi-process protection lands when
+ *   adapter daemons arrive (Phase 4+).
+ *
+ * - Re-running on the same transcript bumps `version` even when nothing
+ *   changed (no idempotency key). Stop hooks fire once per session so
+ *   this is unlikely in practice; session-hash dedup is a Phase 6 task.
+ */
 
 export interface RunAutosaveOpts {
   core: EngramCore;
@@ -35,7 +52,8 @@ const KIND_TO_NODE_TYPE: Record<ExtractionItemT['kind'], string> = {
 
 export async function runAutosave(opts: RunAutosaveOpts): Promise<AutosaveReport> {
   const report: AutosaveReport = {
-    created: 0, updated: 0, skipped: 0, linksCreated: 0, errors: [],
+    created: 0, updated: 0, skipped: 0, linksCreated: 0,
+    duplicatesInBatch: 0, errors: [],
   };
 
   const stat = statSync(opts.transcriptPath);
@@ -57,13 +75,32 @@ export async function runAutosave(opts: RunAutosaveOpts): Promise<AutosaveReport
 
   if (extraction.items.length === 0) return report;
 
-  for (const item of extraction.items) {
+  // Dedup within the same extraction batch: keep the highest-confidence item
+  // per name. The LLM occasionally emits the same fact twice (e.g. as both a
+  // 'decision' and 'preference'); without this, the second pass would silently
+  // update the node the first pass just created and the report would lie.
+  const seenNames = new Set<string>();
+  const deduped: ExtractionItemT[] = [];
+  for (const sorted of [...extraction.items].sort(
+    (a, b) => b.confidence - a.confidence,
+  )) {
+    if (seenNames.has(sorted.name)) {
+      report.duplicatesInBatch += 1;
+      continue;
+    }
+    seenNames.add(sorted.name);
+    deduped.push(sorted);
+  }
+
+  for (const item of deduped) {
     try {
       const nodeType = KIND_TO_NODE_TYPE[item.kind];
       const existing = opts.core.stateTree.getNodeByName(item.name);
 
       let nodeId: string;
       if (existing) {
+        // `set` shallow-merges into existing properties (newer extraction
+        // wins on key collision). See state-tree.ts:257 for the merge impl.
         opts.core.stateTree.mutate([{
           op: 'update',
           node_id: existing.id,

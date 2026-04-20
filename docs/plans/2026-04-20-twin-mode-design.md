@@ -298,6 +298,8 @@ Each phase ships independently. Phase 1+2 alone delivers a working Claude Code "
 4. **Cost runaway.** Worst case: a chatty user with 50 sessions/day on Haiku ≈ $18/month. Add a daily cap in config (`max_autosave_calls_per_day`).
 5. **Privacy.** Transcript → 3rd-party LLM. User must opt-in explicitly during `engram onboard`. Default = disabled until opted in.
 6. **Dedup quality.** Naive name-match dedup will miss semantic duplicates ("Bun preference" vs "Use bun"). Phase 6 candidate: embedding-based dedup.
+7. **Cross-process race on autosave dedup.** `getNodeByName → mutate(create)` is not atomic and the `nodes` table has no `UNIQUE(name)` constraint. Two autosave processes running simultaneously can each insert a duplicate node. Phase 1 mitigation: Stop hooks fire once per session, so collisions are rare. Phase 4+ multi-process protection: add a unique partial index on `(namespace, name)` for non-archived nodes, or wrap autosave in an advisory lock.
+8. **Re-running autosave on the same transcript.** No idempotency key; each run bumps node `version` even if extracted items haven't changed. Phase 1 mitigation: Stop hook is one-shot per session. Phase 6 fix: persist a transcript content-hash → autosave-result map, skip on hit.
 
 ---
 

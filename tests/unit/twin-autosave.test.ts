@@ -363,4 +363,24 @@ describe('runAutosave', () => {
       },
     })).rejects.toThrow(/bad json/);
   });
+
+  it('dedups same-name items within one batch, keeping highest confidence', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({
+        items: [
+          { kind: 'preference', name: 'Use bun',
+            summary: 'lower conf', properties: {}, confidence: 0.5, links: [] },
+          { kind: 'decision', name: 'Use bun',
+            summary: 'higher conf', properties: {}, confidence: 0.95, links: [] },
+        ],
+      }),
+    });
+    expect(report.created).toBe(1);
+    expect(report.updated).toBe(0);
+    expect(report.duplicatesInBatch).toBe(1);
+    const node = engram.stateTree.getNodeByName('Use bun');
+    expect(node?.summary).toBe('higher conf');
+  });
 });
