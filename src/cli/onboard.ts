@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import * as p from '@clack/prompts';
 import { renderBanner } from './banner.js';
@@ -750,17 +750,21 @@ function quoteIfNeeded(s: string): string {
 // ─── Hook installation (Claude Code only) ────────────────────────
 
 // Hook scripts use execFileSync (not exec) to avoid shell injection.
+// `__ENGRAM_BIN__` is replaced at install time with an absolute path so the
+// hook works under Claude Code's environment, which may not inherit the
+// user's PATH (e.g. when launched from a GUI).
 const SESSION_START_HOOK = `#!/usr/bin/env node
 // Engram SessionStart hook — injects "where we left off" project context.
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 
+const ENGRAM_BIN = '__ENGRAM_BIN__';
 const project = basename(process.cwd());
 try {
   // engram CLI emits the hook JSON itself when --hook-format is set.
   // It exits 0 silently when no context is found, so the hook injects nothing.
   const out = execFileSync(
-    'engram',
+    ENGRAM_BIN,
     ['context', project, '--hook-format', 'SessionStart',
       '--strategy', 'graph', '--max-tokens', '1000'],
     { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] },
@@ -773,6 +777,8 @@ const PROMPT_INJECT_HOOK = `#!/usr/bin/env node
 // Engram UserPromptSubmit hook — fetches relevant memories for the user's
 // prompt and injects them as additionalContext for THIS turn only.
 import { execFileSync } from 'node:child_process';
+
+const ENGRAM_BIN = '__ENGRAM_BIN__';
 
 let payload = '';
 for await (const chunk of process.stdin) payload += chunk;
@@ -787,7 +793,7 @@ if (!prompt.trim()) process.exit(0);
 
 try {
   const out = execFileSync(
-    'engram',
+    ENGRAM_BIN,
     ['context', prompt, '--hook-format', 'UserPromptSubmit',
       '--strategy', 'hybrid', '--max-tokens', '1500'],
     { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] },
@@ -799,7 +805,14 @@ try {
 const STOP_AUTOSAVE_HOOK = `#!/usr/bin/env node
 // Engram Stop hook — runs after the session ends. Reads the transcript and
 // extracts substance to save persistently via the host AI's light model.
+//
+// Concurrency note: this fires once per session end. If the user closes
+// multiple sessions quickly, several engram autosave processes may run
+// against the same SQLite DB. The cross-process create race is documented
+// in autosave.ts as a known limitation deferred to Phase 4+.
 import { spawn } from 'node:child_process';
+
+const ENGRAM_BIN = '__ENGRAM_BIN__';
 
 let payload = '';
 for await (const chunk of process.stdin) payload += chunk;
@@ -816,14 +829,50 @@ if (!transcriptPath) process.exit(0);
 // Spawn detached so the Stop hook returns immediately and the user isn't
 // blocked waiting on the LLM extraction call. Stderr inherits so any
 // auth/parse failure is visible in the user's terminal.
-const child = spawn('engram',
-  ['autosave', transcriptPath, '--min-bytes', '500'],
+// --max-bytes 200000 (~50k tokens) caps long-session cost at ~$0.05/run.
+const child = spawn(ENGRAM_BIN,
+  ['autosave', transcriptPath, '--min-bytes', '500', '--max-bytes', '200000'],
   { detached: true, stdio: ['ignore', 'ignore', 'inherit'] },
 );
+// Without this, a missing/renamed engram binary throws an unhandled
+// 'error' event that crashes the Stop hook process.
+child.on('error', () => { /* engram missing or unspawnable — skip silently */ });
 child.unref();
 process.exit(0);
 `;
 
+/**
+ * Resolve the engram CLI to an absolute path. Falls back to bare 'engram' if
+ * `which` fails (best effort — onboard surfaces a warning when this happens).
+ */
+function resolveEngramBin(): { bin: string; resolved: boolean } {
+  try {
+    // execFileSync with the actual `which` binary (not exec/shell) — input is
+    // a constant literal, no injection surface.
+    const out = execFileSync('which', ['engram'], { encoding: 'utf8' }).trim();
+    if (out && fs.existsSync(out)) return { bin: out, resolved: true };
+  } catch { /* not on PATH at install time */ }
+  return { bin: 'engram', resolved: false };
+}
+
+function renderTemplate(tpl: string, engramBin: string): string {
+  return tpl.replace(/__ENGRAM_BIN__/g, engramBin);
+}
+
+/** Exposed for integration tests. Render with a chosen binary path. */
+export function getHookTemplates(engramBin: string = 'engram') {
+  return {
+    sessionStart: renderTemplate(SESSION_START_HOOK, engramBin),
+    promptInject: renderTemplate(PROMPT_INJECT_HOOK, engramBin),
+    stopAutosave: renderTemplate(STOP_AUTOSAVE_HOOK, engramBin),
+  } as const;
+}
+
+/**
+ * @deprecated Contains unsubstituted `__ENGRAM_BIN__` placeholders. Tests
+ * still import this for backward compat — they substitute the placeholder
+ * themselves. New callers should use `getHookTemplates(bin)`.
+ */
 export const HOOK_TEMPLATES = {
   sessionStart: SESSION_START_HOOK,
   promptInject: PROMPT_INJECT_HOOK,
@@ -838,6 +887,19 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   ensureNotCancelled(wantHooks);
   if (!wantHooks) return;
 
+  // Resolve engram binary to an absolute path so the hooks survive PATH
+  // differences between the user's shell and Claude Code's hook environment.
+  const { bin: engramBin, resolved } = resolveEngramBin();
+  if (!resolved) {
+    p.log.warn(
+      `Could not resolve absolute path for 'engram' via PATH lookup. ` +
+      `Hooks will use bare 'engram' — they'll only work if Claude Code's ` +
+      `hook environment includes a directory containing the engram binary.`,
+    );
+  }
+
+  const tpl = getHookTemplates(engramBin);
+
   const hooksDir = path.join(dataDir, 'hooks');
   fs.mkdirSync(hooksDir, { recursive: true });
 
@@ -847,13 +909,13 @@ async function offerHookInstall(dataDir: string): Promise<void> {
 
   // Write hook scripts
   const sessionStartPath = path.join(hooksDir, 'session-start.mjs');
-  fs.writeFileSync(sessionStartPath, SESSION_START_HOOK, { mode: 0o755 });
+  fs.writeFileSync(sessionStartPath, tpl.sessionStart, { mode: 0o755 });
 
   const promptInjectPath = path.join(hooksDir, 'prompt-inject.mjs');
-  fs.writeFileSync(promptInjectPath, PROMPT_INJECT_HOOK, { mode: 0o755 });
+  fs.writeFileSync(promptInjectPath, tpl.promptInject, { mode: 0o755 });
 
   const stopAutosavePath = path.join(hooksDir, 'stop-autosave.mjs');
-  fs.writeFileSync(stopAutosavePath, STOP_AUTOSAVE_HOOK, { mode: 0o755 });
+  fs.writeFileSync(stopAutosavePath, tpl.stopAutosave, { mode: 0o755 });
 
   p.log.success(`Hook scripts written to ${hooksDir}`);
 
@@ -913,5 +975,16 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   p.log.success('Claude Code hooks installed  (SessionStart + UserPromptSubmit + Stop)');
   p.log.info('SessionStart   → injects "where we left off" project context');
   p.log.info('UserPromptSubmit → fetches relevant memories for each prompt');
-  p.log.info('Stop           → autosaves substance from completed sessions (needs ANTHROPIC_API_KEY)');
+  p.log.info('Stop           → autosaves substance from completed sessions');
+
+  // Auth preflight: the Stop hook calls Anthropic SDK which needs the API key.
+  // Claude Code itself uses subscription auth, so users often don't have this
+  // set. Warn loudly so the first failed autosave isn't a mystery.
+  if (!process.env['ANTHROPIC_API_KEY']) {
+    p.log.warn(
+      `ANTHROPIC_API_KEY is not set in your environment. ` +
+      `The Stop autosave hook will fail silently until you add it ` +
+      `(e.g. export ANTHROPIC_API_KEY=... in your shell rc).`,
+    );
+  }
 }

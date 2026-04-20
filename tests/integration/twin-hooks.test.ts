@@ -4,15 +4,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { HOOK_TEMPLATES } from '../../src/cli/onboard.js';
+import { getHookTemplates } from '../../src/cli/onboard.js';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'twin-hooks-'));
-const STUB_BIN = path.join(TMP, 'bin');
+const STUB_BIN_DIR = path.join(TMP, 'bin');
 const HOOK_DIR = path.join(TMP, 'hooks');
-fs.mkdirSync(STUB_BIN);
+fs.mkdirSync(STUB_BIN_DIR);
 fs.mkdirSync(HOOK_DIR);
 
-// Stub `engram` binary that records its argv to a file then echoes a fixed response.
+// Stub `engram` binary that records its argv to a file then echoes a fixed
+// response read from ENGRAM_STUB_OUT (if set).
 const STUB = `#!/usr/bin/env node
 import { writeFileSync, readFileSync } from 'node:fs';
 const log = process.env['ENGRAM_STUB_LOG'];
@@ -24,8 +25,13 @@ if (outPath) {
 }
 process.exit(exit);
 `;
-const stubPath = path.join(STUB_BIN, 'engram');
-fs.writeFileSync(stubPath, STUB, { mode: 0o755 });
+const STUB_PATH = path.join(STUB_BIN_DIR, 'engram-stub');
+fs.writeFileSync(STUB_PATH, STUB, { mode: 0o755 });
+
+// Render templates with the absolute stub path baked in. This mirrors what
+// `engram onboard` does in production: it resolves `which engram` at install
+// time so the hook works under environments without the user's PATH.
+const tpl = getHookTemplates(STUB_PATH);
 
 function writeHook(name: string, body: string): string {
   const p = path.join(HOOK_DIR, name);
@@ -41,10 +47,32 @@ function runHook(
   const result = spawnSync('node', [scriptPath], {
     input: stdin,
     encoding: 'utf8',
-    env: { ...process.env, PATH: `${STUB_BIN}:${process.env['PATH']}`, ...env },
+    env: { ...process.env, ...env },
   });
-  return { stdout: result.stdout ?? '', stderr: result.stderr ?? '', status: result.status ?? -1 };
+  return {
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+    status: result.status ?? -1,
+  };
 }
+
+describe('getHookTemplates substitution', () => {
+  it('substitutes the engram binary path in all three templates', () => {
+    const t = getHookTemplates('/usr/local/bin/engram');
+    expect(t.sessionStart).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
+    expect(t.promptInject).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
+    expect(t.stopAutosave).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
+    // No leftover placeholders.
+    expect(t.sessionStart).not.toContain('__ENGRAM_BIN__');
+    expect(t.promptInject).not.toContain('__ENGRAM_BIN__');
+    expect(t.stopAutosave).not.toContain('__ENGRAM_BIN__');
+  });
+
+  it('defaults to bare "engram" when no path is given', () => {
+    const t = getHookTemplates();
+    expect(t.sessionStart).toContain("ENGRAM_BIN = 'engram'");
+  });
+});
 
 describe('twin Claude Code hook templates', () => {
   let logFile: string;
@@ -58,7 +86,7 @@ describe('twin Claude Code hook templates', () => {
   });
 
   describe('prompt-inject.mjs', () => {
-    const scriptPath = writeHook('prompt-inject.mjs', HOOK_TEMPLATES.promptInject);
+    const scriptPath = writeHook('prompt-inject.mjs', tpl.promptInject);
 
     it('forwards prompt text to engram context with --hook-format', () => {
       const fakeOut = path.join(TMP, 'fake-context-out.json');
@@ -112,9 +140,9 @@ describe('twin Claude Code hook templates', () => {
   });
 
   describe('stop-autosave.mjs', () => {
-    const scriptPath = writeHook('stop-autosave.mjs', HOOK_TEMPLATES.stopAutosave);
+    const scriptPath = writeHook('stop-autosave.mjs', tpl.stopAutosave);
 
-    it('spawns engram autosave with the transcript_path', async () => {
+    it('spawns engram autosave with transcript_path and --max-bytes guard', async () => {
       const { status } = runHook(
         scriptPath,
         JSON.stringify({ transcript_path: '/tmp/fake-transcript.jsonl' }),
@@ -127,6 +155,10 @@ describe('twin Claude Code hook templates', () => {
       const argv = JSON.parse(fs.readFileSync(logFile, 'utf8').trim());
       expect(argv).toContain('autosave');
       expect(argv).toContain('/tmp/fake-transcript.jsonl');
+      expect(argv).toContain('--min-bytes');
+      expect(argv).toContain('500');
+      expect(argv).toContain('--max-bytes');
+      expect(argv).toContain('200000');
     });
 
     it('exits 0 silently when transcript_path is missing', () => {
@@ -138,10 +170,23 @@ describe('twin Claude Code hook templates', () => {
       expect(status).toBe(0);
       // engram should not be called
     });
+
+    it('does not crash when engram binary is missing', async () => {
+      // Render template pointing at a non-existent path
+      const brokenTpl = getHookTemplates('/nonexistent/path/to/engram');
+      const brokenScript = writeHook('stop-broken.mjs', brokenTpl.stopAutosave);
+      const { status } = runHook(
+        brokenScript,
+        JSON.stringify({ transcript_path: '/tmp/x.jsonl' }),
+      );
+      // child.on('error') swallows the missing-binary error so the parent
+      // hook still exits 0 and Claude Code doesn't see a crash.
+      expect(status).toBe(0);
+    });
   });
 
   describe('session-start.mjs', () => {
-    const scriptPath = writeHook('session-start.mjs', HOOK_TEMPLATES.sessionStart);
+    const scriptPath = writeHook('session-start.mjs', tpl.sessionStart);
 
     it('calls engram context with project basename and --hook-format SessionStart', () => {
       const fakeOut = path.join(TMP, 'fake-session-out.json');

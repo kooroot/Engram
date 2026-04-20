@@ -316,8 +316,9 @@ export function registerCLICommands(program: Command): void {
     .option('-p, --provider <name>', 'LLM provider', 'anthropic')
     .option('-m, --model <name>', 'Override default model')
     .option('--min-bytes <n>', 'Skip if transcript smaller than this', '200')
+    .option('--max-bytes <n>', 'Skip if transcript larger than this (cost guard)', '200000')
     .action((transcript: string, opts: {
-      provider: string; model?: string; minBytes: string;
+      provider: string; model?: string; minBytes: string; maxBytes: string;
     }) => withCore(async (core) => {
       if (opts.provider !== 'anthropic') {
         process.stderr.write(
@@ -335,12 +336,14 @@ export function registerCLICommands(program: Command): void {
           provider: 'anthropic',
           ...(opts.model !== undefined ? { model: opts.model } : {}),
           minTranscriptBytes: safeInt(opts.minBytes, 200),
+          maxTranscriptBytes: safeInt(opts.maxBytes, 200_000),
         });
 
         // Summary to stderr — keeps stdout clean for hook composition
+        const skipNote = report.skipReason ? ` (${report.skipReason})` : '';
         const summary =
           `[engram] autosave: ${report.created} created, ${report.updated} updated, ` +
-          `${report.skipped} skipped, ${report.linksCreated} links` +
+          `${report.skipped} skipped${skipNote}, ${report.linksCreated} links` +
           (report.duplicatesInBatch ? `, ${report.duplicatesInBatch} dup-in-batch` : '') +
           (report.errors.length ? `, ${report.errors.length} errors` : '');
         process.stderr.write(summary + '\n');

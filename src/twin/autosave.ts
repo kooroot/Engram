@@ -8,6 +8,8 @@ export interface AutosaveReport {
   created: number;
   updated: number;
   skipped: number;
+  /** Reason for skipping (only set when skipped > 0). */
+  skipReason?: 'too_small' | 'too_large';
   linksCreated: number;
   /** Items dropped because an earlier item in the same batch had the same name. */
   duplicatesInBatch: number;
@@ -39,6 +41,13 @@ export interface RunAutosaveOpts {
   extractFn?: (transcript: string) => Promise<Extraction>;
   /** Skip if transcript file is smaller than this (default 200 bytes). */
   minTranscriptBytes?: number;
+  /**
+   * Skip if transcript file is larger than this (default 200_000 bytes ≈
+   * 50k tokens). Codex review flagged uncapped transcripts as a real cost
+   * concern — long sessions could send 100k+ tokens to Anthropic per Stop
+   * hook firing. Adapter scripts override via `--max-bytes` env or flag.
+   */
+  maxTranscriptBytes?: number;
 }
 
 const KIND_TO_NODE_TYPE: Record<ExtractionItemT['kind'], string> = {
@@ -58,8 +67,15 @@ export async function runAutosave(opts: RunAutosaveOpts): Promise<AutosaveReport
 
   const stat = statSync(opts.transcriptPath);
   const minBytes = opts.minTranscriptBytes ?? 200;
+  const maxBytes = opts.maxTranscriptBytes ?? 200_000;
   if (stat.size < minBytes) {
     report.skipped = 1;
+    report.skipReason = 'too_small';
+    return report;
+  }
+  if (stat.size > maxBytes) {
+    report.skipped = 1;
+    report.skipReason = 'too_large';
     return report;
   }
 

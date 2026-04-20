@@ -301,6 +301,20 @@ describe('runAutosave', () => {
       minTranscriptBytes: 100,
     });
     expect(report.skipped).toBe(1);
+    expect(report.skipReason).toBe('too_small');
+    expect(report.created).toBe(0);
+  });
+
+  it('skips when transcript is too large (cost guard)', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(5000));
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => { throw new Error('should not be called'); },
+      minTranscriptBytes: 100,
+      maxTranscriptBytes: 1000,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.skipReason).toBe('too_large');
     expect(report.created).toBe(0);
   });
 
