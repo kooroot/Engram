@@ -34,6 +34,16 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
       ollamaModel: overrides.embedding?.ollamaModel ?? env['OLLAMA_MODEL'],
     },
     maintenance: overrides.maintenance,
+    dedup: {
+      semanticAutoMerge: overrides.dedup?.semanticAutoMerge
+        ?? (env['ENGRAM_DEDUP_SEMANTIC']
+          ? env['ENGRAM_DEDUP_SEMANTIC'] === '1' || env['ENGRAM_DEDUP_SEMANTIC'] === 'true'
+          : undefined),
+      semanticThreshold: overrides.dedup?.semanticThreshold
+        ?? (env['ENGRAM_DEDUP_SEMANTIC_THRESHOLD']
+          ? Number(env['ENGRAM_DEDUP_SEMANTIC_THRESHOLD'])
+          : undefined),
+    },
   };
 
   const parsed = ConfigSchema.parse(raw);

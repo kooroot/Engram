@@ -13,7 +13,7 @@ import { VectorStore } from './db/vector-store.js';
 import { UsageLog } from './db/usage-log.js';
 import { EngineCache } from './engine/cache.js';
 import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/maintenance.js';
-import { runDedupPass, type DedupPassReport } from './engine/dedup-scan.js';
+import { runDedupPass, cosineSimilarity, type DedupPassReport, type Tier2Options } from './engine/dedup-scan.js';
 import { traverseGraph } from './engine/graph-traversal.js';
 import { buildContext } from './engine/context-builder.js';
 import type { Node, Edge, Event, EventType } from './types/index.js';
@@ -32,6 +32,35 @@ export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from '.
 /** Resolve a node by ID or name */
 function resolveNode(core: EngramCore, idOrName: string): Node | null {
   return core.stateTree.getNode(idOrName) ?? core.stateTree.getNodeByName(idOrName);
+}
+
+/** Build a Tier 2 embedding lookup scoped to a namespace. Reads from vecDb
+ *  (embeddings metadata + vec_embeddings vector blob live in the same file). */
+function makeEmbeddingLookup(
+  vecDb: Database.Database,
+  namespace: string,
+): (nodeId: string) => Float32Array | null {
+  let stmt: Database.Statement | null = null;
+  try {
+    stmt = vecDb.prepare(
+      "SELECT v.embedding FROM vec_embeddings v " +
+      "INNER JOIN embeddings e ON e.id = v.id " +
+      "WHERE e.source_type = 'node' AND e.source_id = ? AND e.namespace = ?"
+    );
+  } catch {
+    // vec_embeddings table doesn't exist (sqlite-vec not loaded) — callers
+    // get a no-op lookup and Tier 2 becomes a no-op.
+    return () => null;
+  }
+  return (nodeId) => {
+    try {
+      const row = stmt!.get(nodeId, namespace) as { embedding: Buffer } | undefined;
+      if (!row) return null;
+      return new Float32Array(row.embedding.buffer, row.embedding.byteOffset, row.embedding.byteLength / 4);
+    } catch {
+      return null;
+    }
+  };
 }
 
 /**
@@ -181,6 +210,64 @@ export function createEngramCore(
             embedding: embeddings[i],
           });
           metrics.embeddings.inc({ namespace: safeNamespaceLabel(ns) });
+        }
+
+        // ── Post-hoc Tier 2 semantic dedup ──
+        // Opt-in: only runs when config.dedup.semanticAutoMerge is true.
+        // For each node we just embedded, ask the vector index for its
+        // nearest same-source-type neighbors. Filter by entity type (so
+        // 'concept' doesn't merge into 'preference'), verify cosine ≥
+        // threshold against the stored vector (the L2 distance returned
+        // by sqlite-vec is monotonic w.r.t. cosine on normalized vectors
+        // but we compute cosine explicitly so normalization isn't assumed),
+        // and if it clears, mergeNodes() to consolidate. This is eventual-
+        // consistency — mutate() has already returned by the time we run.
+        if (config.dedup.semanticAutoMerge) {
+          const getEmb = makeEmbeddingLookup(vecDb.db, ns);
+          const threshold = config.dedup.semanticThreshold;
+          for (const p of pending) {
+            const myNode = stateTree.getNode(p.nodeId);
+            if (!myNode || myNode.archived) continue;
+            const myEmb = getEmb(p.nodeId);
+            if (!myEmb) continue;
+            const candidates = vectorStore.search({
+              embedding: myEmb,
+              sourceType: 'node',
+              limit: 5,
+            });
+            for (const cand of candidates) {
+              if (cand.source_id === p.nodeId) continue;
+              const other = stateTree.getNode(cand.source_id);
+              if (!other || other.archived || other.type !== myNode.type) continue;
+              const otherEmb = getEmb(other.id);
+              if (!otherEmb) continue;
+              const cos = cosineSimilarity(myEmb, otherEmb);
+              if (cos < threshold) continue;
+
+              // Canonical: higher confidence wins; tiebreak on older created_at.
+              const pickOther =
+                other.confidence > myNode.confidence
+                || (other.confidence === myNode.confidence
+                  && (other.created_at ?? '') <= (myNode.created_at ?? ''));
+              const keep = pickOther ? other : myNode;
+              const discard = keep.id === other.id ? myNode : other;
+              try {
+                stateTree.mergeNodes(discard.id, keep.id);
+                log.info('post-hoc Tier 2 semantic merge', {
+                  namespace: ns,
+                  discarded: discard.id,
+                  kept: keep.id,
+                  cosine: cos,
+                });
+              } catch (err) {
+                log.warn('post-hoc Tier 2 merge failed', {
+                  namespace: ns,
+                  error: String(err),
+                });
+              }
+              break; // one merge per just-inserted node per callback pass
+            }
+          }
         }
       } catch (err) {
         metrics.embeddingFailures.inc({ namespace: safeNamespaceLabel(ns) }, pending.length);
@@ -544,9 +631,20 @@ function expand(
 export function runMaintenanceCycle(
   core: EngramCore,
   dryRun: boolean = false,
-  opts: { dedup?: boolean } = {},
+  opts: { dedup?: boolean; semantic?: boolean } = {},
 ): MaintenanceReport & StatusInfo & { dedup?: DedupPassReport } {
   const statsBefore = getStatus(core);
+
+  // Build Tier 2 options if the caller asked for semantic dedup AND an
+  // embedding provider is configured (otherwise getEmbedding would always
+  // return null — expensive no-op).
+  let tier2: Tier2Options | undefined;
+  if (opts.dedup && opts.semantic && core.embeddingProvider && core.vectorStore.isVecEnabled) {
+    tier2 = {
+      getEmbedding: makeEmbeddingLookup(core.vecDb.db, core.config.namespace),
+      threshold: core.config.dedup.semanticThreshold,
+    };
+  }
 
   if (dryRun) {
     const dryReport: MaintenanceReport = { decayed: 0, archived: 0, orphansDetected: 0 };
@@ -556,6 +654,7 @@ export function runMaintenanceCycle(
         core.config.namespace,
         (s, t) => core.stateTree.mergeNodes(s, t),
         true,
+        tier2,
       );
       return { ...dryReport, ...statsBefore, dedup };
     }
@@ -570,6 +669,7 @@ export function runMaintenanceCycle(
       core.config.namespace,
       (s, t) => core.stateTree.mergeNodes(s, t),
       false,
+      tier2,
     );
   }
   const statsAfter = getStatus(core);

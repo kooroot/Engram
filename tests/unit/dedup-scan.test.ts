@@ -5,7 +5,7 @@ import path from 'node:path';
 import { ulid } from 'ulid';
 import { EventLog } from '../../src/db/event-log.js';
 import { StateTree } from '../../src/db/state-tree.js';
-import { findDedupClusters, runDedupPass } from '../../src/engine/dedup-scan.js';
+import { findDedupClusters, runDedupPass, cosineSimilarity } from '../../src/engine/dedup-scan.js';
 
 const TEST_DB_DIR = path.join(import.meta.dirname, '..', '.test-data');
 const TEST_DB_PATH = path.join(TEST_DB_DIR, 'test-dedup-scan.db');
@@ -189,7 +189,7 @@ describe('dedup-scan runDedupPass', () => {
     expect(sourceRow.archived).toBe(1);
   });
 
-  it('re-points edges through the merge', () => {
+  it('re-points edges through the merge (Tier 1)', () => {
     const target = rawInsertNode(db, 'default', { type: 'project', name: 'Engram', confidence: 1.0 });
     const source = rawInsertNode(db, 'default', { type: 'project', name: 'engram', confidence: 0.7 });
     const person = rawInsertNode(db, 'default', { type: 'person', name: 'Alice' });
@@ -205,5 +205,121 @@ describe('dedup-scan runDedupPass', () => {
     ).get(person, 'works_on') as { source_id: string; target_id: string } | undefined;
     expect(edge).toBeDefined();
     expect(edge!.target_id).toBe(target);
+  });
+});
+
+describe('dedup-scan cosineSimilarity', () => {
+  it('returns 1 for identical unit vectors', () => {
+    expect(cosineSimilarity([1, 0, 0], [1, 0, 0])).toBeCloseTo(1, 5);
+  });
+  it('returns 0 for orthogonal vectors', () => {
+    expect(cosineSimilarity([1, 0], [0, 1])).toBeCloseTo(0, 5);
+  });
+  it('returns -1 for antiparallel vectors', () => {
+    expect(cosineSimilarity([1, 0], [-1, 0])).toBeCloseTo(-1, 5);
+  });
+  it('returns 0 when either vector has zero magnitude', () => {
+    expect(cosineSimilarity([0, 0], [1, 1])).toBe(0);
+  });
+  it('returns 0 for length mismatch', () => {
+    expect(cosineSimilarity([1, 0, 0], [1, 0])).toBe(0);
+  });
+  it('handles non-normalized vectors correctly', () => {
+    // [2,0] vs [1,0] — parallel, magnitude differs → still cos=1
+    expect(cosineSimilarity([2, 0], [1, 0])).toBeCloseTo(1, 5);
+  });
+});
+
+describe('dedup-scan findDedupClusters with Tier 2', () => {
+  let db: Database.Database;
+
+  beforeEach(() => { db = setupDb(); });
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  });
+
+  it('clusters semantically similar nodes that Tier 1 misses', () => {
+    // Names that DON'T share tokens but should merge by meaning.
+    // We supply hand-crafted "embeddings" where a and b are near-identical
+    // (cos ≈ 1) but c is orthogonal (cos = 0). Type gate is still enforced.
+    const a = rawInsertNode(db, 'default', { type: 'concept', name: 'Authentication' });
+    const b = rawInsertNode(db, 'default', { type: 'concept', name: 'Login flow' });
+    const c = rawInsertNode(db, 'default', { type: 'concept', name: 'Database schema' });
+
+    const embeddings: Record<string, Float32Array> = {
+      [a]: new Float32Array([1.0, 0.0, 0.0]),
+      [b]: new Float32Array([0.99, 0.14, 0.0]), // cos(a,b) ≈ 0.99
+      [c]: new Float32Array([0.0, 0.0, 1.0]),
+    };
+
+    const clusters = findDedupClusters(db, 'default', {
+      getEmbedding: (id) => embeddings[id] ?? null,
+      threshold: 0.9,
+    });
+
+    expect(clusters).toHaveLength(1);
+    const cluster = clusters[0]!;
+    // a+b clustered, c excluded
+    const allIds = [cluster.target_id, ...cluster.sources.map(s => s.id)];
+    expect(allIds).toContain(a);
+    expect(allIds).toContain(b);
+    expect(allIds).not.toContain(c);
+    // The source was matched via 'semantic'
+    expect(cluster.sources[0]!.matched_by).toBe('semantic');
+    expect(cluster.sources[0]!.score).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it('respects Tier 2 type gate', () => {
+    // Same semantic vectors but different types → no cluster
+    const a = rawInsertNode(db, 'default', { type: 'concept', name: 'Auth' });
+    const b = rawInsertNode(db, 'default', { type: 'project', name: 'Login' });
+    const embeddings: Record<string, Float32Array> = {
+      [a]: new Float32Array([1.0, 0.0]),
+      [b]: new Float32Array([1.0, 0.0]), // cos = 1 but types differ
+    };
+    const clusters = findDedupClusters(db, 'default', {
+      getEmbedding: (id) => embeddings[id] ?? null,
+      threshold: 0.9,
+    });
+    expect(clusters).toEqual([]);
+  });
+
+  it('combines Tier 1 and Tier 2 matches into one cluster (connected components)', () => {
+    // a↔b: Tier 1 (substring)
+    // b↔c: Tier 2 (semantic, unrelated names)
+    // Expected: all three in one cluster
+    const a = rawInsertNode(db, 'default', { type: 'concept', name: 'auth' });
+    const b = rawInsertNode(db, 'default', { type: 'concept', name: 'auth flow' });
+    const c = rawInsertNode(db, 'default', { type: 'concept', name: 'sign-in path' });
+    const embeddings: Record<string, Float32Array> = {
+      [a]: new Float32Array([1.0, 0.0]),
+      [b]: new Float32Array([0.8, 0.6]),
+      [c]: new Float32Array([0.81, 0.59]), // very close to b
+    };
+    const clusters = findDedupClusters(db, 'default', {
+      getEmbedding: (id) => embeddings[id] ?? null,
+      threshold: 0.95,
+    });
+    expect(clusters).toHaveLength(1);
+    const allIds = new Set([clusters[0]!.target_id, ...clusters[0]!.sources.map(s => s.id)]);
+    expect(allIds.size).toBe(3);
+    expect(allIds.has(a)).toBe(true);
+    expect(allIds.has(b)).toBe(true);
+    expect(allIds.has(c)).toBe(true);
+  });
+
+  it('skips Tier 2 pair when either embedding is missing (no false positive)', () => {
+    const a = rawInsertNode(db, 'default', { type: 'concept', name: 'Auth' });
+    const b = rawInsertNode(db, 'default', { type: 'concept', name: 'Login' });
+    const embeddings: Record<string, Float32Array> = {
+      [a]: new Float32Array([1.0, 0.0]),
+      // b has no embedding
+    };
+    const clusters = findDedupClusters(db, 'default', {
+      getEmbedding: (id) => embeddings[id] ?? null,
+      threshold: 0.5,
+    });
+    expect(clusters).toEqual([]);
   });
 });

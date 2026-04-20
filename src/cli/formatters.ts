@@ -192,7 +192,7 @@ export function formatMaintenanceReport(report: {
       type: string;
       target_id: string;
       target_name: string;
-      sources: Array<{ id: string; name: string; matched_by: string; score: number }>;
+      sources: Array<{ id: string; name: string; matched_by: 'exact' | 'substring' | 'jaccard' | 'semantic'; score: number }>;
     }>;
     merged_count: number;
     merged_edges: number;

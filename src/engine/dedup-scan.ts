@@ -25,10 +25,36 @@ import type Database from 'better-sqlite3';
 import type { NodeRow } from '../types/index.js';
 import { isDedupCandidate } from './dedup.js';
 
+/** Cosine similarity between two same-length float vectors. Unit-vector
+ *  safe (just dot product for normalized), general for arbitrary vectors.
+ *  Returns 0 if either vector has zero magnitude. */
+export function cosineSimilarity(a: Float32Array | number[], b: Float32Array | number[]): number {
+  if (a.length !== b.length) return 0;
+  let dot = 0, magA = 0, magB = 0;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i]!;
+    const y = b[i]!;
+    dot += x * y;
+    magA += x * x;
+    magB += y * y;
+  }
+  if (magA === 0 || magB === 0) return 0;
+  return dot / (Math.sqrt(magA) * Math.sqrt(magB));
+}
+
+export interface Tier2Options {
+  /** Resolve a node's embedding vector. Return null if unknown — the pair
+   *  is skipped rather than treated as dissimilar. Plugged in at the
+   *  service layer where both mainDb and vecDb connections live. */
+  getEmbedding: (nodeId: string) => Float32Array | null;
+  /** Cosine similarity threshold for a Tier 2 match. */
+  threshold: number;
+}
+
 export interface DedupClusterSource {
   id: string;
   name: string;
-  matched_by: 'exact' | 'substring' | 'jaccard';
+  matched_by: 'exact' | 'substring' | 'jaccard' | 'semantic';
   score: number;
 }
 
@@ -42,10 +68,17 @@ export interface DedupCluster {
 /**
  * Find clusters of duplicates across all active nodes in the namespace.
  * Returns only clusters of size ≥ 2 (singletons aren't duplicates).
+ *
+ * Pass `tier2` to ALSO union pairs whose embeddings clear the cosine
+ * threshold. Tier 2 runs on top of Tier 1 — matches from either tier
+ * contribute to the same connected component, so a pair that matches
+ * semantically but not lexically still ends up in a cluster with any
+ * lexical neighbors they each have.
  */
 export function findDedupClusters(
   db: Database.Database,
   namespace: string,
+  tier2?: Tier2Options,
 ): DedupCluster[] {
   const rows = db.prepare(
     'SELECT id, type, name, confidence, created_at FROM nodes WHERE namespace = ? AND archived = 0'
@@ -79,8 +112,16 @@ export function findDedupClusters(
     };
 
     // Per-pair dedup scores so we can surface the highest-signal one per source
-    const bestMatch = new Map<string, { other: string; match: { reason: 'exact' | 'substring' | 'jaccard'; score: number } }>();
+    const bestMatch = new Map<string, { other: string; match: { reason: 'exact' | 'substring' | 'jaccard' | 'semantic'; score: number } }>();
+    const recordMatch = (a: string, b: string, m: { reason: 'exact' | 'substring' | 'jaccard' | 'semantic'; score: number }) => {
+      union(a, b);
+      const bestA = bestMatch.get(a);
+      if (!bestA || m.score > bestA.match.score) bestMatch.set(a, { other: b, match: m });
+      const bestB = bestMatch.get(b);
+      if (!bestB || m.score > bestB.match.score) bestMatch.set(b, { other: a, match: m });
+    };
 
+    // ── Tier 1: name-based ───────────────────────────────────
     for (let i = 0; i < bucket.length; i++) {
       for (let j = i + 1; j < bucket.length; j++) {
         const a = bucket[i]!;
@@ -89,12 +130,38 @@ export function findDedupClusters(
           { name: a.name, type: a.type },
           { name: b.name, type: b.type },
         );
-        if (m) {
-          union(a.id, b.id);
-          const bestA = bestMatch.get(a.id);
-          if (!bestA || m.score > bestA.match.score) bestMatch.set(a.id, { other: b.id, match: m });
-          const bestB = bestMatch.get(b.id);
-          if (!bestB || m.score > bestB.match.score) bestMatch.set(b.id, { other: a.id, match: m });
+        if (m) recordMatch(a.id, b.id, m);
+      }
+    }
+
+    // ── Tier 2: embedding-based (opt-in, when provider configured) ──
+    // Runs pairwise within the same type bucket — already name-matched
+    // pairs are harmless (union is idempotent). Only consults embeddings
+    // for pairs that Tier 1 missed, so cost is bounded by the bucket size.
+    // We accept O(n²) fetches within a type because nodes-per-type is
+    // typically small and the fetches are in-process SQLite lookups.
+    if (tier2) {
+      const threshold = tier2.threshold;
+      const vecCache = new Map<string, Float32Array | null>();
+      const getVec = (id: string): Float32Array | null => {
+        if (vecCache.has(id)) return vecCache.get(id)!;
+        const v = tier2.getEmbedding(id);
+        vecCache.set(id, v);
+        return v;
+      };
+      for (let i = 0; i < bucket.length; i++) {
+        const a = bucket[i]!;
+        const va = getVec(a.id);
+        if (!va) continue;
+        for (let j = i + 1; j < bucket.length; j++) {
+          const b = bucket[j]!;
+          if (find(a.id) === find(b.id)) continue; // already in same cluster
+          const vb = getVec(b.id);
+          if (!vb) continue;
+          const cos = cosineSimilarity(va, vb);
+          if (cos >= threshold) {
+            recordMatch(a.id, b.id, { reason: 'semantic', score: cos });
+          }
         }
       }
     }
@@ -159,8 +226,9 @@ export function runDedupPass(
   namespace: string,
   merge: (sourceId: string, targetId: string) => { merged_edges: number; dedup_edges: number },
   dryRun: boolean = false,
+  tier2?: Tier2Options,
 ): DedupPassReport {
-  const clusters = findDedupClusters(db, namespace);
+  const clusters = findDedupClusters(db, namespace, tier2);
   const report: DedupPassReport = {
     clusters,
     merged_count: 0,

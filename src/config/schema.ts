@@ -34,6 +34,20 @@ export const ConfigSchema = z.object({
     archiveInactiveDays: z.number().int().positive().default(90),
     orphanGraceDays: z.number().int().positive().default(30),
   }).default({}),
+
+  dedup: z.object({
+    /** When true AND an embedding provider is configured, Tier 2 (cosine
+     *  similarity) dedup runs post-hoc after the auto-embed callback
+     *  computes a new node's embedding. If a same-type neighbor clears
+     *  `semanticThreshold`, the just-inserted node is merged into the
+     *  higher-confidence / older canonical one. Eventual-consistency —
+     *  the agent's mutate() has already returned by then. */
+    semanticAutoMerge: z.boolean().default(false),
+    /** Cosine similarity threshold for Tier 2 matches. Conservative default
+     *  to prefer precision over recall (better to miss a duplicate than to
+     *  wrongly merge two distinct concepts). */
+    semanticThreshold: z.number().min(0).max(1).default(0.92),
+  }).default({}),
 });
 
 export type Config = z.infer<typeof ConfigSchema>;

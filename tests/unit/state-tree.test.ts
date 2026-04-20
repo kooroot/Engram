@@ -403,4 +403,33 @@ describe('StateTree - Edge Operations', () => {
     expect(content.auto_merges![0]!.requested_name).toBe('engram');
     expect(content.auto_merges![0]!.matched_by).toBe('exact');
   });
+
+  it('mutate() uses an IMMEDIATE transaction (concurrent-write race guard)', () => {
+    // Open a SECOND connection to the same DB file and acquire a write lock
+    // via BEGIN IMMEDIATE. If our mutate() uses IMMEDIATE too it should fail
+    // to acquire the lock (SQLITE_BUSY) — proving the txn tries to take the
+    // write lock upfront, not lazily. If mutate() were DEFERRED the BEGIN
+    // would succeed and only the INSERT would fail, which is the race we're
+    // trying to close.
+    const otherDb = new Database(TEST_DB_PATH);
+    otherDb.pragma('busy_timeout = 0');
+    db.pragma('busy_timeout = 0');
+    otherDb.prepare('BEGIN IMMEDIATE').run();
+
+    try {
+      let caught: unknown = null;
+      try {
+        stateTree.mutate([
+          { op: 'create', type: 'project', name: 'Race Test' },
+        ]);
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeDefined();
+      expect(String(caught)).toMatch(/SQLITE_BUSY|database is locked/i);
+    } finally {
+      otherDb.prepare('ROLLBACK').run();
+      otherDb.close();
+    }
+  });
 });

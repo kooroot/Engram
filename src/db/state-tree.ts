@@ -236,6 +236,12 @@ export class StateTree {
       matched_by: 'exact' | 'substring' | 'jaccard';
     }> = [];
 
+    // Phase 6c — IMMEDIATE transaction closes the concurrent-write race.
+    // Default DEFERRED txns acquire the write lock lazily (on first write),
+    // so two processes could both SELECT, both see no match, then both INSERT.
+    // IMMEDIATE takes the RESERVED lock upfront, serializing mutate() calls
+    // across all connections to this DB file. Dedup's SELECT → INSERT path
+    // is now atomic with respect to other writers.
     const mutationTxn = this.db.transaction(() => {
       for (const op of operations) {
         switch (op.op) {
@@ -284,6 +290,14 @@ export class StateTree {
               });
               historyRowIds.push(histResult.lastInsertRowid);
 
+              // Merge policy (auto-merge at create-time) — INCOMING WINS on
+              // conflict. This is "update" semantic: the agent just asked for
+              // a create with these properties, treat it like update-or-insert.
+              // Contrast with StateTree.mergeNodes (retro consolidation) which
+              // uses "TARGET WINS" — the operator explicitly picked a canonical
+              // node and wants its data preserved. Two different operations,
+              // two different policies, both intentional. See ARCHITECTURE
+              // if you're tempted to "align" them.
               const currentProps = safeJsonParse(existing.properties);
               const mergedProps = { ...currentProps, ...(op.properties ?? {}) };
               const mergedConfidence = Math.max(existing.confidence ?? 0, op.confidence ?? 0);
@@ -393,7 +407,7 @@ export class StateTree {
       }
     });
 
-    mutationTxn();
+    mutationTxn.immediate();
 
     const event = this.eventLog.append({
       type: 'mutation',
@@ -534,7 +548,7 @@ export class StateTree {
       }
     });
 
-    linkTxn();
+    linkTxn.immediate();
 
     const event = this.eventLog.append({
       type: 'mutation',
@@ -628,7 +642,12 @@ export class StateTree {
       });
       historyRowId = histResult.lastInsertRowid;
 
-      // 2. Merge properties (target wins on key conflict — target is the canonical entity)
+      // Merge policy (retro consolidation) — TARGET WINS on key conflict.
+      // The operator (or maintenance --dedup) picked target as canonical, so
+      // its properties are authoritative. Source fills in keys target doesn't
+      // have. Contrast with auto-merge in mutate() create branch which uses
+      // "incoming wins" for standard update semantics. These are intentionally
+      // different rules for two different operations.
       const sourceProps = safeJsonParse(source.properties);
       const targetProps = safeJsonParse(target.properties);
       const merged = { ...sourceProps, ...targetProps };
@@ -687,7 +706,7 @@ export class StateTree {
       ).run(source.id, this.namespace);
     });
 
-    txn();
+    txn.immediate();
 
     // Log merge event
     const event = this.eventLog.append({

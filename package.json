@@ -1,6 +1,6 @@
 {
   "name": "@kooroot/engram",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "AI-native persistent memory for agents — knowledge graph, not files, not RAG. MCP server + CLI + REST.",
   "type": "module",
   "main": "dist/index.js",
