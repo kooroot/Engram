@@ -262,7 +262,13 @@ export function registerCLICommands(program: Command): void {
     .option('-e, --entities <items>', 'Comma-separated entity names', '')
     .option('-m, --max-tokens <n>', 'Token budget', '2000')
     .option('-s, --strategy <strategy>', 'graph | semantic | hybrid', 'hybrid')
-    .action((topic, opts) => withCore(async (core) => {
+    .option('--hook-format <event>', 'Wrap output as Claude Code hook JSON (event: SessionStart|UserPromptSubmit)')
+    .action((topic: string, opts: {
+      entities: string;
+      maxTokens: string;
+      strategy: string;
+      hookFormat?: string;
+    }) => withCore(async (core) => {
       const entities = opts.entities
         ? opts.entities.split(',').map((s: string) => s.trim()).filter(Boolean)
         : undefined;
@@ -272,7 +278,59 @@ export function registerCLICommands(program: Command): void {
         maxTokens: safeInt(opts.maxTokens, 2000),
         strategy: opts.strategy as svc.ContextStrategy,
       });
-      console.log(context);
+      if (opts.hookFormat) {
+        if (!context || context.includes('No relevant context')) {
+          process.exit(0); // empty → hook skips injection by emitting nothing
+        }
+        const out = {
+          hookSpecificOutput: {
+            hookEventName: opts.hookFormat,
+            additionalContext: `[Engram Memory] Relevant context for "${topic}":\n\n${context}`,
+          },
+        };
+        console.log(JSON.stringify(out));
+      } else {
+        console.log(context);
+      }
+    }, ns())());
+
+  // ─── autosave (twin mode) ───────────────────────
+  program
+    .command('autosave <transcript>')
+    .description('Extract substance from a session transcript and save to memory (twin mode)')
+    .option('-p, --provider <name>', 'LLM provider', 'anthropic')
+    .option('-m, --model <name>', 'Override default model')
+    .option('--min-bytes <n>', 'Skip if transcript smaller than this', '200')
+    .action((transcript: string, opts: {
+      provider: string; model?: string; minBytes: string;
+    }) => withCore(async (core) => {
+      const { runAutosave } = await import('../twin/autosave.js');
+      try {
+        const report = await runAutosave({
+          core,
+          transcriptPath: transcript,
+          provider: opts.provider as 'anthropic',
+          ...(opts.model !== undefined ? { model: opts.model } : {}),
+          minTranscriptBytes: safeInt(opts.minBytes, 200),
+        });
+
+        // Summary to stderr — keeps stdout clean for hook composition
+        const summary =
+          `[engram] autosave: ${report.created} created, ${report.updated} updated, ` +
+          `${report.skipped} skipped, ${report.linksCreated} links` +
+          (report.duplicatesInBatch ? `, ${report.duplicatesInBatch} dup-in-batch` : '') +
+          (report.errors.length ? `, ${report.errors.length} errors` : '');
+        process.stderr.write(summary + '\n');
+        if (report.errors.length) {
+          for (const e of report.errors) process.stderr.write(`  error: ${e}\n`);
+          // Per Codex Task 3 review note: partial-save runs must surface non-zero
+          // exit so adapter hooks can distinguish full vs degraded saves.
+          process.exit(2);
+        }
+      } catch (err) {
+        process.stderr.write(`[engram] autosave failed: ${(err as Error).message}\n`);
+        process.exit(1);
+      }
     }, ns())());
 
   // ─── maintenance ─────────────────────────────────
