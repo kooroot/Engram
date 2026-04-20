@@ -551,9 +551,11 @@ program
   .option('-p, --provider <name>', 'LLM provider', 'anthropic')
   .option('-m, --model <name>', 'Override default model')
   .option('--min-bytes <n>', 'Skip if transcript smaller than this', '200')
-  .option('--dry-run', 'Print extraction without saving')
+  // Note: `--dry-run` was dropped from the implemented command — `runAutosave`
+  // has no dry-run mode and the flag would have been dead. Add later if a
+  // user actually needs it.
   .action((transcript: string, opts: {
-    provider: string; model?: string; minBytes: string; dryRun?: boolean;
+    provider: string; model?: string; minBytes: string;
   }) => withCore(async (core) => {
     const { runAutosave } = await import('../twin/autosave.js');
     try {

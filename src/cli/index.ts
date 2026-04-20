@@ -11,6 +11,11 @@ import { runReset } from './reset.js';
 import { runBackup, runListBackups } from './backup.js';
 import { runRestore } from './restore.js';
 
+// Hook event names accepted by `engram context --hook-format`. Limited to
+// what Claude Code's hook contract actually consumes; reject typos at the CLI
+// boundary so we don't silently emit unparseable JSON to the hook host.
+const HOOK_EVENTS = new Set(['SessionStart', 'UserPromptSubmit']);
+
 /** M2: Safe parseInt with fallback for CLI options */
 function safeInt(val: string | undefined, fallback: number): number {
   if (!val) return fallback;
@@ -269,6 +274,13 @@ export function registerCLICommands(program: Command): void {
       strategy: string;
       hookFormat?: string;
     }) => withCore(async (core) => {
+      if (opts.hookFormat && !HOOK_EVENTS.has(opts.hookFormat)) {
+        process.stderr.write(
+          `Invalid --hook-format: ${opts.hookFormat}. ` +
+          `Expected one of: ${[...HOOK_EVENTS].join(', ')}\n`,
+        );
+        process.exit(1);
+      }
       const entities = opts.entities
         ? opts.entities.split(',').map((s: string) => s.trim()).filter(Boolean)
         : undefined;
@@ -279,8 +291,11 @@ export function registerCLICommands(program: Command): void {
         strategy: opts.strategy as svc.ContextStrategy,
       });
       if (opts.hookFormat) {
-        if (!context || context.includes('No relevant context')) {
-          process.exit(0); // empty → hook skips injection by emitting nothing
+        // Use exact-match against the service sentinel rather than substring,
+        // so a legitimate context that happens to mention "No relevant context"
+        // is not silently dropped.
+        if (!context || context.trim() === 'No relevant context found.') {
+          process.exit(0); // hook injects nothing
         }
         const out = {
           hookSpecificOutput: {
@@ -304,12 +319,20 @@ export function registerCLICommands(program: Command): void {
     .action((transcript: string, opts: {
       provider: string; model?: string; minBytes: string;
     }) => withCore(async (core) => {
+      if (opts.provider !== 'anthropic') {
+        process.stderr.write(
+          `[engram] provider not yet implemented: ${opts.provider}. ` +
+          `Phase 1 supports only 'anthropic'.\n`,
+        );
+        process.exit(1);
+      }
       const { runAutosave } = await import('../twin/autosave.js');
+      const { ExtractionParseError } = await import('../twin/providers.js');
       try {
         const report = await runAutosave({
           core,
           transcriptPath: transcript,
-          provider: opts.provider as 'anthropic',
+          provider: 'anthropic',
           ...(opts.model !== undefined ? { model: opts.model } : {}),
           minTranscriptBytes: safeInt(opts.minBytes, 200),
         });
@@ -329,6 +352,12 @@ export function registerCLICommands(program: Command): void {
         }
       } catch (err) {
         process.stderr.write(`[engram] autosave failed: ${(err as Error).message}\n`);
+        // ExtractionParseError carries the raw LLM text — preserve it so the
+        // operator can debug what the model actually emitted.
+        if (err instanceof ExtractionParseError) {
+          const snippet = err.rawText.slice(0, 500);
+          process.stderr.write(`  raw response: ${snippet}\n`);
+        }
         process.exit(1);
       }
     }, ns())());
