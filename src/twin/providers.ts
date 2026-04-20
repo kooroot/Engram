@@ -1,6 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { validateExtraction, type Extraction } from './schema.js';
@@ -126,6 +126,30 @@ function snippet(text: string): string {
     : text.slice(0, RAW_SNIPPET_BYTES) + `… (truncated, total ${text.length} chars)`;
 }
 
+/**
+ * Build a default `SpawnFn` that scrubs the given env key before invoking
+ * `spawnSync`. All three CLI providers share this pattern — scrubbing the
+ * provider-specific API key forces subscription/account auth, avoiding
+ * surprise metered charges when both auth modes are configured.
+ */
+function makeDefaultSpawn(envKeyToScrub: string): SpawnFn {
+  return (cmd, a, input) => {
+    const childEnv = { ...process.env };
+    delete childEnv[envKeyToScrub];
+    const r = spawnSync(cmd, a, {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      env: childEnv,
+      ...(input !== undefined ? { input } : {}),
+    });
+    return {
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      status: r.status,
+    };
+  };
+}
+
 export async function extractWithProvider(opts: ExtractOptions): Promise<Extraction> {
   if (opts.provider === 'anthropic') {
     return extractAnthropic(opts);
@@ -236,26 +260,7 @@ export function extractClaudeCli(opts: ExtractClaudeCliOptions): Extraction {
     'Extract substance from the transcript piped on stdin.',
   ];
 
-  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
-    // Scrub ANTHROPIC_API_KEY so the claude CLI uses subscription auth, not
-    // metered API auth. Without this, users with both auth modes would get
-    // surprise API charges. They can still force API auth by passing
-    // --provider anthropic.
-    const childEnv = { ...process.env };
-    delete childEnv['ANTHROPIC_API_KEY'];
-    const r = spawnSync(cmd, a, {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-      env: childEnv,
-      ...(input !== undefined ? { input } : {}),
-    });
-    return {
-      stdout: r.stdout ?? '',
-      stderr: r.stderr ?? '',
-      status: r.status,
-    };
-  });
-
+  const fn: SpawnFn = opts.spawnFn ?? makeDefaultSpawn('ANTHROPIC_API_KEY');
   const result = fn('claude', args, opts.transcript);
 
   if (result.status !== 0) {
@@ -324,16 +329,26 @@ export interface ExtractCodexCliOptions {
  */
 export function extractCodexCli(opts: ExtractCodexCliOptions): Extraction {
   const tmpDir = mkdtempSync(join(tmpdir(), 'engram-codex-'));
+  try {
+    return runCodex(tmpDir, opts);
+  } finally {
+    // Always clean up — schema + output files would otherwise accumulate
+    // one /tmp/engram-codex-XXX dir per Stop hook firing.
+    try { rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
+function runCodex(tmpDir: string, opts: ExtractCodexCliOptions): Extraction {
   const schemaFile = join(tmpDir, 'schema.json');
   const outputFile = join(tmpDir, 'output.txt');
   writeFileSync(schemaFile, JSON.stringify(EXTRACTION_JSON_SCHEMA));
 
-  // Codex has no separate --system-prompt; we inline everything in the
-  // single positional prompt arg. Transcript is appended after the
-  // extraction instructions.
-  const prompt = `${EXTRACTION_PROMPT}\n\nTranscript:\n${opts.transcript}`;
+  // Pass the prompt+transcript via stdin. Codex docs: "If not provided as an
+  // argument (or if `-` is used), instructions are read from stdin." This
+  // avoids ARG_MAX (~256KB on macOS) when --max-bytes is raised.
+  const stdinPayload = `${EXTRACTION_PROMPT}\n\nTranscript:\n${opts.transcript}`;
   const args = [
-    'exec', prompt,
+    'exec', '-',
     '--skip-git-repo-check',
     '--sandbox', 'read-only',
     '--output-schema', schemaFile,
@@ -341,25 +356,8 @@ export function extractCodexCli(opts: ExtractCodexCliOptions): Extraction {
     ...(opts.model !== undefined ? ['--model', opts.model] : []),
   ];
 
-  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
-    // Scrub OPENAI_API_KEY so codex uses ChatGPT account auth, not metered
-    // API auth — same rationale as the claude-cli ANTHROPIC_API_KEY scrub.
-    const childEnv = { ...process.env };
-    delete childEnv['OPENAI_API_KEY'];
-    const r = spawnSync(cmd, a, {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-      env: childEnv,
-      ...(input !== undefined ? { input } : {}),
-    });
-    return {
-      stdout: r.stdout ?? '',
-      stderr: r.stderr ?? '',
-      status: r.status,
-    };
-  });
-
-  const result = fn('codex', args);
+  const fn: SpawnFn = opts.spawnFn ?? makeDefaultSpawn('OPENAI_API_KEY');
+  const result = fn('codex', args, stdinPayload);
 
   if (result.status !== 0) {
     throw new ExtractionParseError(
@@ -428,37 +426,25 @@ export interface ExtractGeminiCliOptions {
  */
 export function extractGeminiCli(opts: ExtractGeminiCliOptions): Extraction {
   const inlinedSchema = JSON.stringify(EXTRACTION_JSON_SCHEMA);
-  const prompt = `${EXTRACTION_PROMPT}
+  // Gemini docs: "Appended to input on stdin (if any)" — so the transcript
+  // goes via stdin and `-p` carries only the instructions. This avoids
+  // ARG_MAX when --max-bytes is raised. The schema + extraction prompt are
+  // ~2KB total, well under any limit.
+  const promptArg = `${EXTRACTION_PROMPT}
 
 Your response MUST be valid JSON matching this JSON Schema (no markdown fences, no commentary, just the JSON):
 ${inlinedSchema}
 
-Transcript to analyze:
-${opts.transcript}`;
+The transcript to analyze is provided on stdin.`;
 
   const args = [
-    '-p', prompt,
+    '-p', promptArg,
     '-o', 'json',
     ...(opts.model !== undefined ? ['--model', opts.model] : []),
   ];
 
-  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
-    const childEnv = { ...process.env };
-    delete childEnv['GEMINI_API_KEY'];
-    const r = spawnSync(cmd, a, {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-      env: childEnv,
-      ...(input !== undefined ? { input } : {}),
-    });
-    return {
-      stdout: r.stdout ?? '',
-      stderr: r.stderr ?? '',
-      status: r.status,
-    };
-  });
-
-  const result = fn('gemini', args);
+  const fn: SpawnFn = opts.spawnFn ?? makeDefaultSpawn('GEMINI_API_KEY');
+  const result = fn('gemini', args, opts.transcript);
 
   if (result.status !== 0) {
     throw new ExtractionParseError(

@@ -460,10 +460,10 @@ describe('extractCodexCli', () => {
     expect(result.items).toEqual([]);
   });
 
-  it('passes model and schema-file through args; transcript is inlined in prompt', () => {
-    let captured: { args: string[] } | null = null;
-    const spawnFn: SpawnFn = (_cmd, args) => {
-      captured = { args };
+  it('passes model and schema-file through args; transcript via stdin (ARG_MAX guard)', () => {
+    let captured: { args: string[]; input?: string } | null = null;
+    const spawnFn: SpawnFn = (_cmd, args, input) => {
+      captured = { args, ...(input !== undefined ? { input } : {}) };
       const oIdx = args.indexOf('-o');
       if (oIdx >= 0 && args[oIdx + 1]) {
         fs.writeFileSync(args[oIdx + 1], JSON.stringify({ items: [] }));
@@ -472,6 +472,10 @@ describe('extractCodexCli', () => {
     };
     extractCodexCli({ transcript: 'TRANSCRIPT_BODY', model: 'gpt-5', spawnFn });
     expect(captured!.args[0]).toBe('exec');
+    // Prompt arg is `-` meaning "read from stdin"; transcript is NOT in argv.
+    expect(captured!.args[1]).toBe('-');
+    expect(captured!.args).not.toContain('TRANSCRIPT_BODY');
+    expect(captured!.input).toContain('TRANSCRIPT_BODY');
     expect(captured!.args).toContain('--skip-git-repo-check');
     expect(captured!.args).toContain('--sandbox');
     expect(captured!.args).toContain('read-only');
@@ -479,15 +483,53 @@ describe('extractCodexCli', () => {
     expect(captured!.args).toContain('-o');
     expect(captured!.args).toContain('--model');
     expect(captured!.args).toContain('gpt-5');
-    // The prompt positional (index 1) should contain the transcript inlined.
-    expect(captured!.args[1]).toContain('TRANSCRIPT_BODY');
-    // Schema arg must be a file PATH, not the inline schema JSON.
-    const schemaIdx = captured!.args.indexOf('--output-schema');
-    const schemaPath = captured!.args[schemaIdx + 1] ?? '';
-    expect(schemaPath).not.toContain('"type"');
-    // The file at that path should contain the actual schema JSON.
-    const schemaContent = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
-    expect(schemaContent.properties.items.items.additionalProperties).toBe(false);
+  });
+
+  it('cleans up the temp dir on success', () => {
+    const dirsBefore = fs.readdirSync(require('node:os').tmpdir())
+      .filter(d => d.startsWith('engram-codex-')).length;
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      const oIdx = args.indexOf('-o');
+      if (oIdx >= 0 && args[oIdx + 1]) {
+        fs.writeFileSync(args[oIdx + 1], JSON.stringify({ items: [] }));
+      }
+      return { stdout: '', stderr: '', status: 0 };
+    };
+    extractCodexCli({ transcript: 'x', spawnFn });
+    const dirsAfter = fs.readdirSync(require('node:os').tmpdir())
+      .filter(d => d.startsWith('engram-codex-')).length;
+    expect(dirsAfter).toBe(dirsBefore);
+  });
+
+  it('cleans up the temp dir even when CLI fails', () => {
+    const dirsBefore = fs.readdirSync(require('node:os').tmpdir())
+      .filter(d => d.startsWith('engram-codex-')).length;
+    const spawnFn: SpawnFn = () => ({ stdout: '', stderr: 'boom', status: 1 });
+    try { extractCodexCli({ transcript: 'x', spawnFn }); } catch { /* expected */ }
+    const dirsAfter = fs.readdirSync(require('node:os').tmpdir())
+      .filter(d => d.startsWith('engram-codex-')).length;
+    expect(dirsAfter).toBe(dirsBefore);
+  });
+
+  it('captures the schema file content via finally cleanup edge case', () => {
+    // Verify the schema file (written before the spawn) still has correct
+    // content when accessed from the spawnFn synchronously, even though
+    // the dir is cleaned up after extractCodexCli returns.
+    let schemaContent: Record<string, unknown> | null = null;
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      const schemaIdx = args.indexOf('--output-schema');
+      const schemaPath = args[schemaIdx + 1] ?? '';
+      schemaContent = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+      const oIdx = args.indexOf('-o');
+      if (oIdx >= 0 && args[oIdx + 1]) {
+        fs.writeFileSync(args[oIdx + 1], JSON.stringify({ items: [] }));
+      }
+      return { stdout: '', stderr: '', status: 0 };
+    };
+    extractCodexCli({ transcript: 'x', spawnFn });
+    expect(schemaContent).not.toBeNull();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((schemaContent as any).properties.items.items.additionalProperties).toBe(false);
   });
 });
 
@@ -581,10 +623,10 @@ describe('extractGeminiCli', () => {
     expect(result.items).toEqual([]);
   });
 
-  it('passes model through args and inlines schema + transcript into the -p prompt', () => {
-    let captured: { args: string[] } | null = null;
-    const spawnFn: SpawnFn = (_cmd, args) => {
-      captured = { args };
+  it('passes model through args, schema in -p, transcript via stdin (ARG_MAX guard)', () => {
+    let captured: { args: string[]; input?: string } | null = null;
+    const spawnFn: SpawnFn = (_cmd, args, input) => {
+      captured = { args, ...(input !== undefined ? { input } : {}) };
       return {
         stdout: JSON.stringify({ session_id: 'a', response: '{"items":[]}', stats: {} }),
         stderr: '',
@@ -597,13 +639,14 @@ describe('extractGeminiCli', () => {
     expect(captured!.args).toContain('json');
     expect(captured!.args).toContain('--model');
     expect(captured!.args).toContain('gemini-2.5-pro');
-    // The single -p arg must contain both the transcript and the inlined schema
-    // (since gemini has no --system-prompt or --json-schema flag).
+    // -p arg has the schema + instructions but NOT the transcript (ARG_MAX guard).
     const pIdx = captured!.args.indexOf('-p');
     const promptArg = captured!.args[pIdx + 1] ?? '';
-    expect(promptArg).toContain('TRANSCRIPT_BODY');
     expect(promptArg).toContain('JSON Schema');
     expect(promptArg).toContain('"additionalProperties":false');
+    expect(promptArg).not.toContain('TRANSCRIPT_BODY');
+    // Transcript goes via stdin.
+    expect(captured!.input).toBe('TRANSCRIPT_BODY');
   });
 });
 
