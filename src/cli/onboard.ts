@@ -978,22 +978,30 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   p.log.info('Stop           → autosaves substance from completed sessions');
 
   // Auth preflight: the Stop hook calls `engram autosave` which auto-detects
-  // either the `claude` CLI (subscription auth, preferred) or the Anthropic SDK
-  // (requires ANTHROPIC_API_KEY). At least one must be available.
-  let claudeAvailable = false;
-  try {
-    execFileSync('which', ['claude'], { stdio: ['ignore', 'pipe', 'ignore'] });
-    claudeAvailable = true;
-  } catch { /* not on PATH */ }
+  // any host AI CLI (claude > codex > gemini, in that priority order) or the
+  // Anthropic SDK (requires ANTHROPIC_API_KEY). At least one must be available.
+  const cliChecks: Array<{ name: string; provider: string }> = [
+    { name: 'claude', provider: 'claude-cli (subscription)' },
+    { name: 'codex',  provider: 'codex-cli (subscription)' },
+    { name: 'gemini', provider: 'gemini-cli (subscription)' },
+  ];
+  const found: string[] = [];
+  for (const c of cliChecks) {
+    try {
+      execFileSync('which', [c.name], { stdio: ['ignore', 'pipe', 'ignore'] });
+      found.push(c.provider);
+    } catch { /* not on PATH */ }
+  }
 
-  if (claudeAvailable) {
-    p.log.info('Detected `claude` CLI on PATH — autosave will use Claude Code subscription auth.');
+  if (found.length > 0) {
+    p.log.info(`Detected: ${found.join(', ')}`);
+    p.log.info('Autosave will auto-pick the first available CLI (claude > codex > gemini).');
   } else if (process.env['ANTHROPIC_API_KEY']) {
-    p.log.info('Will use ANTHROPIC_API_KEY for autosave (claude CLI not on PATH).');
+    p.log.info('Will use ANTHROPIC_API_KEY for autosave (no host CLIs detected).');
   } else {
     p.log.warn(
-      `Neither \`claude\` CLI nor ANTHROPIC_API_KEY detected. ` +
-      `The Stop autosave hook will fail until one is available.`,
+      `No CLI providers and no ANTHROPIC_API_KEY — ` +
+      `the Stop autosave hook will fail until one is available.`,
     );
   }
 }

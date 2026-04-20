@@ -3,6 +3,8 @@ import { ExtractionSchema, validateExtraction } from '../../src/twin/schema.js';
 import {
   extractWithProvider,
   extractClaudeCli,
+  extractCodexCli,
+  extractGeminiCli,
   ExtractionParseError,
   type SpawnFn,
 } from '../../src/twin/providers.js';
@@ -383,6 +385,228 @@ describe('extractClaudeCli', () => {
   });
 });
 
+describe('extractCodexCli', () => {
+  // Codex reads its model output from a file path passed via -o. Tests use
+  // this helper as a SpawnFn that intercepts -o, writes the desired model
+  // response to that path, and reports success.
+  function spawnFnWritingOutput(modelResponse: string): SpawnFn {
+    return (_cmd, args) => {
+      const oIdx = args.indexOf('-o');
+      const outPath = oIdx >= 0 ? args[oIdx + 1] : undefined;
+      if (outPath) fs.writeFileSync(outPath, modelResponse);
+      return { stdout: '', stderr: '', status: 0 };
+    };
+  }
+
+  it('returns parsed extraction when CLI writes valid JSON to output file (happy path)', () => {
+    const spawnFn = spawnFnWritingOutput(JSON.stringify({
+      items: [{
+        kind: 'fact',
+        name: 'Codex works',
+        summary: 'subscription auth ok',
+        properties: {},
+        confidence: 0.9,
+        links: [],
+      }],
+    }));
+    const result = extractCodexCli({ transcript: 'hi', spawnFn });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.name).toBe('Codex works');
+  });
+
+  it('throws ExtractionParseError when CLI exits non-zero (with stderr in message)', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: '',
+      stderr: 'Not authenticated. Run `codex login`.',
+      status: 1,
+    });
+    try {
+      extractCodexCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/exited 1/);
+      expect((err as Error).message).toMatch(/Not authenticated/);
+    }
+  });
+
+  it('throws ExtractionParseError when output file is unreadable (CLI did not write it)', () => {
+    // SpawnFn reports success but writes nothing — readFileSync should fail.
+    const spawnFn: SpawnFn = () => ({ stdout: '', stderr: '', status: 0 });
+    try {
+      extractCodexCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/did not produce output file/);
+    }
+  });
+
+  it('throws ExtractionParseError when output file content is not JSON', () => {
+    const spawnFn = spawnFnWritingOutput('this is not json at all');
+    try {
+      extractCodexCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/not JSON/);
+      expect((err as ExtractionParseError).rawText).toBe('this is not json at all');
+    }
+  });
+
+  it('strips ```json fences before parsing', () => {
+    const spawnFn = spawnFnWritingOutput('```json\n{"items":[]}\n```');
+    const result = extractCodexCli({ transcript: 'x', spawnFn });
+    expect(result.items).toEqual([]);
+  });
+
+  it('passes model and schema-file through args; transcript is inlined in prompt', () => {
+    let captured: { args: string[] } | null = null;
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      captured = { args };
+      const oIdx = args.indexOf('-o');
+      if (oIdx >= 0 && args[oIdx + 1]) {
+        fs.writeFileSync(args[oIdx + 1], JSON.stringify({ items: [] }));
+      }
+      return { stdout: '', stderr: '', status: 0 };
+    };
+    extractCodexCli({ transcript: 'TRANSCRIPT_BODY', model: 'gpt-5', spawnFn });
+    expect(captured!.args[0]).toBe('exec');
+    expect(captured!.args).toContain('--skip-git-repo-check');
+    expect(captured!.args).toContain('--sandbox');
+    expect(captured!.args).toContain('read-only');
+    expect(captured!.args).toContain('--output-schema');
+    expect(captured!.args).toContain('-o');
+    expect(captured!.args).toContain('--model');
+    expect(captured!.args).toContain('gpt-5');
+    // The prompt positional (index 1) should contain the transcript inlined.
+    expect(captured!.args[1]).toContain('TRANSCRIPT_BODY');
+    // Schema arg must be a file PATH, not the inline schema JSON.
+    const schemaIdx = captured!.args.indexOf('--output-schema');
+    const schemaPath = captured!.args[schemaIdx + 1] ?? '';
+    expect(schemaPath).not.toContain('"type"');
+    // The file at that path should contain the actual schema JSON.
+    const schemaContent = JSON.parse(fs.readFileSync(schemaPath, 'utf8'));
+    expect(schemaContent.properties.items.items.additionalProperties).toBe(false);
+  });
+});
+
+describe('extractGeminiCli', () => {
+  it('returns parsed extraction from { response } envelope (happy path)', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        session_id: 'abc',
+        response: JSON.stringify({
+          items: [{
+            kind: 'fact',
+            name: 'Gemini works',
+            summary: 'inline schema ok',
+            properties: {},
+            confidence: 0.9,
+            links: [],
+          }],
+        }),
+        stats: {},
+      }),
+      stderr: '',
+      status: 0,
+    });
+    const result = extractGeminiCli({ transcript: 'hi', spawnFn });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.name).toBe('Gemini works');
+  });
+
+  it('throws ExtractionParseError when CLI exits non-zero (with stderr in message)', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: '',
+      stderr: 'Authentication required. Run `gemini auth login`.',
+      status: 1,
+    });
+    try {
+      extractGeminiCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/exited 1/);
+      expect((err as Error).message).toMatch(/Authentication required/);
+    }
+  });
+
+  it('throws ExtractionParseError when envelope has no response field', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({ session_id: 'abc', stats: {} }),
+      stderr: '',
+      status: 0,
+    });
+    try {
+      extractGeminiCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/no response field/);
+    }
+  });
+
+  it('throws ExtractionParseError when response field is not JSON', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        session_id: 'abc',
+        response: 'this is not json at all',
+        stats: {},
+      }),
+      stderr: '',
+      status: 0,
+    });
+    try {
+      extractGeminiCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/not JSON/);
+      expect((err as ExtractionParseError).rawText).toBe('this is not json at all');
+    }
+  });
+
+  it('strips ```json fences from the response field before parsing', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        session_id: 'abc',
+        response: '```json\n{"items":[]}\n```',
+        stats: {},
+      }),
+      stderr: '',
+      status: 0,
+    });
+    const result = extractGeminiCli({ transcript: 'x', spawnFn });
+    expect(result.items).toEqual([]);
+  });
+
+  it('passes model through args and inlines schema + transcript into the -p prompt', () => {
+    let captured: { args: string[] } | null = null;
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      captured = { args };
+      return {
+        stdout: JSON.stringify({ session_id: 'a', response: '{"items":[]}', stats: {} }),
+        stderr: '',
+        status: 0,
+      };
+    };
+    extractGeminiCli({ transcript: 'TRANSCRIPT_BODY', model: 'gemini-2.5-pro', spawnFn });
+    expect(captured!.args).toContain('-p');
+    expect(captured!.args).toContain('-o');
+    expect(captured!.args).toContain('json');
+    expect(captured!.args).toContain('--model');
+    expect(captured!.args).toContain('gemini-2.5-pro');
+    // The single -p arg must contain both the transcript and the inlined schema
+    // (since gemini has no --system-prompt or --json-schema flag).
+    const pIdx = captured!.args.indexOf('-p');
+    const promptArg = captured!.args[pIdx + 1] ?? '';
+    expect(promptArg).toContain('TRANSCRIPT_BODY');
+    expect(promptArg).toContain('JSON Schema');
+    expect(promptArg).toContain('"additionalProperties":false');
+  });
+});
+
 describe('extractWithProvider dispatch', () => {
   it("dispatches to claude-cli when provider is 'claude-cli'", async () => {
     let called = false;
@@ -410,6 +634,60 @@ describe('extractWithProvider dispatch', () => {
     });
     expect(called).toBe(true);
     expect(result.items[0]?.name).toBe('Dispatched');
+  });
+
+  it("dispatches to codex-cli when provider is 'codex-cli'", async () => {
+    let called = false;
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      called = true;
+      const oIdx = args.indexOf('-o');
+      if (oIdx >= 0 && args[oIdx + 1]) {
+        fs.writeFileSync(args[oIdx + 1], JSON.stringify({
+          items: [{
+            kind: 'decision', name: 'Codex dispatched',
+            summary: 'via dispatcher', properties: {},
+            confidence: 0.7, links: [],
+          }],
+        }));
+      }
+      return { stdout: '', stderr: '', status: 0 };
+    };
+    const result = await extractWithProvider({
+      provider: 'codex-cli',
+      transcript: 'hello',
+      spawnFn,
+    });
+    expect(called).toBe(true);
+    expect(result.items[0]?.name).toBe('Codex dispatched');
+  });
+
+  it("dispatches to gemini-cli when provider is 'gemini-cli'", async () => {
+    let called = false;
+    const spawnFn: SpawnFn = () => {
+      called = true;
+      return {
+        stdout: JSON.stringify({
+          session_id: 'a',
+          response: JSON.stringify({
+            items: [{
+              kind: 'insight', name: 'Gemini dispatched',
+              summary: 'via dispatcher', properties: {},
+              confidence: 0.7, links: [],
+            }],
+          }),
+          stats: {},
+        }),
+        stderr: '',
+        status: 0,
+      };
+    };
+    const result = await extractWithProvider({
+      provider: 'gemini-cli',
+      transcript: 'hello',
+      spawnFn,
+    });
+    expect(called).toBe(true);
+    expect(result.items[0]?.name).toBe('Gemini dispatched');
   });
 });
 

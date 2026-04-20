@@ -1,8 +1,11 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { validateExtraction, type Extraction } from './schema.js';
 
-export type ProviderName = 'anthropic' | 'claude-cli';
+export type ProviderName = 'anthropic' | 'claude-cli' | 'codex-cli' | 'gemini-cli';
 
 const EXTRACTION_PROMPT = `You are an extraction agent for Engram, a persistent memory graph.
 
@@ -129,6 +132,20 @@ export async function extractWithProvider(opts: ExtractOptions): Promise<Extract
   }
   if (opts.provider === 'claude-cli') {
     return Promise.resolve(extractClaudeCli({
+      transcript: opts.transcript,
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(opts.spawnFn !== undefined ? { spawnFn: opts.spawnFn } : {}),
+    }));
+  }
+  if (opts.provider === 'codex-cli') {
+    return Promise.resolve(extractCodexCli({
+      transcript: opts.transcript,
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(opts.spawnFn !== undefined ? { spawnFn: opts.spawnFn } : {}),
+    }));
+  }
+  if (opts.provider === 'gemini-cli') {
+    return Promise.resolve(extractGeminiCli({
       transcript: opts.transcript,
       ...(opts.model !== undefined ? { model: opts.model } : {}),
       ...(opts.spawnFn !== undefined ? { spawnFn: opts.spawnFn } : {}),
@@ -280,6 +297,219 @@ export function extractClaudeCli(opts: ExtractClaudeCliOptions): Extraction {
     throw new ExtractionParseError(
       `Schema validation failed: ${(err as Error).message}`,
       JSON.stringify(envelope.structured_output),
+      err,
+    );
+  }
+}
+
+export interface ExtractCodexCliOptions {
+  transcript: string;
+  model?: string;
+  /** Test seam: replace the real `spawnSync` invocation. */
+  spawnFn?: SpawnFn;
+}
+
+/**
+ * Extract via the `codex` CLI in headless mode. Codex takes the JSON Schema
+ * as a FILE PATH (not inline string) via `--output-schema`, and writes its
+ * final assistant message to a file via `-o` / `--output-last-message`.
+ *
+ * Synchronous because `spawnSync` is sync — the dispatcher in
+ * `extractWithProvider` wraps the result in a Promise.
+ *
+ * Auth: Codex auto-uses OPENAI_API_KEY if set, ChatGPT account otherwise.
+ * We scrub OPENAI_API_KEY so users with both auth modes don't get surprise
+ * API charges. They can still force API auth by setting the env var
+ * themselves and bypassing this scrubbing if needed.
+ */
+export function extractCodexCli(opts: ExtractCodexCliOptions): Extraction {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'engram-codex-'));
+  const schemaFile = join(tmpDir, 'schema.json');
+  const outputFile = join(tmpDir, 'output.txt');
+  writeFileSync(schemaFile, JSON.stringify(EXTRACTION_JSON_SCHEMA));
+
+  // Codex has no separate --system-prompt; we inline everything in the
+  // single positional prompt arg. Transcript is appended after the
+  // extraction instructions.
+  const prompt = `${EXTRACTION_PROMPT}\n\nTranscript:\n${opts.transcript}`;
+  const args = [
+    'exec', prompt,
+    '--skip-git-repo-check',
+    '--sandbox', 'read-only',
+    '--output-schema', schemaFile,
+    '-o', outputFile,
+    ...(opts.model !== undefined ? ['--model', opts.model] : []),
+  ];
+
+  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
+    // Scrub OPENAI_API_KEY so codex uses ChatGPT account auth, not metered
+    // API auth — same rationale as the claude-cli ANTHROPIC_API_KEY scrub.
+    const childEnv = { ...process.env };
+    delete childEnv['OPENAI_API_KEY'];
+    const r = spawnSync(cmd, a, {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      env: childEnv,
+      ...(input !== undefined ? { input } : {}),
+    });
+    return {
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      status: r.status,
+    };
+  });
+
+  const result = fn('codex', args);
+
+  if (result.status !== 0) {
+    throw new ExtractionParseError(
+      `codex CLI exited ${result.status}: ${result.stderr.slice(0, 500)}`,
+      result.stdout,
+    );
+  }
+
+  let modelOutput: string;
+  try {
+    modelOutput = readFileSync(outputFile, 'utf8');
+  } catch (err) {
+    throw new ExtractionParseError(
+      `codex CLI did not produce output file: ${(err as Error).message}`,
+      result.stdout,
+      err,
+    );
+  }
+
+  // Codex may wrap the response in ```json fences even when given a schema.
+  const cleaned = modelOutput
+    .trim()
+    .replace(/^```[a-zA-Z0-9_-]*\s*\r?\n?/, '')
+    .replace(/\r?\n?```$/, '')
+    .trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `codex CLI output not JSON: ${(err as Error).message}`,
+      modelOutput,
+      err,
+    );
+  }
+
+  try {
+    return validateExtraction(parsed);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `Schema validation failed: ${(err as Error).message}`,
+      modelOutput,
+      err,
+    );
+  }
+}
+
+export interface ExtractGeminiCliOptions {
+  transcript: string;
+  model?: string;
+  /** Test seam: replace the real `spawnSync` invocation. */
+  spawnFn?: SpawnFn;
+}
+
+/**
+ * Extract via the `gemini` CLI in headless mode. Gemini has no native
+ * `--system-prompt` or `--json-schema` flags, so we inline the extraction
+ * instructions, the JSON Schema, and the transcript into a single `-p`
+ * argument. The CLI returns a `{ session_id, response, stats }` envelope
+ * via `-o json`; we parse `response` (the model's text) and then JSON.parse
+ * that to get the extraction.
+ *
+ * Auth: Gemini uses GEMINI_API_KEY if set, Google account otherwise. Scrub
+ * GEMINI_API_KEY for the same reason as the other providers.
+ */
+export function extractGeminiCli(opts: ExtractGeminiCliOptions): Extraction {
+  const inlinedSchema = JSON.stringify(EXTRACTION_JSON_SCHEMA);
+  const prompt = `${EXTRACTION_PROMPT}
+
+Your response MUST be valid JSON matching this JSON Schema (no markdown fences, no commentary, just the JSON):
+${inlinedSchema}
+
+Transcript to analyze:
+${opts.transcript}`;
+
+  const args = [
+    '-p', prompt,
+    '-o', 'json',
+    ...(opts.model !== undefined ? ['--model', opts.model] : []),
+  ];
+
+  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
+    const childEnv = { ...process.env };
+    delete childEnv['GEMINI_API_KEY'];
+    const r = spawnSync(cmd, a, {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+      env: childEnv,
+      ...(input !== undefined ? { input } : {}),
+    });
+    return {
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      status: r.status,
+    };
+  });
+
+  const result = fn('gemini', args);
+
+  if (result.status !== 0) {
+    throw new ExtractionParseError(
+      `gemini CLI exited ${result.status}: ${result.stderr.slice(0, 500)}`,
+      result.stdout,
+    );
+  }
+
+  let envelope: { response?: string };
+  try {
+    envelope = JSON.parse(result.stdout);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `gemini CLI output not JSON: ${(err as Error).message}`,
+      result.stdout,
+      err,
+    );
+  }
+
+  if (!envelope.response) {
+    throw new ExtractionParseError(
+      'gemini CLI returned no response field',
+      result.stdout,
+    );
+  }
+
+  // Strip optional markdown fences — even though we instructed Gemini not
+  // to wrap, models occasionally do.
+  const cleaned = envelope.response
+    .trim()
+    .replace(/^```[a-zA-Z0-9_-]*\s*\r?\n?/, '')
+    .replace(/\r?\n?```$/, '')
+    .trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `gemini model response not JSON: ${(err as Error).message}`,
+      envelope.response,
+      err,
+    );
+  }
+
+  try {
+    return validateExtraction(parsed);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `Schema validation failed: ${(err as Error).message}`,
+      envelope.response,
       err,
     );
   }

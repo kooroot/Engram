@@ -24,6 +24,16 @@ function safeInt(val: string | undefined, fallback: number): number {
   return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
 }
 
+/** Check if a CLI binary is available on PATH. Used by autosave auto-detect. */
+function hasCli(name: string): boolean {
+  try {
+    execFileSync('which', [name], { stdio: ['ignore', 'pipe', 'ignore'] });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function withCore(
   fn: (core: EngramCore) => void | Promise<void>,
   namespace?: string,
@@ -314,32 +324,45 @@ export function registerCLICommands(program: Command): void {
   program
     .command('autosave <transcript>')
     .description('Extract substance from a session transcript and save to memory (twin mode)')
-    .option('-p, --provider <name>', 'LLM provider: auto | claude-cli | anthropic', 'auto')
+    .option('-p, --provider <name>', 'LLM provider: auto | claude-cli | codex-cli | gemini-cli | anthropic', 'auto')
     .option('-m, --model <name>', 'Override default model')
     .option('--min-bytes <n>', 'Skip if transcript smaller than this', '200')
     .option('--max-bytes <n>', 'Skip if transcript larger than this (cost guard)', '200000')
     .action((transcript: string, opts: {
       provider: string; model?: string; minBytes: string; maxBytes: string;
     }) => withCore(async (core) => {
-      let resolvedProvider: 'claude-cli' | 'anthropic';
+      let resolvedProvider: 'claude-cli' | 'codex-cli' | 'gemini-cli' | 'anthropic';
       if (opts.provider === 'auto') {
-        // Auto-detect: prefer claude CLI (subscription auth, no key needed),
-        // fall back to Anthropic SDK only if ANTHROPIC_API_KEY is set.
-        try {
-          execFileSync('which', ['claude'], { stdio: ['ignore', 'pipe', 'ignore'] });
+        // Priority: ENGRAM_HOST_AI hint (set by adapter scripts) →
+        // first available CLI (claude > codex > gemini) → SDK fallback.
+        const hostHint = process.env['ENGRAM_HOST_AI'];
+        if (hostHint === 'claude' && hasCli('claude')) {
           resolvedProvider = 'claude-cli';
-        } catch {
-          if (process.env['ANTHROPIC_API_KEY']) {
-            resolvedProvider = 'anthropic';
-          } else {
-            process.stderr.write(
-              '[engram] no provider available: install Claude Code CLI ' +
-              'or set ANTHROPIC_API_KEY\n',
-            );
-            process.exit(1);
-          }
+        } else if (hostHint === 'codex' && hasCli('codex')) {
+          resolvedProvider = 'codex-cli';
+        } else if (hostHint === 'gemini' && hasCli('gemini')) {
+          resolvedProvider = 'gemini-cli';
+        } else if (hasCli('claude')) {
+          resolvedProvider = 'claude-cli';
+        } else if (hasCli('codex')) {
+          resolvedProvider = 'codex-cli';
+        } else if (hasCli('gemini')) {
+          resolvedProvider = 'gemini-cli';
+        } else if (process.env['ANTHROPIC_API_KEY']) {
+          resolvedProvider = 'anthropic';
+        } else {
+          process.stderr.write(
+            '[engram] no provider available: install claude/codex/gemini CLI ' +
+            'or set ANTHROPIC_API_KEY\n',
+          );
+          process.exit(1);
         }
-      } else if (opts.provider === 'claude-cli' || opts.provider === 'anthropic') {
+      } else if (
+        opts.provider === 'claude-cli'
+        || opts.provider === 'codex-cli'
+        || opts.provider === 'gemini-cli'
+        || opts.provider === 'anthropic'
+      ) {
         resolvedProvider = opts.provider;
       } else {
         process.stderr.write(`[engram] unknown provider: ${opts.provider}\n`);
