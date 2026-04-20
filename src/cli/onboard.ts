@@ -595,9 +595,14 @@ export async function runOnboard(): Promise<void> {
   const installedInstructionFiles = await offerInstructionInstall(installClients);
   void installedInstructionFiles;
 
-  // Offer to install Claude Code hooks for auto-capture.
-  // These are the HARD mechanism — instructions alone aren't reliable.
-  if (installClients.includes('claude') || await hasCommand('claude')) {
+  // Offer to install auto-capture hooks for whichever host AI CLIs are
+  // present (Claude Code / Codex CLI / Gemini CLI). Hooks are the HARD
+  // mechanism — instructions alone aren't reliable.
+  const anyHostAiPresent = installClients.length > 0
+    || (await hasCommand('claude'))
+    || (await hasCommand('codex'))
+    || (await hasCommand('gemini'));
+  if (anyHostAiPresent) {
     await offerHookInstall(dataDir);
   }
 
@@ -747,18 +752,31 @@ function quoteIfNeeded(s: string): string {
   return `'${s.replace(/'/g, `'\\''`)}'`;
 }
 
-// ─── Hook installation (Claude Code only) ────────────────────────
+// ─── Hook installation (Claude Code + Codex + Gemini) ────────────
+
+export type HostAi = 'claude' | 'codex' | 'gemini';
 
 // Hook scripts use execFileSync (not exec) to avoid shell injection.
 // `__ENGRAM_BIN__` is replaced at install time with an absolute path so the
-// hook works under Claude Code's environment, which may not inherit the
+// hook works under the host AI's environment, which may not inherit the
 // user's PATH (e.g. when launched from a GUI).
+//
+// `__HOST_AI__` is replaced with 'claude' | 'codex' | 'gemini' so the
+// autosave/context subprocess knows which host AI CLI should service the
+// LLM call (via ENGRAM_HOST_AI env var).
+//
+// `__STOP_NOOP__` is replaced with either:
+//   - `` (empty) for Claude  — empty stdout is valid on Stop
+//   - `process.stdout.write('{"continue": true}\n');` for Codex/Gemini,
+//      since Codex rejects empty stdout on Stop ("exit 0 with no output
+//      is invalid") and it's harmless on Gemini's SessionEnd.
 const SESSION_START_HOOK = `#!/usr/bin/env node
 // Engram SessionStart hook — injects "where we left off" project context.
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 
 const ENGRAM_BIN = '__ENGRAM_BIN__';
+const ENGRAM_HOST_AI = '__HOST_AI__';
 const project = basename(process.cwd());
 try {
   // engram CLI emits the hook JSON itself when --hook-format is set.
@@ -767,7 +785,10 @@ try {
     ENGRAM_BIN,
     ['context', project, '--hook-format', 'SessionStart',
       '--strategy', 'graph', '--max-tokens', '1000'],
-    { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] },
+    {
+      encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ENGRAM_HOST_AI },
+    },
   );
   if (out) process.stdout.write(out);
 } catch { /* silent — don't block session start */ }
@@ -779,6 +800,7 @@ const PROMPT_INJECT_HOOK = `#!/usr/bin/env node
 import { execFileSync } from 'node:child_process';
 
 const ENGRAM_BIN = '__ENGRAM_BIN__';
+const ENGRAM_HOST_AI = '__HOST_AI__';
 
 let payload = '';
 for await (const chunk of process.stdin) payload += chunk;
@@ -796,7 +818,10 @@ try {
     ENGRAM_BIN,
     ['context', prompt, '--hook-format', 'UserPromptSubmit',
       '--strategy', 'hybrid', '--max-tokens', '1500'],
-    { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] },
+    {
+      encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ENGRAM_HOST_AI },
+    },
   );
   if (out) process.stdout.write(out);
 } catch { /* engram down or no context — skip silently */ }
@@ -813,6 +838,7 @@ const STOP_AUTOSAVE_HOOK = `#!/usr/bin/env node
 import { spawn } from 'node:child_process';
 
 const ENGRAM_BIN = '__ENGRAM_BIN__';
+const ENGRAM_HOST_AI = '__HOST_AI__';
 
 let payload = '';
 for await (const chunk of process.stdin) payload += chunk;
@@ -824,7 +850,10 @@ try {
     (obj && typeof obj.transcript_path === 'string') ? obj.transcript_path : '';
 } catch { /* malformed stdin — skip silently */ }
 
-if (!transcriptPath) process.exit(0);
+if (!transcriptPath) {
+  __STOP_NOOP__
+  process.exit(0);
+}
 
 // Spawn detached so the Stop hook returns immediately and the user isn't
 // blocked waiting on the LLM extraction call. Stderr inherits so any
@@ -832,12 +861,16 @@ if (!transcriptPath) process.exit(0);
 // --max-bytes 200000 (~50k tokens) caps long-session cost at ~$0.05/run.
 const child = spawn(ENGRAM_BIN,
   ['autosave', transcriptPath, '--min-bytes', '500', '--max-bytes', '200000'],
-  { detached: true, stdio: ['ignore', 'ignore', 'inherit'] },
+  {
+    detached: true, stdio: ['ignore', 'ignore', 'inherit'],
+    env: { ...process.env, ENGRAM_HOST_AI },
+  },
 );
 // Without this, a missing/renamed engram binary throws an unhandled
 // 'error' event that crashes the Stop hook process.
 child.on('error', () => { /* engram missing or unspawnable — skip silently */ });
 child.unref();
+__STOP_NOOP__
 process.exit(0);
 `;
 
@@ -855,50 +888,51 @@ function resolveEngramBin(): { bin: string; resolved: boolean } {
   return { bin: 'engram', resolved: false };
 }
 
-function renderTemplate(tpl: string, engramBin: string): string {
-  return tpl.replace(/__ENGRAM_BIN__/g, engramBin);
+function renderTemplate(tpl: string, engramBin: string, hostAi: HostAi): string {
+  // Claude Stop accepts empty stdout; Codex Stop and Gemini SessionEnd do not
+  // strictly require it but Codex explicitly rejects empty Stop stdout. A
+  // `{"continue": true}` no-op is valid on all three.
+  const stopNoOp = hostAi === 'claude'
+    ? ''
+    : `process.stdout.write('{"continue": true}\\n');`;
+  return tpl
+    .replace(/__ENGRAM_BIN__/g, engramBin)
+    .replace(/__HOST_AI__/g, hostAi)
+    .replace(/__STOP_NOOP__/g, stopNoOp);
 }
 
-/** Exposed for integration tests. Render with a chosen binary path. */
-export function getHookTemplates(engramBin: string = 'engram') {
+/**
+ * Exposed for integration tests and install paths. Render hook scripts
+ * parameterized for a given host AI.
+ *
+ * Back-compat: legacy callers pass a single string (the engram binary path)
+ * and get the 'claude' variant — preserves the pre-Phase-4 signature.
+ */
+export function getHookTemplates(
+  optsOrBin: string | { engramBin: string; hostAi: HostAi } = { engramBin: 'engram', hostAi: 'claude' },
+) {
+  const { engramBin, hostAi } = typeof optsOrBin === 'string'
+    ? { engramBin: optsOrBin, hostAi: 'claude' as HostAi }
+    : optsOrBin;
   return {
-    sessionStart: renderTemplate(SESSION_START_HOOK, engramBin),
-    promptInject: renderTemplate(PROMPT_INJECT_HOOK, engramBin),
-    stopAutosave: renderTemplate(STOP_AUTOSAVE_HOOK, engramBin),
+    sessionStart: renderTemplate(SESSION_START_HOOK, engramBin, hostAi),
+    promptInject: renderTemplate(PROMPT_INJECT_HOOK, engramBin, hostAi),
+    stopAutosave: renderTemplate(STOP_AUTOSAVE_HOOK, engramBin, hostAi),
   } as const;
 }
 
 /**
- * @deprecated Contains unsubstituted `__ENGRAM_BIN__` placeholders. Tests
- * still import this for backward compat — they substitute the placeholder
- * themselves. New callers should use `getHookTemplates(bin)`.
+ * @deprecated Contains the Claude-variant substitution only. New callers
+ * should use `getHookTemplates({engramBin, hostAi})`.
  */
 export const HOOK_TEMPLATES = {
-  sessionStart: SESSION_START_HOOK,
-  promptInject: PROMPT_INJECT_HOOK,
-  stopAutosave: STOP_AUTOSAVE_HOOK,
+  sessionStart: renderTemplate(SESSION_START_HOOK, 'engram', 'claude'),
+  promptInject: renderTemplate(PROMPT_INJECT_HOOK, 'engram', 'claude'),
+  stopAutosave: renderTemplate(STOP_AUTOSAVE_HOOK, 'engram', 'claude'),
 } as const;
 
-async function offerHookInstall(dataDir: string): Promise<void> {
-  const wantHooks = await p.confirm({
-    message: 'Install auto-capture hooks for Claude Code?  (per-turn memory injection + post-session autosave)',
-    initialValue: true,
-  });
-  ensureNotCancelled(wantHooks);
-  if (!wantHooks) return;
-
-  // Resolve engram binary to an absolute path so the hooks survive PATH
-  // differences between the user's shell and Claude Code's hook environment.
-  const { bin: engramBin, resolved } = resolveEngramBin();
-  if (!resolved) {
-    p.log.warn(
-      `Could not resolve absolute path for 'engram' via PATH lookup. ` +
-      `Hooks will use bare 'engram' — they'll only work if Claude Code's ` +
-      `hook environment includes a directory containing the engram binary.`,
-    );
-  }
-
-  const tpl = getHookTemplates(engramBin);
+async function installClaudeHooks(dataDir: string, engramBin: string): Promise<void> {
+  const tpl = getHookTemplates({ engramBin, hostAi: 'claude' });
 
   const hooksDir = path.join(dataDir, 'hooks');
   fs.mkdirSync(hooksDir, { recursive: true });
@@ -917,7 +951,7 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   const stopAutosavePath = path.join(hooksDir, 'stop-autosave.mjs');
   fs.writeFileSync(stopAutosavePath, tpl.stopAutosave, { mode: 0o755 });
 
-  p.log.success(`Hook scripts written to ${hooksDir}`);
+  p.log.success(`Claude hook scripts written to ${hooksDir}`);
 
   // Merge into ~/.claude/settings.json
   const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
@@ -938,7 +972,11 @@ async function offerHookInstall(dataDir: string): Promise<void> {
     if (!Array.isArray(hooks[event])) hooks[event] = [];
     hooks[event] = (hooks[event] as Array<Record<string, unknown>>).filter(h => {
       const cmds = (h['hooks'] as Array<Record<string, unknown>>) ?? [];
-      return !cmds.some(c => typeof c['command'] === 'string' && (c['command'] as string).includes('.engram/hooks/'));
+      return !cmds.some(c => typeof c['command'] === 'string'
+        && (c['command'] as string).includes('.engram/hooks/')
+        // Only strip claude-scoped hooks here; leave codex/gemini alone
+        && !(c['command'] as string).includes('.engram/hooks/codex/')
+        && !(c['command'] as string).includes('.engram/hooks/gemini/'));
     });
     (hooks[event] as unknown[]).push(newEntry);
   }
@@ -976,10 +1014,213 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   p.log.info('SessionStart   → injects "where we left off" project context');
   p.log.info('UserPromptSubmit → fetches relevant memories for each prompt');
   p.log.info('Stop           → autosaves substance from completed sessions');
+}
 
-  // Auth preflight: the Stop hook calls `engram autosave` which auto-detects
-  // any host AI CLI (claude > codex > gemini, in that priority order) or the
-  // Anthropic SDK (requires ANTHROPIC_API_KEY). At least one must be available.
+async function installCodexHooks(dataDir: string, engramBin: string): Promise<void> {
+  const tpl = getHookTemplates({ engramBin, hostAi: 'codex' });
+  const hooksDir = path.join(dataDir, 'hooks', 'codex');
+  fs.mkdirSync(hooksDir, { recursive: true });
+
+  // Per-host-AI hook scripts — avoid collision with claude's variant which
+  // lives one directory up in ~/.engram/hooks/.
+  const sessionStartPath = path.join(hooksDir, 'session-start.mjs');
+  const promptInjectPath = path.join(hooksDir, 'prompt-inject.mjs');
+  const stopAutosavePath = path.join(hooksDir, 'stop-autosave.mjs');
+  fs.writeFileSync(sessionStartPath, tpl.sessionStart, { mode: 0o755 });
+  fs.writeFileSync(promptInjectPath, tpl.promptInject, { mode: 0o755 });
+  fs.writeFileSync(stopAutosavePath, tpl.stopAutosave, { mode: 0o755 });
+
+  p.log.success(`Codex hook scripts written to ${hooksDir}`);
+
+  // ~/.codex/hooks.json — separate file, same schema as Claude's settings.json
+  const hooksJsonPath = path.join(os.homedir(), '.codex', 'hooks.json');
+  fs.mkdirSync(path.dirname(hooksJsonPath), { recursive: true });
+  let hooksConfig: Record<string, unknown> = {};
+  if (fs.existsSync(hooksJsonPath)) {
+    try {
+      hooksConfig = JSON.parse(fs.readFileSync(hooksJsonPath, 'utf8'));
+    } catch {
+      p.log.warn(`Could not parse ${hooksJsonPath} — skipping Codex hook install.`);
+      return;
+    }
+  }
+
+  const events = (hooksConfig['hooks'] ?? {}) as Record<string, unknown[]>;
+  const mergeEvent = (name: string, entry: Record<string, unknown>): void => {
+    if (!Array.isArray(events[name])) events[name] = [];
+    // Filter prior engram entries so re-install is idempotent.
+    events[name] = (events[name] as Array<Record<string, unknown>>).filter(e => {
+      const hs = (e['hooks'] as Array<Record<string, unknown>>) ?? [];
+      return !hs.some(h => typeof h['command'] === 'string'
+        && (h['command'] as string).includes('.engram/hooks/codex/'));
+    });
+    (events[name] as unknown[]).push(entry);
+  };
+
+  mergeEvent('SessionStart', {
+    matcher: '',
+    hooks: [{ type: 'command', command: `node ${sessionStartPath}`, timeout: 10 }],
+  });
+  mergeEvent('UserPromptSubmit', {
+    matcher: '',
+    hooks: [{ type: 'command', command: `node ${promptInjectPath}`, timeout: 5 }],
+  });
+  mergeEvent('Stop', {
+    matcher: '',
+    hooks: [{ type: 'command', command: `node ${stopAutosavePath}`, timeout: 30 }],
+  });
+
+  hooksConfig['hooks'] = events;
+  fs.writeFileSync(hooksJsonPath, JSON.stringify(hooksConfig, null, 2));
+
+  // Enable the codex_hooks feature flag in config.toml.
+  enableCodexHooksFlag();
+
+  p.log.success('Codex hooks installed  (SessionStart + UserPromptSubmit + Stop)');
+}
+
+function enableCodexHooksFlag(): void {
+  const configPath = path.join(os.homedir(), '.codex', 'config.toml');
+  let toml = '';
+  if (fs.existsSync(configPath)) toml = fs.readFileSync(configPath, 'utf8');
+
+  if (/codex_hooks\s*=\s*true/.test(toml)) return; // already enabled
+
+  if (/^\[features\]/m.test(toml)) {
+    toml = toml.replace(/^\[features\]/m, '[features]\ncodex_hooks = true');
+  } else {
+    if (toml && !toml.endsWith('\n')) toml += '\n';
+    toml += '\n[features]\ncodex_hooks = true\n';
+  }
+  fs.writeFileSync(configPath, toml);
+  p.log.info('Enabled codex_hooks feature flag in ~/.codex/config.toml');
+}
+
+async function installGeminiHooks(dataDir: string, engramBin: string): Promise<void> {
+  const tpl = getHookTemplates({ engramBin, hostAi: 'gemini' });
+  const hooksDir = path.join(dataDir, 'hooks', 'gemini');
+  fs.mkdirSync(hooksDir, { recursive: true });
+
+  // Gemini v1: only SessionStart + SessionEnd autosave. There's no
+  // UserPromptSubmit equivalent — BeforeAgent fires at the right moment
+  // but its stdin doesn't include `prompt`, so prompt-inject.mjs can't
+  // work as-is. Per-turn injection on Gemini is a v2 follow-up (it'd need
+  // transcript-tail parsing).
+  const sessionStartPath = path.join(hooksDir, 'session-start.mjs');
+  const sessionEndPath = path.join(hooksDir, 'session-end-autosave.mjs');
+  fs.writeFileSync(sessionStartPath, tpl.sessionStart, { mode: 0o755 });
+  fs.writeFileSync(sessionEndPath, tpl.stopAutosave, { mode: 0o755 });
+
+  p.log.success(`Gemini hook scripts written to ${hooksDir}`);
+
+  // Gemini uses the same settings.json as MCP, under 'hooks' key.
+  const settingsPath = path.join(os.homedir(), '.gemini', 'settings.json');
+  fs.mkdirSync(path.dirname(settingsPath), { recursive: true });
+  let settings: Record<string, unknown> = {};
+  if (fs.existsSync(settingsPath)) {
+    try {
+      settings = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
+    } catch {
+      p.log.warn(`Could not parse ${settingsPath} — skipping Gemini hook install.`);
+      return;
+    }
+  }
+  const events = (settings['hooks'] ?? {}) as Record<string, unknown[]>;
+  const mergeEvent = (name: string, entry: Record<string, unknown>): void => {
+    if (!Array.isArray(events[name])) events[name] = [];
+    events[name] = (events[name] as Array<Record<string, unknown>>).filter(e => {
+      const hs = (e['hooks'] as Array<Record<string, unknown>>) ?? [];
+      return !hs.some(h => typeof h['command'] === 'string'
+        && (h['command'] as string).includes('.engram/hooks/gemini/'));
+    });
+    (events[name] as unknown[]).push(entry);
+  };
+
+  mergeEvent('SessionStart', {
+    matcher: '',
+    hooks: [{
+      name: 'engram-session-start',
+      type: 'command',
+      command: `node ${sessionStartPath}`,
+      timeout: 10000,
+    }],
+  });
+  mergeEvent('SessionEnd', {
+    matcher: '',
+    hooks: [{
+      name: 'engram-session-end-autosave',
+      type: 'command',
+      command: `node ${sessionEndPath}`,
+      timeout: 30000,
+    }],
+  });
+
+  settings['hooks'] = events;
+  fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
+
+  p.log.success('Gemini hooks installed  (SessionStart + SessionEnd autosave)');
+  p.log.info('Note: per-turn memory injection not yet supported on Gemini (TODO).');
+}
+
+function hasCliSync(name: string): boolean {
+  try {
+    execFileSync(process.platform === 'win32' ? 'where' : 'which', [name], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function offerHookInstall(dataDir: string): Promise<void> {
+  const wantHooks = await p.confirm({
+    message: 'Install auto-capture hooks for your AI CLIs?  (per-turn memory injection + post-session autosave)',
+    initialValue: true,
+  });
+  ensureNotCancelled(wantHooks);
+  if (!wantHooks) return;
+
+  // Resolve engram binary to an absolute path so the hooks survive PATH
+  // differences between the user's shell and the host AI's hook environment.
+  const { bin: engramBin, resolved } = resolveEngramBin();
+  if (!resolved) {
+    p.log.warn(
+      `Could not resolve absolute path for 'engram' via PATH lookup. ` +
+      `Hooks will use bare 'engram' — they'll only work if the host AI's ` +
+      `hook environment includes a directory containing the engram binary.`,
+    );
+  }
+
+  type HookTarget = { id: HostAi; name: string; install: () => Promise<void> };
+  const available: HookTarget[] = [];
+  if (hasCliSync('claude')) available.push({ id: 'claude', name: 'Claude Code', install: () => installClaudeHooks(dataDir, engramBin) });
+  if (hasCliSync('codex'))  available.push({ id: 'codex',  name: 'Codex CLI',   install: () => installCodexHooks(dataDir, engramBin) });
+  if (hasCliSync('gemini')) available.push({ id: 'gemini', name: 'Gemini CLI',  install: () => installGeminiHooks(dataDir, engramBin) });
+
+  if (available.length === 0) {
+    p.log.warn('None of claude/codex/gemini CLIs detected on PATH. Skipping hook install.');
+    return;
+  }
+
+  const picks = await p.multiselect<HostAi>({
+    message: 'Install hooks for which CLIs?  (space to toggle, enter to confirm)',
+    required: false,
+    initialValues: available.map(a => a.id),
+    options: available.map(a => ({ value: a.id, label: a.name })),
+  });
+  ensureNotCancelled(picks);
+
+  const picked = picks as HostAi[];
+  for (const a of available) {
+    if (picked.includes(a.id)) await a.install();
+  }
+
+  // Auth preflight: the autosave hook calls `engram autosave` which
+  // auto-detects any host AI CLI (claude > codex > gemini, in that
+  // priority order) or the Anthropic SDK (requires ANTHROPIC_API_KEY).
+  // ENGRAM_HOST_AI baked into the hook script overrides the default
+  // priority so each CLI's autosave stays on its own LLM.
   const cliChecks: Array<{ name: string; provider: string }> = [
     { name: 'claude', provider: 'claude-cli (subscription)' },
     { name: 'codex',  provider: 'codex-cli (subscription)' },
@@ -995,13 +1236,13 @@ async function offerHookInstall(dataDir: string): Promise<void> {
 
   if (found.length > 0) {
     p.log.info(`Detected: ${found.join(', ')}`);
-    p.log.info('Autosave will auto-pick the first available CLI (claude > codex > gemini).');
+    p.log.info('Each hook has ENGRAM_HOST_AI baked in so autosave stays on the right CLI.');
   } else if (process.env['ANTHROPIC_API_KEY']) {
     p.log.info('Will use ANTHROPIC_API_KEY for autosave (no host CLIs detected).');
   } else {
     p.log.warn(
       `No CLI providers and no ANTHROPIC_API_KEY — ` +
-      `the Stop autosave hook will fail until one is available.`,
+      `autosave hooks will fail until one is available.`,
     );
   }
 }

@@ -31,7 +31,7 @@ fs.writeFileSync(STUB_PATH, STUB, { mode: 0o755 });
 // Render templates with the absolute stub path baked in. This mirrors what
 // `engram onboard` does in production: it resolves `which engram` at install
 // time so the hook works under environments without the user's PATH.
-const tpl = getHookTemplates(STUB_PATH);
+const tpl = getHookTemplates({ engramBin: STUB_PATH, hostAi: 'claude' });
 
 function writeHook(name: string, body: string): string {
   const p = path.join(HOOK_DIR, name);
@@ -58,7 +58,7 @@ function runHook(
 
 describe('getHookTemplates substitution', () => {
   it('substitutes the engram binary path in all three templates', () => {
-    const t = getHookTemplates('/usr/local/bin/engram');
+    const t = getHookTemplates({ engramBin: '/usr/local/bin/engram', hostAi: 'claude' });
     expect(t.sessionStart).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
     expect(t.promptInject).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
     expect(t.stopAutosave).toContain("ENGRAM_BIN = '/usr/local/bin/engram'");
@@ -66,11 +66,72 @@ describe('getHookTemplates substitution', () => {
     expect(t.sessionStart).not.toContain('__ENGRAM_BIN__');
     expect(t.promptInject).not.toContain('__ENGRAM_BIN__');
     expect(t.stopAutosave).not.toContain('__ENGRAM_BIN__');
+    expect(t.sessionStart).not.toContain('__HOST_AI__');
+    expect(t.promptInject).not.toContain('__HOST_AI__');
+    expect(t.stopAutosave).not.toContain('__HOST_AI__');
+    expect(t.stopAutosave).not.toContain('__STOP_NOOP__');
   });
 
-  it('defaults to bare "engram" when no path is given', () => {
+  it('defaults to bare "engram" + claude when no args are given', () => {
     const t = getHookTemplates();
     expect(t.sessionStart).toContain("ENGRAM_BIN = 'engram'");
+    expect(t.sessionStart).toContain("ENGRAM_HOST_AI = 'claude'");
+  });
+
+  it('accepts the legacy single-string signature as a claude variant', () => {
+    const t = getHookTemplates('/some/bin/engram');
+    expect(t.sessionStart).toContain("ENGRAM_BIN = '/some/bin/engram'");
+    expect(t.sessionStart).toContain("ENGRAM_HOST_AI = 'claude'");
+    // Claude variant: no `{"continue": true}` no-op in the Stop template.
+    expect(t.stopAutosave).not.toContain('"continue": true');
+  });
+});
+
+describe('getHookTemplates per-host-AI variants', () => {
+  it('claude variant: Stop hook exits silently (no {"continue": true})', () => {
+    const t = getHookTemplates({ engramBin: '/bin/engram', hostAi: 'claude' });
+    expect(t.stopAutosave).not.toContain('"continue": true');
+    expect(t.sessionStart).toContain("ENGRAM_HOST_AI = 'claude'");
+    expect(t.promptInject).toContain("ENGRAM_HOST_AI = 'claude'");
+    expect(t.stopAutosave).toContain("ENGRAM_HOST_AI = 'claude'");
+  });
+
+  it('codex variant: Stop hook emits {"continue": true} (codex requires non-empty stdout)', () => {
+    const t = getHookTemplates({ engramBin: '/bin/engram', hostAi: 'codex' });
+    expect(t.stopAutosave).toContain('"continue": true');
+    expect(t.sessionStart).toContain("ENGRAM_HOST_AI = 'codex'");
+    expect(t.promptInject).toContain("ENGRAM_HOST_AI = 'codex'");
+    expect(t.stopAutosave).toContain("ENGRAM_HOST_AI = 'codex'");
+  });
+
+  it('gemini variant: Stop/SessionEnd hook emits {"continue": true} no-op (harmless)', () => {
+    const t = getHookTemplates({ engramBin: '/bin/engram', hostAi: 'gemini' });
+    expect(t.stopAutosave).toContain('"continue": true');
+    expect(t.sessionStart).toContain("ENGRAM_HOST_AI = 'gemini'");
+    expect(t.promptInject).toContain("ENGRAM_HOST_AI = 'gemini'");
+    expect(t.stopAutosave).toContain("ENGRAM_HOST_AI = 'gemini'");
+  });
+
+  it('all variants forward ENGRAM_HOST_AI via env to the engram subprocess', () => {
+    for (const hostAi of ['claude', 'codex', 'gemini'] as const) {
+      const t = getHookTemplates({ engramBin: '/bin/engram', hostAi });
+      // execFileSync / spawn options blob includes `env: { ...process.env, ENGRAM_HOST_AI }`
+      expect(t.sessionStart).toContain('ENGRAM_HOST_AI');
+      expect(t.sessionStart).toMatch(/env:\s*\{[^}]*ENGRAM_HOST_AI/);
+      expect(t.promptInject).toMatch(/env:\s*\{[^}]*ENGRAM_HOST_AI/);
+      expect(t.stopAutosave).toMatch(/env:\s*\{[^}]*ENGRAM_HOST_AI/);
+    }
+  });
+
+  it('no leftover placeholders in any variant', () => {
+    for (const hostAi of ['claude', 'codex', 'gemini'] as const) {
+      const t = getHookTemplates({ engramBin: '/bin/engram', hostAi });
+      for (const body of [t.sessionStart, t.promptInject, t.stopAutosave]) {
+        expect(body).not.toContain('__ENGRAM_BIN__');
+        expect(body).not.toContain('__HOST_AI__');
+        expect(body).not.toContain('__STOP_NOOP__');
+      }
+    }
   });
 });
 
