@@ -751,50 +751,88 @@ function quoteIfNeeded(s: string): string {
 
 // Hook scripts use execFileSync (not exec) to avoid shell injection.
 const SESSION_START_HOOK = `#!/usr/bin/env node
-// Engram SessionStart hook — injects project context from memory so the AI
-// knows "where we left off" without calling query_engram itself.
+// Engram SessionStart hook — injects "where we left off" project context.
 import { execFileSync } from 'node:child_process';
 import { basename } from 'node:path';
 
 const project = basename(process.cwd());
 try {
-  const ctx = execFileSync(
-    'engram', ['context', project, '--strategy', 'graph', '--max-tokens', '1000'],
+  // engram CLI emits the hook JSON itself when --hook-format is set.
+  // It exits 0 silently when no context is found, so the hook injects nothing.
+  const out = execFileSync(
+    'engram',
+    ['context', project, '--hook-format', 'SessionStart',
+      '--strategy', 'graph', '--max-tokens', '1000'],
     { encoding: 'utf8', timeout: 8000, stdio: ['pipe', 'pipe', 'pipe'] },
-  ).trim();
-  if (ctx && !ctx.includes('No relevant context')) {
-    const out = {
-      hookSpecificOutput: {
-        hookEventName: 'SessionStart',
-        additionalContext:
-          '[Engram Memory] Project "' + project + '" from previous sessions:\\n\\n' +
-          ctx +
-          '\\n\\nUse this to help the user. Save new substance via engram mutate_state.',
-      },
-    };
-    process.stdout.write(JSON.stringify(out));
-  }
+  );
+  if (out) process.stdout.write(out);
 } catch { /* silent — don't block session start */ }
 `;
 
-const PROMPT_NUDGE_HOOK = `#!/usr/bin/env node
-// Engram UserPromptSubmit hook — injects a brief save-reminder into every
-// turn so the AI doesn't forget to use engram for substantive work.
-const out = {
-  hookSpecificOutput: {
-    hookEventName: 'UserPromptSubmit',
-    additionalContext:
-      '[Engram] If the user just discussed a project, decision, preference, ' +
-      'insight, or progress — save it via engram mutate_state. ' +
-      'If trivial (greeting, simple Q&A), skip. Be proactive.',
-  },
-};
-process.stdout.write(JSON.stringify(out));
+const PROMPT_INJECT_HOOK = `#!/usr/bin/env node
+// Engram UserPromptSubmit hook — fetches relevant memories for the user's
+// prompt and injects them as additionalContext for THIS turn only.
+import { execFileSync } from 'node:child_process';
+
+let payload = '';
+for await (const chunk of process.stdin) payload += chunk;
+
+let prompt = '';
+try {
+  const obj = JSON.parse(payload);
+  prompt = (obj && typeof obj.prompt === 'string') ? obj.prompt : '';
+} catch { /* malformed stdin — skip silently */ }
+
+if (!prompt.trim()) process.exit(0);
+
+try {
+  const out = execFileSync(
+    'engram',
+    ['context', prompt, '--hook-format', 'UserPromptSubmit',
+      '--strategy', 'hybrid', '--max-tokens', '1500'],
+    { encoding: 'utf8', timeout: 5000, stdio: ['pipe', 'pipe', 'pipe'] },
+  );
+  if (out) process.stdout.write(out);
+} catch { /* engram down or no context — skip silently */ }
 `;
+
+const STOP_AUTOSAVE_HOOK = `#!/usr/bin/env node
+// Engram Stop hook — runs after the session ends. Reads the transcript and
+// extracts substance to save persistently via the host AI's light model.
+import { spawn } from 'node:child_process';
+
+let payload = '';
+for await (const chunk of process.stdin) payload += chunk;
+
+let transcriptPath = '';
+try {
+  const obj = JSON.parse(payload);
+  transcriptPath =
+    (obj && typeof obj.transcript_path === 'string') ? obj.transcript_path : '';
+} catch { /* malformed stdin — skip silently */ }
+
+if (!transcriptPath) process.exit(0);
+
+// Spawn detached so the Stop hook returns immediately and the user isn't
+// blocked waiting on the LLM extraction call. Stderr inherits so any
+// auth/parse failure is visible in the user's terminal.
+const child = spawn('engram',
+  ['autosave', transcriptPath, '--min-bytes', '500'],
+  { detached: true, stdio: ['ignore', 'ignore', 'inherit'] },
+);
+child.unref();
+process.exit(0);
+`;
+
+export const HOOK_TEMPLATES = {
+  sessionStart: SESSION_START_HOOK,
+  promptInject: PROMPT_INJECT_HOOK,
+  stopAutosave: STOP_AUTOSAVE_HOOK,
+} as const;
 
 async function offerHookInstall(dataDir: string): Promise<void> {
   const wantHooks = await p.confirm({
-    message: 'Install auto-capture hooks for Claude Code?  (injects memory context + save reminders per turn)',
+    message: 'Install auto-capture hooks for Claude Code?  (per-turn memory injection + post-session autosave)',
     initialValue: true,
   });
   ensureNotCancelled(wantHooks);
@@ -803,12 +841,19 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   const hooksDir = path.join(dataDir, 'hooks');
   fs.mkdirSync(hooksDir, { recursive: true });
 
+  // Cleanup orphaned Phase 1 hook (replaced by prompt-inject.mjs).
+  const orphaned = path.join(hooksDir, 'prompt-nudge.mjs');
+  if (fs.existsSync(orphaned)) fs.rmSync(orphaned);
+
   // Write hook scripts
   const sessionStartPath = path.join(hooksDir, 'session-start.mjs');
   fs.writeFileSync(sessionStartPath, SESSION_START_HOOK, { mode: 0o755 });
 
-  const promptNudgePath = path.join(hooksDir, 'prompt-nudge.mjs');
-  fs.writeFileSync(promptNudgePath, PROMPT_NUDGE_HOOK, { mode: 0o755 });
+  const promptInjectPath = path.join(hooksDir, 'prompt-inject.mjs');
+  fs.writeFileSync(promptInjectPath, PROMPT_INJECT_HOOK, { mode: 0o755 });
+
+  const stopAutosavePath = path.join(hooksDir, 'stop-autosave.mjs');
+  fs.writeFileSync(stopAutosavePath, STOP_AUTOSAVE_HOOK, { mode: 0o755 });
 
   p.log.success(`Hook scripts written to ${hooksDir}`);
 
@@ -848,16 +893,25 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   mergeHookEntry('UserPromptSubmit', {
     hooks: [{
       type: 'command',
-      command: `node ${promptNudgePath}`,
+      command: `node ${promptInjectPath}`,
       timeout: 5,
       async: true,
+    }],
+  });
+
+  mergeHookEntry('Stop', {
+    hooks: [{
+      type: 'command',
+      command: `node ${stopAutosavePath}`,
+      timeout: 30,
     }],
   });
 
   settings['hooks'] = hooks;
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2));
 
-  p.log.success('Claude Code hooks installed  (SessionStart + UserPromptSubmit)');
-  p.log.info('SessionStart → injects "where we left off" project context');
-  p.log.info('UserPromptSubmit → reminds AI to save substance each turn');
+  p.log.success('Claude Code hooks installed  (SessionStart + UserPromptSubmit + Stop)');
+  p.log.info('SessionStart   → injects "where we left off" project context');
+  p.log.info('UserPromptSubmit → fetches relevant memories for each prompt');
+  p.log.info('Stop           → autosaves substance from completed sessions (needs ANTHROPIC_API_KEY)');
 }
