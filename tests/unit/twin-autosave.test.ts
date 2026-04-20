@@ -1,6 +1,11 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { ExtractionSchema, validateExtraction } from '../../src/twin/schema.js';
 import { extractWithProvider, ExtractionParseError } from '../../src/twin/providers.js';
+import { runAutosave } from '../../src/twin/autosave.js';
+import { loadConfig } from '../../src/config/index.js';
+import { createEngramServer, type EngramServer } from '../../src/server.js';
+import path from 'node:path';
+import fs from 'node:fs';
 
 describe('twin extraction schema', () => {
   it('accepts a well-formed extraction', () => {
@@ -232,5 +237,130 @@ describe('twin providers', () => {
     });
     expect(capturedArgs!['temperature']).toBe(0);
     expect(capturedArgs!['max_tokens']).toBe(4000);
+  });
+});
+
+const TEST_DATA_DIR = path.join(import.meta.dirname, '..', '.test-data', 'twin-autosave');
+
+describe('runAutosave', () => {
+  let engram: EngramServer;
+  let transcriptPath: string;
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DATA_DIR)) fs.rmSync(TEST_DATA_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DATA_DIR, { recursive: true });
+    const config = loadConfig({ dataDir: TEST_DATA_DIR });
+    engram = createEngramServer(config);
+    transcriptPath = path.join(TEST_DATA_DIR, 'transcript.txt');
+  });
+
+  afterEach(() => {
+    engram.close();
+    if (fs.existsSync(TEST_DATA_DIR)) fs.rmSync(TEST_DATA_DIR, { recursive: true });
+  });
+
+  it('creates new nodes from extraction', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500)); // big enough to pass min-bytes
+    const report = await runAutosave({
+      core: engram,
+      transcriptPath,
+      provider: 'anthropic',
+      extractFn: async () => ({
+        items: [{
+          kind: 'preference', name: 'Tabs over spaces',
+          summary: 'User prefers tabs', properties: {}, confidence: 0.95, links: [],
+        }],
+      }),
+    });
+    expect(report.created).toBe(1);
+    expect(report.updated).toBe(0);
+    expect(engram.stateTree.getNodeByName('Tabs over spaces')).not.toBeNull();
+  });
+
+  it('updates existing node instead of duplicating', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    const item = {
+      kind: 'preference' as const, name: 'Use bun',
+      summary: 'first save', properties: {}, confidence: 0.8, links: [],
+    };
+    await runAutosave({ core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({ items: [item] }) });
+    const report = await runAutosave({ core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({ items: [{ ...item, summary: 'updated save' }] }) });
+    expect(report.created).toBe(0);
+    expect(report.updated).toBe(1);
+    const node = engram.stateTree.getNodeByName('Use bun');
+    expect(node?.summary).toBe('updated save');
+  });
+
+  it('skips when transcript is too small', async () => {
+    fs.writeFileSync(transcriptPath, 'tiny');
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => { throw new Error('should not be called'); },
+      minTranscriptBytes: 100,
+    });
+    expect(report.skipped).toBe(1);
+    expect(report.created).toBe(0);
+  });
+
+  it('returns zero counts when extraction is empty', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({ items: [] }),
+    });
+    expect(report.created).toBe(0);
+    expect(report.updated).toBe(0);
+  });
+
+  it('creates links between extracted items when targets exist', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    // Pre-create the target node so the link target_name resolves
+    engram.stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram', summary: 'memory system' },
+    ]);
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({
+        items: [{
+          kind: 'decision', name: 'Use SQLite',
+          summary: 'chose SQLite', properties: {}, confidence: 0.9,
+          links: [{ predicate: 'decided_in', target_name: 'Engram' }],
+        }],
+      }),
+    });
+    expect(report.created).toBe(1);
+    expect(report.linksCreated).toBe(1);
+  });
+
+  it('records error but continues when one item fails', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    const report = await runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => ({
+        items: [
+          { kind: 'fact', name: 'good item',
+            summary: 'ok', properties: {}, confidence: 0.5, links: [] },
+          { kind: 'fact', name: 'item with bad link',
+            summary: 'has missing target', properties: {}, confidence: 0.5,
+            links: [{ predicate: 'rel', target_name: 'definitely-not-in-db' }] },
+        ],
+      }),
+    });
+    expect(report.created).toBe(2);
+    // Bad link silently skipped (target missing) — not an error
+    expect(report.linksCreated).toBe(0);
+  });
+
+  it('logs raw text when provider throws ExtractionParseError', async () => {
+    fs.writeFileSync(transcriptPath, 'A'.repeat(500));
+    const { ExtractionParseError } = await import('../../src/twin/providers.js');
+    await expect(runAutosave({
+      core: engram, transcriptPath, provider: 'anthropic',
+      extractFn: async () => {
+        throw new ExtractionParseError('bad json', '{ broken');
+      },
+    })).rejects.toThrow(/bad json/);
   });
 });
