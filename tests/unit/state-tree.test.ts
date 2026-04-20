@@ -364,4 +364,43 @@ describe('StateTree - Edge Operations', () => {
     const after = stateTree.getNode(firstId)!;
     expect(after.confidence).toBe(0.9);
   });
+
+  it('auto-merges intra-batch duplicate creates in the same mutate() call', () => {
+    // Both creates land in one transaction — the second must see the first
+    // (not yet committed to the DB) and merge into it, otherwise we'd produce
+    // two rows for one concept.
+    const res = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram', properties: { a: 1 } },
+      { op: 'create', type: 'project', name: 'engram', properties: { b: 2 } },
+    ]);
+
+    expect(res.results).toHaveLength(2);
+    expect(res.results[0].auto_merged).toBeUndefined();
+    expect(res.results[1].auto_merged).toBe(true);
+    expect(res.results[1].matched_by).toBe('exact');
+    expect(res.results[1].node_id).toBe(res.results[0].node_id);
+
+    // Exactly one project-typed node for this concept
+    const all = stateTree.getNodesByType('project');
+    const engramNodes = all.filter(n => n.name.toLowerCase() === 'engram');
+    expect(engramNodes).toHaveLength(1);
+    expect(engramNodes[0]!.properties).toEqual({ a: 1, b: 2 });
+  });
+
+  it('records auto_merges in the event log for audit', () => {
+    stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram' },
+    ]);
+    const { event_id } = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'engram', properties: { x: 1 } },
+    ]);
+
+    const ev = eventLog.queryByType('mutation').find(e => e.id === event_id);
+    expect(ev).toBeDefined();
+    const content = ev!.content as { auto_merges?: Array<{ matched_by: string; requested_name: string }> };
+    expect(content.auto_merges).toBeDefined();
+    expect(content.auto_merges!).toHaveLength(1);
+    expect(content.auto_merges![0]!.requested_name).toBe('engram');
+    expect(content.auto_merges![0]!.matched_by).toBe('exact');
+  });
 });

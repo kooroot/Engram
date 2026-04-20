@@ -220,16 +220,31 @@ export class StateTree {
     const affectedNodeIds: string[] = [];
     const historyRowIds: Array<number | bigint> = []; // M8: track exact history rows to attach event_id to
 
+    // Phase 6a — auto-dedup bookkeeping
+    // Prepared once per batch; reused across all 'create' ops (avoids re-preparing in a loop).
+    const getSameTypeActiveStmt = this.db.prepare(
+      'SELECT * FROM nodes WHERE type = ? AND namespace = ? AND archived = 0'
+    );
+    // Tracks nodes created THIS batch so a later op in the same mutate() call can dedup into them.
+    // Without this, `mutate([create A, create A])` would silently insert two rows before the txn commits.
+    const batchInserted: Array<{ id: string; type: string; name: string; version: number }> = [];
+    // Merge outcomes to append to the event log so the audit trail distinguishes
+    // "agent asked for create, got a new node" from "agent asked for create, got silently merged".
+    const autoMerges: Array<{
+      requested_name: string;
+      merged_into_id: string;
+      matched_by: 'exact' | 'substring' | 'jaccard';
+    }> = [];
+
     const mutationTxn = this.db.transaction(() => {
       for (const op of operations) {
         switch (op.op) {
           case 'create': {
             // Auto-dedup: same-type scan for a normalized-name match before insert.
             // Phase 6a — agents can't be trusted to always query before creating,
-            // so engram enforces "one concept, one node" here.
-            const existingSameType = this.db.prepare(
-              'SELECT * FROM nodes WHERE type = ? AND namespace = ? AND archived = 0'
-            ).all(op.type, this.namespace) as NodeRow[];
+            // so engram enforces "one concept, one node" here. Scans both the DB
+            // AND this batch's accumulated inserts (so intra-batch duplicates also merge).
+            const existingSameType = getSameTypeActiveStmt.all(op.type, this.namespace) as NodeRow[];
 
             let dedupMatch: { row: NodeRow; reason: 'exact' | 'substring' | 'jaccard' } | null = null;
             for (const row of existingSameType) {
@@ -238,6 +253,24 @@ export class StateTree {
                 { name: row.name, type: row.type },
               );
               if (m) { dedupMatch = { row, reason: m.reason }; break; }
+            }
+            // Batch-internal scan: a same-batch earlier create of the same concept
+            // hasn't been committed yet, so it wasn't in the DB query above.
+            if (!dedupMatch) {
+              for (const pending of batchInserted) {
+                if (pending.type !== op.type) continue;
+                const m = isDedupCandidate(
+                  { name: op.name, type: op.type },
+                  { name: pending.name, type: pending.type },
+                );
+                if (m) {
+                  // Hydrate the just-inserted row so the merge branch below can treat
+                  // it uniformly with a DB-sourced row.
+                  const row = this.getNodeByIdStmt.get(pending.id, this.namespace) as NodeRow | undefined;
+                  if (row) { dedupMatch = { row, reason: m.reason }; }
+                  break;
+                }
+              }
             }
 
             if (dedupMatch) {
@@ -265,16 +298,26 @@ export class StateTree {
                 namespace: this.namespace,
               });
 
+              const newVersion = existing.version + 1;
               const mergedResult: MutationResult = {
                 op: 'update',
                 node_id: existing.id,
-                version: existing.version + 1,
+                version: newVersion,
                 auto_merged: true,
                 matched_by: dedupMatch.reason,
                 ...(op.name !== existing.name ? { requested_name: op.name } : {}),
               };
               results.push(mergedResult);
               affectedNodeIds.push(existing.id);
+              autoMerges.push({
+                requested_name: op.name,
+                merged_into_id: existing.id,
+                matched_by: dedupMatch.reason,
+              });
+              // Keep batch-internal view consistent if this existing row was itself
+              // inserted earlier in the same batch.
+              const batchIdx = batchInserted.findIndex(p => p.id === existing.id);
+              if (batchIdx >= 0) batchInserted[batchIdx]!.version = newVersion;
               break;
             }
 
@@ -292,6 +335,7 @@ export class StateTree {
             });
             results.push({ op: 'create', node_id: id, version: 1 });
             affectedNodeIds.push(id);
+            batchInserted.push({ id, type: op.type, name: op.name, version: 1 });
             break;
           }
           case 'update': {
@@ -354,7 +398,9 @@ export class StateTree {
     const event = this.eventLog.append({
       type: 'mutation',
       source: 'agent',
-      content: { operations },
+      content: autoMerges.length > 0
+        ? { operations, auto_merges: autoMerges }
+        : { operations },
       state_ref: affectedNodeIds,
     });
 
