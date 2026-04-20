@@ -13,6 +13,7 @@ import type {
 import { nodeFromRow, edgeFromRow } from '../types/index.js';
 import { safeJsonParse } from '../utils.js';
 import { metrics, startTimer, safeNamespaceLabel } from '../metrics.js';
+import { isDedupCandidate } from '../engine/dedup.js';
 import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
@@ -223,6 +224,61 @@ export class StateTree {
       for (const op of operations) {
         switch (op.op) {
           case 'create': {
+            // Auto-dedup: same-type scan for a normalized-name match before insert.
+            // Phase 6a — agents can't be trusted to always query before creating,
+            // so engram enforces "one concept, one node" here.
+            const existingSameType = this.db.prepare(
+              'SELECT * FROM nodes WHERE type = ? AND namespace = ? AND archived = 0'
+            ).all(op.type, this.namespace) as NodeRow[];
+
+            let dedupMatch: { row: NodeRow; reason: 'exact' | 'substring' | 'jaccard' } | null = null;
+            for (const row of existingSameType) {
+              const m = isDedupCandidate(
+                { name: op.name, type: op.type },
+                { name: row.name, type: row.type },
+              );
+              if (m) { dedupMatch = { row, reason: m.reason }; break; }
+            }
+
+            if (dedupMatch) {
+              const existing = dedupMatch.row;
+              const histResult = this.insertHistoryStmt.run({
+                node_id: existing.id,
+                version: existing.version,
+                properties: existing.properties,
+                changed_by: null,
+                namespace: this.namespace,
+              });
+              historyRowIds.push(histResult.lastInsertRowid);
+
+              const currentProps = safeJsonParse(existing.properties);
+              const mergedProps = { ...currentProps, ...(op.properties ?? {}) };
+              const mergedConfidence = Math.max(existing.confidence ?? 0, op.confidence ?? 0);
+
+              this.updateNodeStmt.run({
+                id: existing.id,
+                name: existing.name, // keep canonical existing name
+                properties: JSON.stringify(mergedProps),
+                summary: op.summary ?? existing.summary,
+                confidence: mergedConfidence,
+                event_id: null,
+                namespace: this.namespace,
+              });
+
+              const mergedResult: MutationResult = {
+                op: 'update',
+                node_id: existing.id,
+                version: existing.version + 1,
+                auto_merged: true,
+                matched_by: dedupMatch.reason,
+                ...(op.name !== existing.name ? { requested_name: op.name } : {}),
+              };
+              results.push(mergedResult);
+              affectedNodeIds.push(existing.id);
+              break;
+            }
+
+            // No dedup match → normal create
             const id = ulid();
             this.insertNodeStmt.run({
               id,

@@ -71,6 +71,12 @@ export interface MutationResult {
   op: string;
   node_id: string;
   version: number;
+  /** True if a `create` was auto-converted to an update on a matching node. */
+  auto_merged?: boolean;
+  /** Why the dedup matched — only set when auto_merged is true. */
+  matched_by?: 'exact' | 'substring' | 'jaccard';
+  /** The name requested by the caller (differs from canonical node name when auto-merged). */
+  requested_name?: string;
 }
 
 export interface LinkResult {

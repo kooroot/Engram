@@ -270,4 +270,98 @@ describe('StateTree - Edge Operations', () => {
     const mutations = eventLog.queryByType('mutation');
     expect(mutations.length).toBeGreaterThanOrEqual(2);
   });
+
+  // ─── Phase 6a: auto-dedup on mutate_state create ────────────────
+
+  it('auto-merges duplicate creates with the same exact name', () => {
+    const first = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram', properties: { a: 1 } },
+    ]);
+    const firstId = first.results[0].node_id;
+
+    const second = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram', properties: { b: 2 } },
+    ]);
+
+    expect(second.results).toHaveLength(1);
+    expect(second.results[0].auto_merged).toBe(true);
+    expect(second.results[0].matched_by).toBe('exact');
+    expect(second.results[0].node_id).toBe(firstId);
+    expect(second.results[0].op).toBe('update');
+    expect(second.results[0].version).toBe(2);
+
+    const node = stateTree.getNode(firstId);
+    expect(node).not.toBeNull();
+    expect(node!.properties).toEqual({ a: 1, b: 2 });
+  });
+
+  it('auto-merges via substring match and keeps canonical existing name', () => {
+    const first = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'engram', summary: 'original' },
+    ]);
+    const firstId = first.results[0].node_id;
+
+    const second = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'Engram Twin Mode', properties: { mode: 'twin' } },
+    ]);
+
+    expect(second.results[0].auto_merged).toBe(true);
+    expect(second.results[0].matched_by).toBe('substring');
+    expect(second.results[0].node_id).toBe(firstId);
+    expect(second.results[0].requested_name).toBe('Engram Twin Mode');
+
+    const node = stateTree.getNode(firstId);
+    // Canonical existing name is preserved
+    expect(node!.name).toBe('engram');
+    expect(node!.properties).toEqual({ mode: 'twin' });
+  });
+
+  it('allows same name across different types (type gate)', () => {
+    const a = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'bun' },
+    ]);
+    const b = stateTree.mutate([
+      { op: 'create', type: 'preference', name: 'bun' },
+    ]);
+
+    expect(a.results[0].auto_merged).toBeUndefined();
+    expect(b.results[0].auto_merged).toBeUndefined();
+    expect(a.results[0].node_id).not.toBe(b.results[0].node_id);
+
+    // Both should exist independently
+    expect(stateTree.getNode(a.results[0].node_id)).not.toBeNull();
+    expect(stateTree.getNode(b.results[0].node_id)).not.toBeNull();
+  });
+
+  it('merges properties (new wins) and takes max of confidences on auto-merge', () => {
+    const first = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'GraphDB',
+        properties: { keep: 'original', overwrite: 'old' },
+        confidence: 0.5 },
+    ]);
+    const firstId = first.results[0].node_id;
+
+    const second = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'GraphDB',
+        properties: { overwrite: 'new', extra: 'added' },
+        confidence: 0.9 },
+    ]);
+
+    expect(second.results[0].auto_merged).toBe(true);
+    const node = stateTree.getNode(firstId)!;
+    expect(node.properties).toEqual({
+      keep: 'original',
+      overwrite: 'new',
+      extra: 'added',
+    });
+    expect(node.confidence).toBe(0.9);
+
+    // Third create with LOWER confidence → should not drop confidence below existing max
+    const third = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'GraphDB', confidence: 0.3 },
+    ]);
+    expect(third.results[0].auto_merged).toBe(true);
+    const after = stateTree.getNode(firstId)!;
+    expect(after.confidence).toBe(0.9);
+  });
 });
