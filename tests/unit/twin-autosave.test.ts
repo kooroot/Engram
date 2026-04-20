@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ExtractionSchema, validateExtraction } from '../../src/twin/schema.js';
-import { extractWithProvider } from '../../src/twin/providers.js';
+import { extractWithProvider, ExtractionParseError } from '../../src/twin/providers.js';
 
 describe('twin extraction schema', () => {
   it('accepts a well-formed extraction', () => {
@@ -149,5 +149,88 @@ describe('twin providers', () => {
       transcript: 'x',
       client: fakeClient as any,
     })).rejects.toThrow(/no text content/);
+  });
+
+  it('strips bare ``` fences (no language tag)', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({
+          content: [{ type: 'text', text: '```\n{"items":[]}\n```' }],
+        }),
+      },
+    };
+    const result = await extractWithProvider({
+      provider: 'anthropic', transcript: 'x', client: fakeClient as any,
+    });
+    expect(result.items).toEqual([]);
+  });
+
+  it('strips ```javascript and other tag variants', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({
+          content: [{ type: 'text', text: '```javascript\n{"items":[]}\n```' }],
+        }),
+      },
+    };
+    const result = await extractWithProvider({
+      provider: 'anthropic', transcript: 'x', client: fakeClient as any,
+    });
+    expect(result.items).toEqual([]);
+  });
+
+  it('wraps JSON.parse failure in ExtractionParseError with raw text', async () => {
+    const garbage = '{ "items": [ { not valid json';
+    const fakeClient = {
+      messages: {
+        create: async () => ({ content: [{ type: 'text', text: garbage }] }),
+      },
+    };
+    try {
+      await extractWithProvider({
+        provider: 'anthropic', transcript: 'x', client: fakeClient as any,
+      });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as ExtractionParseError).rawText).toBe(garbage);
+      expect((err as Error).message).toMatch(/JSON.parse failed/);
+    }
+  });
+
+  it('wraps schema-violation in ExtractionParseError with raw text', async () => {
+    const text = JSON.stringify({ items: [{ kind: 'banana' }] });
+    const fakeClient = {
+      messages: {
+        create: async () => ({ content: [{ type: 'text', text }] }),
+      },
+    };
+    try {
+      await extractWithProvider({
+        provider: 'anthropic', transcript: 'x', client: fakeClient as any,
+      });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as ExtractionParseError).rawText).toBe(text);
+      expect((err as Error).message).toMatch(/Schema validation failed/);
+    }
+  });
+
+  it('passes temperature: 0 and max_tokens: 4000 to the SDK', async () => {
+    let capturedArgs: Record<string, unknown> | null = null;
+    const fakeClient = {
+      messages: {
+        create: async (args: Record<string, unknown>) => {
+          capturedArgs = args;
+          return { content: [{ type: 'text', text: '{"items":[]}' }] };
+        },
+      },
+    };
+    await extractWithProvider({
+      provider: 'anthropic', transcript: 'x', client: fakeClient as any,
+    });
+    expect(capturedArgs!['temperature']).toBe(0);
+    expect(capturedArgs!['max_tokens']).toBe(4000);
   });
 });

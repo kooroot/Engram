@@ -42,6 +42,30 @@ export interface ExtractOptions {
   model?: string;
 }
 
+/**
+ * Error thrown when the provider returned text but it could not be parsed
+ * or did not match the schema. Carries a snippet of the raw response so the
+ * caller can log it for debugging — without this the failure is opaque.
+ */
+export class ExtractionParseError extends Error {
+  constructor(
+    message: string,
+    readonly rawText: string,
+    readonly cause?: unknown,
+  ) {
+    super(message);
+    this.name = 'ExtractionParseError';
+  }
+}
+
+const RAW_SNIPPET_BYTES = 500;
+
+function snippet(text: string): string {
+  return text.length <= RAW_SNIPPET_BYTES
+    ? text
+    : text.slice(0, RAW_SNIPPET_BYTES) + `… (truncated, total ${text.length} chars)`;
+}
+
 export async function extractWithProvider(opts: ExtractOptions): Promise<Extraction> {
   if (opts.provider !== 'anthropic') {
     throw new Error(`Provider not yet implemented: ${opts.provider}`);
@@ -51,7 +75,8 @@ export async function extractWithProvider(opts: ExtractOptions): Promise<Extract
 
   const resp = await client.messages.create({
     model: opts.model ?? 'claude-haiku-4-5',
-    max_tokens: 2000,
+    max_tokens: 4000,
+    temperature: 0,
     system: EXTRACTION_PROMPT,
     messages: [{ role: 'user', content: opts.transcript }],
   });
@@ -60,7 +85,28 @@ export async function extractWithProvider(opts: ExtractOptions): Promise<Extract
     | { type: 'text'; text: string } | undefined;
   if (!block) throw new Error('Provider returned no text content');
 
-  const cleaned = block.text.trim().replace(/^```json\s*/i, '').replace(/```$/, '').trim();
-  const parsed = JSON.parse(cleaned);
-  return validateExtraction(parsed);
+  // Strip optional opening fence (```json, ```javascript, or bare ```) and closing fence.
+  const cleaned = block.text
+    .trim()
+    .replace(/^```[a-zA-Z0-9_-]*\s*\r?\n?/, '')
+    .replace(/\r?\n?```$/, '')
+    .trim();
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(cleaned);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `JSON.parse failed: ${(err as Error).message}. Raw: ${snippet(block.text)}`,
+      block.text, err,
+    );
+  }
+  try {
+    return validateExtraction(parsed);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `Schema validation failed: ${(err as Error).message}. Raw: ${snippet(block.text)}`,
+      block.text, err,
+    );
+  }
 }
