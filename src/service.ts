@@ -13,6 +13,7 @@ import { VectorStore } from './db/vector-store.js';
 import { UsageLog } from './db/usage-log.js';
 import { EngineCache } from './engine/cache.js';
 import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/maintenance.js';
+import { runDedupPass, type DedupPassReport } from './engine/dedup-scan.js';
 import { traverseGraph } from './engine/graph-traversal.js';
 import { buildContext } from './engine/context-builder.js';
 import type { Node, Edge, Event, EventType } from './types/index.js';
@@ -543,14 +544,34 @@ function expand(
 export function runMaintenanceCycle(
   core: EngramCore,
   dryRun: boolean = false,
-): MaintenanceReport & StatusInfo {
+  opts: { dedup?: boolean } = {},
+): MaintenanceReport & StatusInfo & { dedup?: DedupPassReport } {
   const statsBefore = getStatus(core);
 
   if (dryRun) {
-    return { decayed: 0, archived: 0, orphansDetected: 0, ...statsBefore };
+    const dryReport: MaintenanceReport = { decayed: 0, archived: 0, orphansDetected: 0 };
+    if (opts.dedup) {
+      const dedup = runDedupPass(
+        core.db,
+        core.config.namespace,
+        (s, t) => core.stateTree.mergeNodes(s, t),
+        true,
+      );
+      return { ...dryReport, ...statsBefore, dedup };
+    }
+    return { ...dryReport, ...statsBefore };
   }
 
   const report = runMaintenance(core.db, core.config.namespace, core.config.maintenance);
+  let dedup: DedupPassReport | undefined;
+  if (opts.dedup) {
+    dedup = runDedupPass(
+      core.db,
+      core.config.namespace,
+      (s, t) => core.stateTree.mergeNodes(s, t),
+      false,
+    );
+  }
   const statsAfter = getStatus(core);
-  return { ...report, ...statsAfter };
+  return { ...report, ...statsAfter, ...(dedup ? { dedup } : {}) };
 }

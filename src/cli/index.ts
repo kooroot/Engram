@@ -413,8 +413,9 @@ export function registerCLICommands(program: Command): void {
     .command('maintenance')
     .description('Run maintenance cycle (decay, archive, orphan cleanup)')
     .option('-d, --dry-run', 'Preview without making changes')
+    .option('--dedup', 'Also run retroactive dedup (Tier 1 heuristic: same-type + normalized-name / token-subset / Jaccard ≥ 0.7)')
     .action((opts) => withCore((core) => {
-      const report = svc.runMaintenanceCycle(core, opts.dryRun ?? false);
+      const report = svc.runMaintenanceCycle(core, opts.dryRun ?? false, { dedup: opts.dedup });
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     }, ns())());
 

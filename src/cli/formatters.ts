@@ -187,6 +187,18 @@ export function formatMaintenanceReport(report: {
   activeNodes: number;
   activeEdges: number;
   totalEvents: number;
+  dedup?: {
+    clusters: Array<{
+      type: string;
+      target_id: string;
+      target_name: string;
+      sources: Array<{ id: string; name: string; matched_by: string; score: number }>;
+    }>;
+    merged_count: number;
+    merged_edges: number;
+    dedup_edges: number;
+    failed: Array<{ source_id: string; target_id: string; error: string }>;
+  };
 }, dryRun: boolean): string {
   const prefix = dryRun ? chalk.yellow('[DRY RUN] ') : '';
   const lines = [
@@ -200,6 +212,35 @@ export function formatMaintenanceReport(report: {
     `  Active edges       ${report.activeEdges}`,
     `  Total events       ${report.totalEvents}`,
   ];
+
+  if (report.dedup) {
+    lines.push(chalk.dim('─'.repeat(40)));
+    const d = report.dedup;
+    lines.push(chalk.bold(`  Dedup — ${d.clusters.length} cluster(s)`));
+    if (dryRun) {
+      const pending = d.clusters.reduce((n, c) => n + c.sources.length, 0);
+      lines.push(`  Would merge        ${pending} source node(s)`);
+    } else {
+      lines.push(`  Merged             ${d.merged_count} source node(s)`);
+      lines.push(`  Edges re-pointed   ${d.merged_edges}`);
+      lines.push(`  Edges deduplicated ${d.dedup_edges}`);
+      if (d.failed.length > 0) {
+        lines.push(chalk.red(`  Failed merges      ${d.failed.length}`));
+        for (const f of d.failed) {
+          lines.push(chalk.red(`    ${f.source_id} → ${f.target_id}: ${f.error}`));
+        }
+      }
+    }
+    if (d.clusters.length > 0) {
+      lines.push(chalk.dim('  Clusters:'));
+      for (const c of d.clusters) {
+        lines.push(`    [${c.type}] ${chalk.cyan(c.target_name)} ← ${c.sources.length} dup(s)`);
+        for (const s of c.sources) {
+          lines.push(chalk.dim(`      • ${s.name}  (${s.matched_by}, score ${s.score.toFixed(2)})`));
+        }
+      }
+    }
+  }
   return lines.join('\n');
 }
 
