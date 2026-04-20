@@ -37,19 +37,21 @@ If nothing substantive was discussed, return { "items": [] }.`;
 
 /**
  * Hand-written JSON Schema for the `claude --json-schema` flag. Mirrors the
- * Extraction shape but slightly looser (e.g. additionalProperties allowed on
- * `properties`) — strict validation still happens via `validateExtraction()`
- * after parsing, so this is defense-in-depth at the model boundary, not the
- * trust boundary.
+ * Extraction shape — `additionalProperties: false` at every level matches
+ * Zod's `.strict()` so model output approved by Claude can't surprise the
+ * downstream `validateExtraction()` step. The `properties` field is the one
+ * exception because it's user-defined free-form metadata.
  */
 const EXTRACTION_JSON_SCHEMA = {
   type: 'object',
+  additionalProperties: false,
   properties: {
     items: {
       type: 'array',
       maxItems: 50,
       items: {
         type: 'object',
+        additionalProperties: false,
         properties: {
           kind: { type: 'string', enum: ['decision', 'preference', 'fact', 'insight', 'person', 'project_update'] },
           name: { type: 'string', minLength: 1 },
@@ -61,6 +63,7 @@ const EXTRACTION_JSON_SCHEMA = {
             maxItems: 20,
             items: {
               type: 'object',
+              additionalProperties: false,
               properties: {
                 predicate: { type: 'string', minLength: 1 },
                 target_name: { type: 'string', minLength: 1 },
@@ -92,6 +95,8 @@ export interface ExtractOptions {
 export type SpawnFn = (
   cmd: string,
   args: string[],
+  /** Bytes piped to the child's stdin (used for the transcript). */
+  input?: string,
 ) => { stdout: string; stderr: string; status: number | null };
 
 /**
@@ -201,19 +206,31 @@ export interface ExtractClaudeCliOptions {
  * subscription auth and the CLI returns "Not logged in".
  */
 export function extractClaudeCli(opts: ExtractClaudeCliOptions): Extraction {
+  // Transcript goes via stdin, not argv. macOS ARG_MAX is ~256KB so passing
+  // a large transcript as a positional arg fails with E2BIG when users raise
+  // --max-bytes. Stdin has no such limit. The -p arg is the user message;
+  // the transcript content is what the model analyzes.
   const args = [
     '--print',
     '--model', opts.model ?? 'claude-haiku-4-5',
     '--system-prompt', EXTRACTION_PROMPT,
     '--output-format', 'json',
     '--json-schema', JSON.stringify(EXTRACTION_JSON_SCHEMA),
-    opts.transcript,
+    'Extract substance from the transcript piped on stdin.',
   ];
 
-  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a) => {
+  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a, input) => {
+    // Scrub ANTHROPIC_API_KEY so the claude CLI uses subscription auth, not
+    // metered API auth. Without this, users with both auth modes would get
+    // surprise API charges. They can still force API auth by passing
+    // --provider anthropic.
+    const childEnv = { ...process.env };
+    delete childEnv['ANTHROPIC_API_KEY'];
     const r = spawnSync(cmd, a, {
       encoding: 'utf8',
       maxBuffer: 16 * 1024 * 1024,
+      env: childEnv,
+      ...(input !== undefined ? { input } : {}),
     });
     return {
       stdout: r.stdout ?? '',
@@ -222,7 +239,7 @@ export function extractClaudeCli(opts: ExtractClaudeCliOptions): Extraction {
     };
   });
 
-  const result = fn('claude', args);
+  const result = fn('claude', args, opts.transcript);
 
   if (result.status !== 0) {
     throw new ExtractionParseError(

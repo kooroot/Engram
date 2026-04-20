@@ -342,10 +342,10 @@ describe('extractClaudeCli', () => {
     }
   });
 
-  it('passes transcript and model through to spawnFn args', () => {
-    let captured: { cmd: string; args: string[] } | null = null;
-    const spawnFn: SpawnFn = (cmd, args) => {
-      captured = { cmd, args };
+  it('passes model through args and transcript via stdin', () => {
+    let captured: { cmd: string; args: string[]; input?: string } | null = null;
+    const spawnFn: SpawnFn = (cmd, args, input) => {
+      captured = { cmd, args, ...(input !== undefined ? { input } : {}) };
       return {
         stdout: JSON.stringify({ is_error: false, structured_output: { items: [] } }),
         stderr: '',
@@ -356,8 +356,30 @@ describe('extractClaudeCli', () => {
     expect(captured!.cmd).toBe('claude');
     expect(captured!.args).toContain('--print');
     expect(captured!.args).toContain('claude-opus-4-7');
-    expect(captured!.args).toContain('TRANSCRIPT');
     expect(captured!.args).toContain('--json-schema');
+    // Transcript must NOT be in argv (ARG_MAX guard); it goes via stdin.
+    expect(captured!.args).not.toContain('TRANSCRIPT');
+    expect(captured!.input).toBe('TRANSCRIPT');
+  });
+
+  it('json schema rejects unknown keys (matches zod .strict())', () => {
+    // Verify the JSON Schema we hand to claude --json-schema is tight enough
+    // that schema-violating extras would fail there too — not just at the
+    // downstream zod re-validation step.
+    let capturedSchema = '';
+    const spawnFn: SpawnFn = (_cmd, args) => {
+      const idx = args.indexOf('--json-schema');
+      if (idx >= 0) capturedSchema = args[idx + 1] ?? '';
+      return {
+        stdout: JSON.stringify({ is_error: false, structured_output: { items: [] } }),
+        stderr: '', status: 0,
+      };
+    };
+    extractClaudeCli({ transcript: 'x', spawnFn });
+    const parsed = JSON.parse(capturedSchema);
+    expect(parsed.additionalProperties).toBe(false);
+    expect(parsed.properties.items.items.additionalProperties).toBe(false);
+    expect(parsed.properties.items.items.properties.links.items.additionalProperties).toBe(false);
   });
 });
 
