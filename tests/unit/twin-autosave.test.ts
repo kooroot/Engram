@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { ExtractionSchema, validateExtraction } from '../../src/twin/schema.js';
-import { extractWithProvider, ExtractionParseError } from '../../src/twin/providers.js';
+import {
+  extractWithProvider,
+  extractClaudeCli,
+  ExtractionParseError,
+  type SpawnFn,
+} from '../../src/twin/providers.js';
 import { runAutosave } from '../../src/twin/autosave.js';
 import { loadConfig } from '../../src/config/index.js';
 import { createEngramServer, type EngramServer } from '../../src/server.js';
@@ -237,6 +242,152 @@ describe('twin providers', () => {
     });
     expect(capturedArgs!['temperature']).toBe(0);
     expect(capturedArgs!['max_tokens']).toBe(4000);
+  });
+});
+
+describe('extractClaudeCli', () => {
+  it('returns parsed extraction when CLI emits structured_output (happy path)', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        type: 'result',
+        subtype: 'success',
+        is_error: false,
+        structured_output: {
+          items: [{
+            kind: 'fact',
+            name: 'CLI works',
+            summary: 'subscription auth ok',
+            properties: {},
+            confidence: 0.9,
+            links: [],
+          }],
+        },
+      }),
+      stderr: '',
+      status: 0,
+    });
+    const result = extractClaudeCli({ transcript: 'hi', spawnFn });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.name).toBe('CLI works');
+  });
+
+  it('throws ExtractionParseError when CLI exits non-zero (with stderr in message)', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: '',
+      stderr: 'Not logged in. Run `claude /login`.',
+      status: 1,
+    });
+    try {
+      extractClaudeCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/exited 1/);
+      expect((err as Error).message).toMatch(/Not logged in/);
+    }
+  });
+
+  it('throws ExtractionParseError when stdout is not JSON', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: 'this is not json at all',
+      stderr: '',
+      status: 0,
+    });
+    try {
+      extractClaudeCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/not JSON/);
+      expect((err as ExtractionParseError).rawText).toBe('this is not json at all');
+    }
+  });
+
+  it('throws ExtractionParseError when envelope.is_error is true', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        type: 'result',
+        is_error: true,
+        result: 'rate limit exceeded',
+      }),
+      stderr: '',
+      status: 0,
+    });
+    try {
+      extractClaudeCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/reported error/);
+      expect((err as Error).message).toMatch(/rate limit/);
+    }
+  });
+
+  it('throws ExtractionParseError when structured_output is missing', () => {
+    const spawnFn: SpawnFn = () => ({
+      stdout: JSON.stringify({
+        type: 'result',
+        is_error: false,
+        result: 'free text only — no schema honored',
+      }),
+      stderr: '',
+      status: 0,
+    });
+    try {
+      extractClaudeCli({ transcript: 'x', spawnFn });
+      throw new Error('expected ExtractionParseError');
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExtractionParseError);
+      expect((err as Error).message).toMatch(/no structured_output/);
+    }
+  });
+
+  it('passes transcript and model through to spawnFn args', () => {
+    let captured: { cmd: string; args: string[] } | null = null;
+    const spawnFn: SpawnFn = (cmd, args) => {
+      captured = { cmd, args };
+      return {
+        stdout: JSON.stringify({ is_error: false, structured_output: { items: [] } }),
+        stderr: '',
+        status: 0,
+      };
+    };
+    extractClaudeCli({ transcript: 'TRANSCRIPT', model: 'claude-opus-4-7', spawnFn });
+    expect(captured!.cmd).toBe('claude');
+    expect(captured!.args).toContain('--print');
+    expect(captured!.args).toContain('claude-opus-4-7');
+    expect(captured!.args).toContain('TRANSCRIPT');
+    expect(captured!.args).toContain('--json-schema');
+  });
+});
+
+describe('extractWithProvider dispatch', () => {
+  it("dispatches to claude-cli when provider is 'claude-cli'", async () => {
+    let called = false;
+    const spawnFn: SpawnFn = () => {
+      called = true;
+      return {
+        stdout: JSON.stringify({
+          is_error: false,
+          structured_output: {
+            items: [{
+              kind: 'preference', name: 'Dispatched',
+              summary: 'via dispatcher', properties: {},
+              confidence: 0.7, links: [],
+            }],
+          },
+        }),
+        stderr: '',
+        status: 0,
+      };
+    };
+    const result = await extractWithProvider({
+      provider: 'claude-cli',
+      transcript: 'hello',
+      spawnFn,
+    });
+    expect(called).toBe(true);
+    expect(result.items[0]?.name).toBe('Dispatched');
   });
 });
 

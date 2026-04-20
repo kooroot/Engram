@@ -977,14 +977,23 @@ async function offerHookInstall(dataDir: string): Promise<void> {
   p.log.info('UserPromptSubmit → fetches relevant memories for each prompt');
   p.log.info('Stop           → autosaves substance from completed sessions');
 
-  // Auth preflight: the Stop hook calls Anthropic SDK which needs the API key.
-  // Claude Code itself uses subscription auth, so users often don't have this
-  // set. Warn loudly so the first failed autosave isn't a mystery.
-  if (!process.env['ANTHROPIC_API_KEY']) {
+  // Auth preflight: the Stop hook calls `engram autosave` which auto-detects
+  // either the `claude` CLI (subscription auth, preferred) or the Anthropic SDK
+  // (requires ANTHROPIC_API_KEY). At least one must be available.
+  let claudeAvailable = false;
+  try {
+    execFileSync('which', ['claude'], { stdio: ['ignore', 'pipe', 'ignore'] });
+    claudeAvailable = true;
+  } catch { /* not on PATH */ }
+
+  if (claudeAvailable) {
+    p.log.info('Detected `claude` CLI on PATH — autosave will use Claude Code subscription auth.');
+  } else if (process.env['ANTHROPIC_API_KEY']) {
+    p.log.info('Will use ANTHROPIC_API_KEY for autosave (claude CLI not on PATH).');
+  } else {
     p.log.warn(
-      `ANTHROPIC_API_KEY is not set in your environment. ` +
-      `The Stop autosave hook will fail silently until you add it ` +
-      `(e.g. export ANTHROPIC_API_KEY=... in your shell rc).`,
+      `Neither \`claude\` CLI nor ANTHROPIC_API_KEY detected. ` +
+      `The Stop autosave hook will fail until one is available.`,
     );
   }
 }

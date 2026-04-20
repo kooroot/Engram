@@ -1,7 +1,8 @@
 import Anthropic from '@anthropic-ai/sdk';
+import { spawnSync } from 'node:child_process';
 import { validateExtraction, type Extraction } from './schema.js';
 
-export type ProviderName = 'anthropic';
+export type ProviderName = 'anthropic' | 'claude-cli';
 
 const EXTRACTION_PROMPT = `You are an extraction agent for Engram, a persistent memory graph.
 
@@ -34,13 +35,64 @@ Output: strict JSON only (no prose, no markdown fences) matching this TypeScript
 
 If nothing substantive was discussed, return { "items": [] }.`;
 
+/**
+ * Hand-written JSON Schema for the `claude --json-schema` flag. Mirrors the
+ * Extraction shape but slightly looser (e.g. additionalProperties allowed on
+ * `properties`) — strict validation still happens via `validateExtraction()`
+ * after parsing, so this is defense-in-depth at the model boundary, not the
+ * trust boundary.
+ */
+const EXTRACTION_JSON_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      maxItems: 50,
+      items: {
+        type: 'object',
+        properties: {
+          kind: { type: 'string', enum: ['decision', 'preference', 'fact', 'insight', 'person', 'project_update'] },
+          name: { type: 'string', minLength: 1 },
+          summary: { type: 'string', minLength: 1 },
+          properties: { type: 'object', additionalProperties: true },
+          confidence: { type: 'number', minimum: 0, maximum: 1 },
+          links: {
+            type: 'array',
+            maxItems: 20,
+            items: {
+              type: 'object',
+              properties: {
+                predicate: { type: 'string', minLength: 1 },
+                target_name: { type: 'string', minLength: 1 },
+              },
+              required: ['predicate', 'target_name'],
+            },
+          },
+        },
+        required: ['kind', 'name', 'summary', 'confidence', 'links'],
+      },
+    },
+  },
+  required: ['items'],
+} as const;
+
 export interface ExtractOptions {
   provider: ProviderName;
   transcript: string;
   apiKey?: string;
   client?: Anthropic;
   model?: string;
+  /**
+   * Test seam for the claude-cli provider. Replace `spawnSync` so the test
+   * never invokes the real CLI binary.
+   */
+  spawnFn?: SpawnFn;
 }
+
+export type SpawnFn = (
+  cmd: string,
+  args: string[],
+) => { stdout: string; stderr: string; status: number | null };
 
 /**
  * Error thrown when the provider returned text but it could not be parsed
@@ -67,9 +119,27 @@ function snippet(text: string): string {
 }
 
 export async function extractWithProvider(opts: ExtractOptions): Promise<Extraction> {
-  if (opts.provider !== 'anthropic') {
-    throw new Error(`Provider not yet implemented: ${opts.provider}`);
+  if (opts.provider === 'anthropic') {
+    return extractAnthropic(opts);
   }
+  if (opts.provider === 'claude-cli') {
+    return Promise.resolve(extractClaudeCli({
+      transcript: opts.transcript,
+      ...(opts.model !== undefined ? { model: opts.model } : {}),
+      ...(opts.spawnFn !== undefined ? { spawnFn: opts.spawnFn } : {}),
+    }));
+  }
+  throw new Error(`Provider not yet implemented: ${opts.provider as string}`);
+}
+
+export interface ExtractAnthropicOptions {
+  transcript: string;
+  apiKey?: string;
+  client?: Anthropic;
+  model?: string;
+}
+
+export async function extractAnthropic(opts: ExtractAnthropicOptions): Promise<Extraction> {
   const client = opts.client
     ?? new Anthropic({ apiKey: opts.apiKey ?? process.env['ANTHROPIC_API_KEY'] });
 
@@ -107,6 +177,93 @@ export async function extractWithProvider(opts: ExtractOptions): Promise<Extract
     throw new ExtractionParseError(
       `Schema validation failed: ${(err as Error).message}. Raw: ${snippet(block.text)}`,
       block.text, err,
+    );
+  }
+}
+
+export interface ExtractClaudeCliOptions {
+  transcript: string;
+  model?: string;
+  /** Test seam: replace the real `spawnSync` invocation. */
+  spawnFn?: SpawnFn;
+}
+
+/**
+ * Extract via the `claude` CLI in headless mode. This leverages the user's
+ * already-logged-in Claude Code session (subscription auth), so no
+ * `ANTHROPIC_API_KEY` is required.
+ *
+ * Synchronous because `spawnSync` is sync — the dispatcher in
+ * `extractWithProvider` wraps the result in a Promise to keep the async
+ * surface uniform.
+ *
+ * NOTE: Do NOT use `--bare`. Per the Claude Code docs, that flag breaks
+ * subscription auth and the CLI returns "Not logged in".
+ */
+export function extractClaudeCli(opts: ExtractClaudeCliOptions): Extraction {
+  const args = [
+    '--print',
+    '--model', opts.model ?? 'claude-haiku-4-5',
+    '--system-prompt', EXTRACTION_PROMPT,
+    '--output-format', 'json',
+    '--json-schema', JSON.stringify(EXTRACTION_JSON_SCHEMA),
+    opts.transcript,
+  ];
+
+  const fn: SpawnFn = opts.spawnFn ?? ((cmd, a) => {
+    const r = spawnSync(cmd, a, {
+      encoding: 'utf8',
+      maxBuffer: 16 * 1024 * 1024,
+    });
+    return {
+      stdout: r.stdout ?? '',
+      stderr: r.stderr ?? '',
+      status: r.status,
+    };
+  });
+
+  const result = fn('claude', args);
+
+  if (result.status !== 0) {
+    throw new ExtractionParseError(
+      `claude CLI exited ${result.status}: ${result.stderr.slice(0, 500)}`,
+      result.stdout,
+      undefined,
+    );
+  }
+
+  let envelope: { structured_output?: unknown; result?: string; is_error?: boolean };
+  try {
+    envelope = JSON.parse(result.stdout);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `claude CLI output not JSON: ${(err as Error).message}`,
+      result.stdout,
+      err,
+    );
+  }
+
+  if (envelope.is_error) {
+    throw new ExtractionParseError(
+      `claude CLI reported error: ${envelope.result ?? '(no detail)'}`,
+      result.stdout,
+    );
+  }
+
+  if (!envelope.structured_output) {
+    throw new ExtractionParseError(
+      'claude CLI returned no structured_output (was --json-schema accepted?)',
+      result.stdout,
+    );
+  }
+
+  try {
+    return validateExtraction(envelope.structured_output);
+  } catch (err) {
+    throw new ExtractionParseError(
+      `Schema validation failed: ${(err as Error).message}`,
+      JSON.stringify(envelope.structured_output),
+      err,
     );
   }
 }

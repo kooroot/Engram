@@ -1,4 +1,5 @@
 import { Command } from 'commander';
+import { execFileSync } from 'node:child_process';
 import { createEngramCore, type EngramCore } from '../service.js';
 import * as svc from '../service.js';
 import * as fmt from './formatters.js';
@@ -313,27 +314,45 @@ export function registerCLICommands(program: Command): void {
   program
     .command('autosave <transcript>')
     .description('Extract substance from a session transcript and save to memory (twin mode)')
-    .option('-p, --provider <name>', 'LLM provider', 'anthropic')
+    .option('-p, --provider <name>', 'LLM provider: auto | claude-cli | anthropic', 'auto')
     .option('-m, --model <name>', 'Override default model')
     .option('--min-bytes <n>', 'Skip if transcript smaller than this', '200')
     .option('--max-bytes <n>', 'Skip if transcript larger than this (cost guard)', '200000')
     .action((transcript: string, opts: {
       provider: string; model?: string; minBytes: string; maxBytes: string;
     }) => withCore(async (core) => {
-      if (opts.provider !== 'anthropic') {
-        process.stderr.write(
-          `[engram] provider not yet implemented: ${opts.provider}. ` +
-          `Phase 1 supports only 'anthropic'.\n`,
-        );
+      let resolvedProvider: 'claude-cli' | 'anthropic';
+      if (opts.provider === 'auto') {
+        // Auto-detect: prefer claude CLI (subscription auth, no key needed),
+        // fall back to Anthropic SDK only if ANTHROPIC_API_KEY is set.
+        try {
+          execFileSync('which', ['claude'], { stdio: ['ignore', 'pipe', 'ignore'] });
+          resolvedProvider = 'claude-cli';
+        } catch {
+          if (process.env['ANTHROPIC_API_KEY']) {
+            resolvedProvider = 'anthropic';
+          } else {
+            process.stderr.write(
+              '[engram] no provider available: install Claude Code CLI ' +
+              'or set ANTHROPIC_API_KEY\n',
+            );
+            process.exit(1);
+          }
+        }
+      } else if (opts.provider === 'claude-cli' || opts.provider === 'anthropic') {
+        resolvedProvider = opts.provider;
+      } else {
+        process.stderr.write(`[engram] unknown provider: ${opts.provider}\n`);
         process.exit(1);
       }
+
       const { runAutosave } = await import('../twin/autosave.js');
       const { ExtractionParseError } = await import('../twin/providers.js');
       try {
         const report = await runAutosave({
           core,
           transcriptPath: transcript,
-          provider: 'anthropic',
+          provider: resolvedProvider,
           ...(opts.model !== undefined ? { model: opts.model } : {}),
           minTranscriptBytes: safeInt(opts.minBytes, 200),
           maxTranscriptBytes: safeInt(opts.maxBytes, 200_000),
