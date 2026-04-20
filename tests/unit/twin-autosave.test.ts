@@ -31,4 +31,48 @@ describe('twin extraction schema', () => {
   it('accepts empty items array', () => {
     expect(() => validateExtraction({ items: [] })).not.toThrow();
   });
+
+  it('rejects unknown top-level keys (strict mode)', () => {
+    expect(() => validateExtraction({ items: [], extra: 'nope' })).toThrow();
+  });
+
+  it('rejects unknown per-item keys (strict mode)', () => {
+    expect(() => validateExtraction({
+      items: [{
+        kind: 'fact', name: 'x', summary: 'y', confidence: 0.5, links: [],
+        bogus: true,
+      }],
+    })).toThrow();
+  });
+
+  it('defaults missing properties to empty object', () => {
+    const parsed = validateExtraction({
+      items: [{
+        kind: 'fact', name: 'x', summary: 'y', confidence: 0.5, links: [],
+      }],
+    });
+    expect(parsed.items[0]?.properties).toEqual({});
+  });
+
+  it('trims whitespace in name and summary', () => {
+    const parsed = validateExtraction({
+      items: [{
+        kind: 'fact', name: '  spaced  ', summary: '  summary  ',
+        confidence: 0.5, links: [],
+      }],
+    });
+    expect(parsed.items[0]?.name).toBe('spaced');
+    expect(parsed.items[0]?.summary).toBe('summary');
+  });
+
+  it('caps links at 20 per item', () => {
+    const tooMany = Array.from({ length: 21 }, (_, i) => ({
+      predicate: 'p', target_name: `t${i}`,
+    }));
+    expect(() => validateExtraction({
+      items: [{
+        kind: 'fact', name: 'x', summary: 'y', confidence: 0.5, links: tooMany,
+      }],
+    })).toThrow();
+  });
 });
