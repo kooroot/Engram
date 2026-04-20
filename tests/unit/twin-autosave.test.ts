@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { ExtractionSchema, validateExtraction } from '../../src/twin/schema.js';
+import { extractWithProvider } from '../../src/twin/providers.js';
 
 describe('twin extraction schema', () => {
   it('accepts a well-formed extraction', () => {
@@ -74,5 +75,79 @@ describe('twin extraction schema', () => {
         kind: 'fact', name: 'x', summary: 'y', confidence: 0.5, links: tooMany,
       }],
     })).toThrow();
+  });
+});
+
+describe('twin providers', () => {
+  it('returns parsed extraction from a mocked anthropic response', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({
+          content: [{
+            type: 'text',
+            text: JSON.stringify({
+              items: [{
+                kind: 'fact', name: 'Test fact', summary: 'A test',
+                confidence: 0.8, links: [],
+              }],
+            }),
+          }],
+        }),
+      },
+    };
+    const result = await extractWithProvider({
+      provider: 'anthropic',
+      transcript: 'user: hello\nassistant: hi',
+      client: fakeClient as any,
+    });
+    expect(result.items).toHaveLength(1);
+    expect(result.items[0]?.name).toBe('Test fact');
+  });
+
+  it('strips ```json fences before parsing', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({
+          content: [{
+            type: 'text',
+            text: '```json\n{"items":[]}\n```',
+          }],
+        }),
+      },
+    };
+    const result = await extractWithProvider({
+      provider: 'anthropic',
+      transcript: 'x',
+      client: fakeClient as any,
+    });
+    expect(result.items).toEqual([]);
+  });
+
+  it('throws on schema-violating response', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({
+          content: [{ type: 'text', text: JSON.stringify({ items: [{ kind: 'banana' }] }) }],
+        }),
+      },
+    };
+    await expect(extractWithProvider({
+      provider: 'anthropic',
+      transcript: 'x',
+      client: fakeClient as any,
+    })).rejects.toThrow();
+  });
+
+  it('throws when provider returns no text content', async () => {
+    const fakeClient = {
+      messages: {
+        create: async () => ({ content: [{ type: 'tool_use' }] }),
+      },
+    };
+    await expect(extractWithProvider({
+      provider: 'anthropic',
+      transcript: 'x',
+      client: fakeClient as any,
+    })).rejects.toThrow(/no text content/);
   });
 });
