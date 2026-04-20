@@ -1046,17 +1046,23 @@ async function installCodexHooks(dataDir: string, engramBin: string): Promise<vo
   }
 
   const events = (hooksConfig['hooks'] ?? {}) as Record<string, unknown[]>;
+  // Filter by the actual absolute script paths we're about to write, not by
+  // a hardcoded "~/.engram/hooks/codex/" substring. Users with a custom
+  // ENGRAM_DATA_DIR would otherwise see duplicates on re-install.
+  const codexScriptPaths = new Set([sessionStartPath, promptInjectPath, stopAutosavePath]);
   const mergeEvent = (name: string, entry: Record<string, unknown>): void => {
     if (!Array.isArray(events[name])) events[name] = [];
-    // Filter prior engram entries so re-install is idempotent.
     events[name] = (events[name] as Array<Record<string, unknown>>).filter(e => {
       const hs = (e['hooks'] as Array<Record<string, unknown>>) ?? [];
-      return !hs.some(h => typeof h['command'] === 'string'
-        && (h['command'] as string).includes('.engram/hooks/codex/'));
+      return !hs.some(h => {
+        const cmd = typeof h['command'] === 'string' ? (h['command'] as string) : '';
+        return [...codexScriptPaths].some(p => cmd.includes(p));
+      });
     });
     (events[name] as unknown[]).push(entry);
   };
 
+  // Codex config `timeout` is in SECONDS (per codex hooks docs).
   mergeEvent('SessionStart', {
     matcher: '',
     hooks: [{ type: 'command', command: `node ${sessionStartPath}`, timeout: 10 }],
@@ -1079,19 +1085,69 @@ async function installCodexHooks(dataDir: string, engramBin: string): Promise<vo
   p.log.success('Codex hooks installed  (SessionStart + UserPromptSubmit + Stop)');
 }
 
+/**
+ * Pure function exposed for testing: take a `config.toml` content string,
+ * return the same string with `codex_hooks = true` ensured under a
+ * `[features]` section.
+ *
+ * Line-based rather than regex-based to avoid the traps the prior version hit:
+ * - commented-out `# codex_hooks = true` no longer short-circuits us
+ * - commented-out `# [features]` no longer suppresses section detection
+ * - explicit `codex_hooks = false` gets flipped to `true` rather than ignored
+ * - CRLF and mixed line endings preserved
+ *
+ * We don't pull a full TOML parser in just for this — the grammar we touch
+ * is trivial (one key under one section header), so line scanning is enough.
+ * If future features need deeper TOML editing, swap for a real parser then.
+ *
+ * @returns `{ toml, changed }` — `changed:false` when the file already has the flag on.
+ */
+export function patchCodexHooksFlag(raw: string): { toml: string; changed: boolean } {
+  // Preserve the original line ending style.
+  const eol = /\r\n/.test(raw) ? '\r\n' : '\n';
+  const lines = raw.split(/\r?\n/);
+
+  const isActive = (line: string) => !/^\s*#/.test(line);
+  const isSectionHeader = (line: string) => /^\s*\[[^\]]+\]\s*$/.test(line);
+  const isFeaturesHeader = (line: string) =>
+    isActive(line) && /^\s*\[features\]\s*$/.test(line);
+
+  const featuresIdx = lines.findIndex(isFeaturesHeader);
+
+  if (featuresIdx >= 0) {
+    let updatedInPlace = false;
+    for (let i = featuresIdx + 1; i < lines.length; i += 1) {
+      const line = lines[i] ?? '';
+      if (isActive(line) && isSectionHeader(line)) break; // left the section
+      if (isActive(line) && /^\s*codex_hooks\s*=/.test(line)) {
+        if (/^\s*codex_hooks\s*=\s*true\s*(#.*)?$/.test(line)) {
+          return { toml: raw, changed: false };
+        }
+        lines[i] = line.replace(/codex_hooks\s*=\s*\S+/, 'codex_hooks = true');
+        updatedInPlace = true;
+        break;
+      }
+    }
+    if (!updatedInPlace) {
+      lines.splice(featuresIdx + 1, 0, 'codex_hooks = true');
+    }
+  } else {
+    if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
+    lines.push('[features]', 'codex_hooks = true');
+  }
+
+  const out = lines.join(eol);
+  return {
+    toml: out.endsWith(eol) ? out : out + eol,
+    changed: true,
+  };
+}
+
 function enableCodexHooksFlag(): void {
   const configPath = path.join(os.homedir(), '.codex', 'config.toml');
-  let toml = '';
-  if (fs.existsSync(configPath)) toml = fs.readFileSync(configPath, 'utf8');
-
-  if (/codex_hooks\s*=\s*true/.test(toml)) return; // already enabled
-
-  if (/^\[features\]/m.test(toml)) {
-    toml = toml.replace(/^\[features\]/m, '[features]\ncodex_hooks = true');
-  } else {
-    if (toml && !toml.endsWith('\n')) toml += '\n';
-    toml += '\n[features]\ncodex_hooks = true\n';
-  }
+  const raw = fs.existsSync(configPath) ? fs.readFileSync(configPath, 'utf8') : '';
+  const { toml, changed } = patchCodexHooksFlag(raw);
+  if (!changed) return;
   fs.writeFileSync(configPath, toml);
   p.log.info('Enabled codex_hooks feature flag in ~/.codex/config.toml');
 }
@@ -1126,16 +1182,27 @@ async function installGeminiHooks(dataDir: string, engramBin: string): Promise<v
     }
   }
   const events = (settings['hooks'] ?? {}) as Record<string, unknown[]>;
+  // Filter by the actual absolute script paths we're about to write — same
+  // rationale as installCodexHooks (custom dataDir → no false-match misses).
+  const geminiScriptPaths = new Set([sessionStartPath, sessionEndPath]);
   const mergeEvent = (name: string, entry: Record<string, unknown>): void => {
     if (!Array.isArray(events[name])) events[name] = [];
     events[name] = (events[name] as Array<Record<string, unknown>>).filter(e => {
       const hs = (e['hooks'] as Array<Record<string, unknown>>) ?? [];
-      return !hs.some(h => typeof h['command'] === 'string'
-        && (h['command'] as string).includes('.engram/hooks/gemini/'));
+      return !hs.some(h => {
+        const cmd = typeof h['command'] === 'string' ? (h['command'] as string) : '';
+        return [...geminiScriptPaths].some(p => cmd.includes(p));
+      });
     });
     (events[name] as unknown[]).push(entry);
   };
 
+  // Gemini config `timeout` is in MILLISECONDS (per gemini hooks docs).
+  // Our existing stop-autosave template reads `transcript_path` from stdin;
+  // we ASSUME Gemini's SessionEnd stdin includes that field per its hooks
+  // contract. If it doesn't, autosave will silently no-op (early exit path).
+  // TODO: verify against a real SessionEnd payload and add transcript-tail
+  // fallback if the field name differs.
   mergeEvent('SessionStart', {
     matcher: '',
     hooks: [{

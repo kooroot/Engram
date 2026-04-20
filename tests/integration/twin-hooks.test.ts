@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 
-import { getHookTemplates } from '../../src/cli/onboard.js';
+import { getHookTemplates, patchCodexHooksFlag } from '../../src/cli/onboard.js';
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'twin-hooks-'));
 const STUB_BIN_DIR = path.join(TMP, 'bin');
@@ -132,6 +132,71 @@ describe('getHookTemplates per-host-AI variants', () => {
         expect(body).not.toContain('__STOP_NOOP__');
       }
     }
+  });
+});
+
+describe('patchCodexHooksFlag', () => {
+  it('adds [features] + codex_hooks=true to an empty file', () => {
+    const { toml, changed } = patchCodexHooksFlag('');
+    expect(changed).toBe(true);
+    expect(toml).toContain('[features]');
+    expect(toml).toMatch(/^codex_hooks = true$/m);
+  });
+
+  it('is a no-op when codex_hooks=true is already set', () => {
+    const input = '[features]\ncodex_hooks = true\n';
+    const { toml, changed } = patchCodexHooksFlag(input);
+    expect(changed).toBe(false);
+    expect(toml).toBe(input);
+  });
+
+  it('flips codex_hooks=false to true in-place', () => {
+    const input = '[features]\ncodex_hooks = false\nother_flag = true\n';
+    const { toml, changed } = patchCodexHooksFlag(input);
+    expect(changed).toBe(true);
+    expect(toml).toContain('codex_hooks = true');
+    expect(toml).not.toContain('codex_hooks = false');
+    expect(toml).toContain('other_flag = true'); // unrelated lines preserved
+  });
+
+  it('ignores commented-out codex_hooks = true (adds real entry)', () => {
+    const input = '[features]\n# codex_hooks = true\n';
+    const { toml, changed } = patchCodexHooksFlag(input);
+    expect(changed).toBe(true);
+    // Real entry added; commented line preserved.
+    expect(toml.split('\n').filter(l => l.trim() === 'codex_hooks = true')).toHaveLength(1);
+    expect(toml).toContain('# codex_hooks = true');
+  });
+
+  it('ignores commented-out [features] section (appends a real one)', () => {
+    const input = '# [features]\n# codex_hooks = true\n';
+    const { toml, changed } = patchCodexHooksFlag(input);
+    expect(changed).toBe(true);
+    expect(toml.match(/^\[features\]$/gm)?.length ?? 0).toBe(1);
+    expect(toml).toMatch(/^codex_hooks = true$/m);
+  });
+
+  it('preserves CRLF line endings', () => {
+    const input = '[features]\r\ncodex_hooks = false\r\n';
+    const { toml } = patchCodexHooksFlag(input);
+    expect(toml).toContain('\r\n');
+    expect(toml).not.toMatch(/[^\r]\n/); // no bare LF introduced
+  });
+
+  it('inserts codex_hooks into existing [features] section without disturbing other sections', () => {
+    const input = '[projects]\nroot = "."\n\n[features]\nsomething_else = true\n\n[mcp_servers.engram]\ncommand = "node"\n';
+    const { toml, changed } = patchCodexHooksFlag(input);
+    expect(changed).toBe(true);
+    expect(toml).toContain('[projects]');
+    expect(toml).toContain('[mcp_servers.engram]');
+    expect(toml).toContain('something_else = true');
+    expect(toml).toMatch(/\[features\][\s\S]*codex_hooks = true/);
+    // codex_hooks is inside [features], not after [mcp_servers.engram]
+    const featuresIdx = toml.indexOf('[features]');
+    const mcpIdx = toml.indexOf('[mcp_servers.engram]');
+    const flagIdx = toml.indexOf('codex_hooks = true');
+    expect(flagIdx).toBeGreaterThan(featuresIdx);
+    expect(flagIdx).toBeLessThan(mcpIdx);
   });
 });
 
