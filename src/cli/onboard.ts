@@ -1079,7 +1079,7 @@ async function installCodexHooks(dataDir: string, engramBin: string): Promise<vo
   hooksConfig['hooks'] = events;
   fs.writeFileSync(hooksJsonPath, JSON.stringify(hooksConfig, null, 2));
 
-  // Enable the codex_hooks feature flag in config.toml.
+  // Enable the hooks feature flag in config.toml.
   enableCodexHooksFlag();
 
   p.log.success('Codex hooks installed  (SessionStart + UserPromptSubmit + Stop)');
@@ -1087,13 +1087,14 @@ async function installCodexHooks(dataDir: string, engramBin: string): Promise<vo
 
 /**
  * Pure function exposed for testing: take a `config.toml` content string,
- * return the same string with `codex_hooks = true` ensured under a
+ * return the same string with `hooks = true` ensured under a
  * `[features]` section.
  *
  * Line-based rather than regex-based to avoid the traps the prior version hit:
- * - commented-out `# codex_hooks = true` no longer short-circuits us
+ * - commented-out `# hooks = true` no longer short-circuits us
  * - commented-out `# [features]` no longer suppresses section detection
- * - explicit `codex_hooks = false` gets flipped to `true` rather than ignored
+ * - explicit `hooks = false` gets flipped to `true` rather than ignored
+ * - deprecated `codex_hooks = true` gets migrated away to avoid Codex warnings
  * - CRLF and mixed line endings preserved
  *
  * We don't pull a full TOML parser in just for this — the grammar we touch
@@ -1115,31 +1116,45 @@ export function patchCodexHooksFlag(raw: string): { toml: string; changed: boole
   const featuresIdx = lines.findIndex(isFeaturesHeader);
 
   if (featuresIdx >= 0) {
-    let updatedInPlace = false;
+    let hooksIdx = -1;
+    const deprecatedIdxs: number[] = [];
+
     for (let i = featuresIdx + 1; i < lines.length; i += 1) {
       const line = lines[i] ?? '';
-      if (isActive(line) && isSectionHeader(line)) break; // left the section
-      if (isActive(line) && /^\s*codex_hooks\s*=/.test(line)) {
-        if (/^\s*codex_hooks\s*=\s*true\s*(#.*)?$/.test(line)) {
-          return { toml: raw, changed: false };
-        }
-        lines[i] = line.replace(/codex_hooks\s*=\s*\S+/, 'codex_hooks = true');
-        updatedInPlace = true;
-        break;
-      }
+      if (isActive(line) && isSectionHeader(line)) break;
+      if (!isActive(line)) continue;
+      if (/^\s*hooks\s*=/.test(line)) hooksIdx = i;
+      if (/^\s*codex_hooks\s*=/.test(line)) deprecatedIdxs.push(i);
     }
-    if (!updatedInPlace) {
-      lines.splice(featuresIdx + 1, 0, 'codex_hooks = true');
+
+    if (hooksIdx >= 0) {
+      const line = lines[hooksIdx] ?? '';
+      if (!/^\s*hooks\s*=\s*true\s*(#.*)?$/.test(line)) {
+        lines[hooksIdx] = line.replace(/hooks\s*=\s*\S+/, 'hooks = true');
+      }
+      for (const idx of [...deprecatedIdxs].reverse()) lines.splice(idx, 1);
+    } else if (deprecatedIdxs.length > 0) {
+      const [firstDeprecatedIdx, ...duplicateDeprecatedIdxs] = deprecatedIdxs;
+      const line = lines[firstDeprecatedIdx] ?? '';
+      lines[firstDeprecatedIdx] = line.replace(/codex_hooks\s*=\s*\S+/, 'hooks = true');
+      for (const idx of [...duplicateDeprecatedIdxs].reverse()) lines.splice(idx, 1);
+    } else {
+      lines.splice(featuresIdx + 1, 0, 'hooks = true');
     }
   } else {
-    if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
-    lines.push('[features]', 'codex_hooks = true');
+    if (lines.length === 1 && lines[0] === '') {
+      lines.splice(0, 1, '[features]', 'hooks = true');
+    } else {
+      if (lines.length > 0 && lines[lines.length - 1] !== '') lines.push('');
+      lines.push('[features]', 'hooks = true');
+    }
   }
 
   const out = lines.join(eol);
+  const toml = out.endsWith(eol) ? out : out + eol;
   return {
-    toml: out.endsWith(eol) ? out : out + eol,
-    changed: true,
+    toml,
+    changed: toml !== raw,
   };
 }
 
@@ -1149,7 +1164,7 @@ function enableCodexHooksFlag(): void {
   const { toml, changed } = patchCodexHooksFlag(raw);
   if (!changed) return;
   fs.writeFileSync(configPath, toml);
-  p.log.info('Enabled codex_hooks feature flag in ~/.codex/config.toml');
+  p.log.info('Enabled hooks feature flag in ~/.codex/config.toml');
 }
 
 async function installGeminiHooks(dataDir: string, engramBin: string): Promise<void> {
