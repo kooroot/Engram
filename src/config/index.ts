@@ -4,6 +4,17 @@ import { autoLoadEngramEnv } from './load-env-file.js';
 
 export type { Config };
 
+export interface ConfigOverrides {
+  dataDir?: Config['dataDir'];
+  dbFilename?: Config['dbFilename'];
+  vecDbFilename?: Config['vecDbFilename'];
+  namespace?: Config['namespace'];
+  cache?: Partial<Config['cache']>;
+  embedding?: Partial<Config['embedding']>;
+  maintenance?: Partial<Config['maintenance']>;
+  dedup?: Partial<Config['dedup']>;
+}
+
 /**
  * Precedence (highest → lowest): explicit overrides > env vars > engram.env file > defaults.
  * Programmatic overrides must win so request-scoped settings (e.g., namespace
@@ -11,7 +22,7 @@ export type { Config };
  * from `<dataDir>/engram.env` or `~/.engram/engram.env` (set `ENGRAM_NO_ENV_FILE=1`
  * to disable). It NEVER overwrites already-set process.env entries.
  */
-export function loadConfig(overrides: Partial<Config> = {}): Config {
+export function loadConfig(overrides: ConfigOverrides = {}): Config {
   autoLoadEngramEnv(overrides.dataDir);
   const env = process.env;
   const raw = {
@@ -33,7 +44,14 @@ export function loadConfig(overrides: Partial<Config> = {}): Config {
       ollamaUrl: overrides.embedding?.ollamaUrl ?? env['OLLAMA_URL'],
       ollamaModel: overrides.embedding?.ollamaModel ?? env['OLLAMA_MODEL'],
     },
-    maintenance: overrides.maintenance,
+    maintenance: {
+      confidenceDecayFactor: overrides.maintenance?.confidenceDecayFactor,
+      archiveConfidenceThreshold: overrides.maintenance?.archiveConfidenceThreshold,
+      archiveInactiveDays: overrides.maintenance?.archiveInactiveDays,
+      orphanGraceDays: overrides.maintenance?.orphanGraceDays,
+      historyKeepVersions: overrides.maintenance?.historyKeepVersions
+        ?? (env['ENGRAM_HISTORY_KEEP_VERSIONS'] ? Number(env['ENGRAM_HISTORY_KEEP_VERSIONS']) : undefined),
+    },
     dedup: {
       semanticAutoMerge: overrides.dedup?.semanticAutoMerge
         ?? (env['ENGRAM_DEDUP_SEMANTIC']

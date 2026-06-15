@@ -4,7 +4,7 @@
  */
 import type Database from 'better-sqlite3';
 import { createRequire } from 'node:module';
-import type { Config } from './config/index.js';
+import type { Config, ConfigOverrides } from './config/index.js';
 import { loadConfig } from './config/index.js';
 import { initMainDb, initVecDb, type DatabaseConnection } from './db/index.js';
 import { EventLog } from './db/event-log.js';
@@ -12,7 +12,7 @@ import { StateTree } from './db/state-tree.js';
 import { VectorStore } from './db/vector-store.js';
 import { UsageLog } from './db/usage-log.js';
 import { EngineCache } from './engine/cache.js';
-import { getStateStats, runMaintenance, type MaintenanceReport } from './engine/maintenance.js';
+import { getStateStats, runMaintenance, runHistoryCompaction, type MaintenanceReport } from './engine/maintenance.js';
 import { runDedupPass, cosineSimilarity, type DedupPassReport, type Tier2Options } from './engine/dedup-scan.js';
 import { traverseGraph } from './engine/graph-traversal.js';
 import { buildContext } from './engine/context-builder.js';
@@ -29,9 +29,29 @@ import { log } from './logger.js';
 export { exportNamespace, importBundle } from './port.js';
 export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from './port.js';
 
+/** Max nodes of each type injected into a getContext() recall block. Bounds the
+ *  SessionStart/UserPromptSubmit hook so one over-represented type (e.g. a
+ *  project's many near-duplicate decisions) can't starve the rest. */
+const CONTEXT_MAX_PER_TYPE = 6;
+
 /** Resolve a node by ID or name */
 function resolveNode(core: EngramCore, idOrName: string): Node | null {
   return core.stateTree.getNode(idOrName) ?? core.stateTree.getNodeByName(idOrName);
+}
+
+/**
+ * Checkpoint + truncate the WAL so the `-wal` sidecar doesn't accumulate across
+ * the process lifetime (the long-running MCP server otherwise leaves a multi-MB
+ * WAL until SQLite's auto-checkpoint fires). Best-effort: a busy checkpoint
+ * (another connection holding the WAL) or a non-WAL db is non-fatal. Mirrors the
+ * pattern already used in cli/backup.ts.
+ */
+function checkpointWal(db: Database.Database): void {
+  try {
+    db.pragma('wal_checkpoint(TRUNCATE)');
+  } catch {
+    /* WAL busy or db not in WAL mode — safe to skip */
+  }
 }
 
 /** Build a Tier 2 embedding lookup scoped to a namespace. Reads from vecDb
@@ -158,7 +178,7 @@ export function resolveEmbeddingProvider(
  * and optional auto-embedding hook registration.
  */
 export function createEngramCore(
-  configOverrides: Partial<Config> = {},
+  configOverrides: ConfigOverrides = {},
   options: CreateCoreOptions = {},
 ): EngramCore {
   const config = loadConfig(configOverrides);
@@ -167,7 +187,7 @@ export function createEngramCore(
 
   const ns = config.namespace;
   const eventLog = new EventLog(mainDb.db, ns);
-  const stateTree = new StateTree(mainDb.db, eventLog, ns);
+  const stateTree = new StateTree(mainDb.db, eventLog, ns, config.maintenance.historyKeepVersions);
   const embeddingProvider = resolveEmbeddingProvider(config, options.embeddingProvider);
 
   // BUG-A fix: Pass dimension from provider or config
@@ -292,11 +312,15 @@ export function createEngramCore(
     embeddingProvider,
     usageLog,
     close() {
+      checkpointWal(mainDb.db);
+      checkpointWal(vecDb.db);
       mainDb.close();
       vecDb.close();
     },
     async closeAsync() {
       await stateTree.drainCallbacks();
+      checkpointWal(mainDb.db);
+      checkpointWal(vecDb.db);
       mainDb.close();
       vecDb.close();
     },
@@ -605,7 +629,10 @@ export async function getContext(
   const out = buildContext(
     [...allNodes.values()],
     [...allEdges.values()],
-    { maxTokens: opts.maxTokens ?? 2000 },
+    // Cap per-type injection so a project with many near-duplicate decisions
+    // can't dominate the SessionStart/UserPromptSubmit recall block — keep the
+    // top-N highest-confidence of each type for a diverse, bounded context.
+    { maxTokens: opts.maxTokens ?? 2000, maxPerType: CONTEXT_MAX_PER_TYPE },
   );
   metrics.contextDuration.observe({ namespace: safeNamespaceLabel(core.config.namespace), strategy }, stopTimer());
   return out;
@@ -628,50 +655,74 @@ function expand(
 
 // ─── Maintenance ─────────────────────────────────────────
 
+export interface MaintenanceCycleReport extends MaintenanceReport, StatusInfo {
+  dedup?: DedupPassReport;
+  historyCompacted?: number;
+  warnings?: string[];
+}
+
 export function runMaintenanceCycle(
   core: EngramCore,
   dryRun: boolean = false,
-  opts: { dedup?: boolean; semantic?: boolean } = {},
-): MaintenanceReport & StatusInfo & { dedup?: DedupPassReport } {
+  opts: { dedup?: boolean; semantic?: boolean; compactHistory?: boolean } = {},
+): MaintenanceCycleReport {
+  const ns = core.config.namespace;
   const statsBefore = getStatus(core);
+  const warnings: string[] = [];
 
   // Build Tier 2 options if the caller asked for semantic dedup AND an
   // embedding provider is configured (otherwise getEmbedding would always
   // return null — expensive no-op).
   let tier2: Tier2Options | undefined;
-  if (opts.dedup && opts.semantic && core.embeddingProvider && core.vectorStore.isVecEnabled) {
-    tier2 = {
-      getEmbedding: makeEmbeddingLookup(core.vecDb.db, core.config.namespace),
-      threshold: core.config.dedup.semanticThreshold,
-    };
+  if (opts.dedup && opts.semantic) {
+    if (core.embeddingProvider && core.vectorStore.isVecEnabled) {
+      tier2 = {
+        getEmbedding: makeEmbeddingLookup(core.vecDb.db, ns),
+        threshold: core.config.dedup.semanticThreshold,
+      };
+    } else {
+      // Surface the silent no-op: --semantic does nothing without embeddings.
+      warnings.push(
+        'Semantic dedup (--semantic) was requested but no embedding provider is ' +
+        'configured (embedding.provider="none"), so Tier 2 cosine matching is inactive — ' +
+        'only Tier 1 (name-based) dedup ran. Configure an embedding provider and backfill ' +
+        'embeddings to catch semantically-similar duplicates.',
+      );
+    }
+  }
+
+  const keepN = core.config.maintenance.historyKeepVersions;
+  const mergeFn = (s: string, t: string) => core.stateTree.mergeNodes(s, t);
+  if (opts.compactHistory && keepN <= 0) {
+    warnings.push(
+      'History compaction was requested but maintenance.historyKeepVersions=0 disables ' +
+      'node_history pruning, so no history snapshots were pruned.',
+    );
   }
 
   if (dryRun) {
-    const dryReport: MaintenanceReport = { decayed: 0, archived: 0, orphansDetected: 0 };
-    if (opts.dedup) {
-      const dedup = runDedupPass(
-        core.db,
-        core.config.namespace,
-        (s, t) => core.stateTree.mergeNodes(s, t),
-        true,
-        tier2,
-      );
-      return { ...dryReport, ...statsBefore, dedup };
-    }
-    return { ...dryReport, ...statsBefore };
+    const result: MaintenanceCycleReport = {
+      decayed: 0, archived: 0, orphansDetected: 0,
+      ...statsBefore,
+    };
+    if (opts.dedup) result.dedup = runDedupPass(core.db, ns, mergeFn, true, tier2);
+    if (opts.compactHistory) result.historyCompacted = runHistoryCompaction(core.db, ns, keepN, true).historyPruned;
+    if (warnings.length) result.warnings = warnings;
+    return result;
   }
 
-  const report = runMaintenance(core.db, core.config.namespace, core.config.maintenance);
+  const report = runMaintenance(core.db, ns, core.config.maintenance);
   let dedup: DedupPassReport | undefined;
-  if (opts.dedup) {
-    dedup = runDedupPass(
-      core.db,
-      core.config.namespace,
-      (s, t) => core.stateTree.mergeNodes(s, t),
-      false,
-      tier2,
-    );
-  }
+  if (opts.dedup) dedup = runDedupPass(core.db, ns, mergeFn, false, tier2);
+  let historyCompacted: number | undefined;
+  if (opts.compactHistory) historyCompacted = runHistoryCompaction(core.db, ns, keepN, false).historyPruned;
+
   const statsAfter = getStatus(core);
-  return { ...report, ...statsAfter, ...(dedup ? { dedup } : {}) };
+  return {
+    ...report,
+    ...statsAfter,
+    ...(dedup ? { dedup } : {}),
+    ...(historyCompacted !== undefined ? { historyCompacted } : {}),
+    ...(warnings.length ? { warnings } : {}),
+  };
 }

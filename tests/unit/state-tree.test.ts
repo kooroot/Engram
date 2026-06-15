@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { EventLog } from '../../src/db/event-log.js';
 import { StateTree } from '../../src/db/state-tree.js';
+import { runHistoryCompaction } from '../../src/engine/maintenance.js';
 
 const TEST_DB_DIR = path.join(import.meta.dirname, '..', '.test-data');
 const TEST_DB_PATH = path.join(TEST_DB_DIR, 'test-state.db');
@@ -95,6 +96,77 @@ describe('StateTree - Node Operations', () => {
     expect(history).toHaveLength(1);
     expect(JSON.parse(history[0].properties)).toEqual({ status: 'exploring' });
     expect(history[0].version).toBe(1);
+  });
+
+  it('should cap node_history to keep-last-N + original v1 when retention is enabled', () => {
+    // keepN = 3 → after many updates, retain the newest 3 snapshots plus v1.
+    const capped = new StateTree(db, eventLog, 'default', 3);
+    const { results: created } = capped.mutate([
+      { op: 'create', type: 'concept', name: 'Retained', properties: { v: 0 } },
+    ]);
+    const nodeId = created[0].node_id;
+
+    // 10 updates → live version reaches 11; history would otherwise hold v1..v10.
+    for (let i = 1; i <= 10; i++) {
+      capped.mutate([{ op: 'update', node_id: nodeId, set: { v: i } }]);
+    }
+
+    const history = db
+      .prepare('SELECT version, properties FROM node_history WHERE node_id = ? ORDER BY version')
+      .all(nodeId) as Array<{ version: number; properties: string }>;
+
+    // newest 3 (v8,v9,v10) + the original (v1) — intermediate v2..v7 pruned.
+    expect(history.map(h => h.version)).toEqual([1, 8, 9, 10]);
+    // v1 still holds the genuine original snapshot, not a later one.
+    expect(JSON.parse(history[0].properties)).toEqual({ v: 0 });
+
+    // Current state is untouched by retention — history is audit/display only.
+    const node = capped.getNode(nodeId)!;
+    expect(node.version).toBe(11);
+    expect(node.properties).toEqual({ v: 10 });
+  });
+
+  it('should keep full node_history when retention is disabled (default)', () => {
+    // Default stateTree (historyKeepVersions = 0) must preserve every snapshot.
+    const { results: created } = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'Unbounded', properties: { v: 0 } },
+    ]);
+    const nodeId = created[0].node_id;
+    for (let i = 1; i <= 6; i++) {
+      stateTree.mutate([{ op: 'update', node_id: nodeId, set: { v: i } }]);
+    }
+    const count = (db
+      .prepare('SELECT COUNT(*) AS c FROM node_history WHERE node_id = ?')
+      .get(nodeId) as { c: number }).c;
+    expect(count).toBe(6); // v1..v6, nothing pruned
+  });
+
+  it('runHistoryCompaction retroactively prunes existing history to keep-last-N + v1', () => {
+    // Seed an already-bloated node with the unlimited (default) tree.
+    const { results: created } = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'Bloated', properties: { v: 0 } },
+    ]);
+    const nodeId = created[0].node_id;
+    for (let i = 1; i <= 8; i++) {
+      stateTree.mutate([{ op: 'update', node_id: nodeId, set: { v: i } }]);
+    }
+    const count = () => (db
+      .prepare('SELECT COUNT(*) AS c FROM node_history WHERE node_id = ?')
+      .get(nodeId) as { c: number }).c;
+    expect(count()).toBe(8); // v1..v8 all retained
+
+    // Dry run reports the would-prune count but persists nothing.
+    const dry = runHistoryCompaction(db, 'default', 3, true);
+    expect(dry.historyPruned).toBe(4); // would drop v2..v5
+    expect(count()).toBe(8);
+
+    // Live run actually prunes to v1 + newest 3.
+    const live = runHistoryCompaction(db, 'default', 3, false);
+    expect(live.historyPruned).toBe(4);
+    const versions = (db
+      .prepare('SELECT version FROM node_history WHERE node_id = ? ORDER BY version')
+      .all(nodeId) as Array<{ version: number }>).map(r => r.version);
+    expect(versions).toEqual([1, 6, 7, 8]);
   });
 
   it('should delete a node and cascade edges', () => {

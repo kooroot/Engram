@@ -118,6 +118,8 @@ engram history "Alice"                     # version-by-version timeline
 engram context "Engram roadmap" \
   --strategy hybrid --max-tokens 2000      # same injection an agent would get
 engram maintenance --dry-run               # decay / archive / orphan preview
+engram maintenance --compact-history \
+  --dry-run                                # preview node_history pruning
 
 # Multi-tenant
 engram --namespace work status

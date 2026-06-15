@@ -5,6 +5,8 @@ export interface MaintenanceConfig {
   archiveConfidenceThreshold: number;
   archiveInactiveDays: number;
   orphanGraceDays: number;
+  /** Per-node cap on retained node_history snapshots (newest N + original v1). 0 disables pruning. */
+  historyKeepVersions: number;
 }
 
 const DEFAULT_CONFIG: MaintenanceConfig = {
@@ -12,12 +14,74 @@ const DEFAULT_CONFIG: MaintenanceConfig = {
   archiveConfidenceThreshold: 0.3,
   archiveInactiveDays: 90,
   orphanGraceDays: 30,
+  historyKeepVersions: 20,
 };
 
 export interface MaintenanceReport {
   decayed: number;
   archived: number;
   orphansDetected: number;
+}
+
+/**
+ * Per-node history-pruning DELETE, shared by the write-time cap (StateTree)
+ * and the retroactive compaction pass (runHistoryCompaction) so their semantics
+ * can never drift. Keeps the newest @keepN snapshots (by version) for one node
+ * PLUS its original (MIN(version), i.e. v1). Bind params: @node_id, @ns, @keepN.
+ * Call sites must skip execution when @keepN <= 0.
+ */
+export const HISTORY_PRUNE_SQL = `
+  DELETE FROM node_history
+  WHERE node_id = @node_id AND namespace = @ns
+    AND id NOT IN (
+      SELECT id FROM node_history
+      WHERE node_id = @node_id AND namespace = @ns
+      ORDER BY version DESC LIMIT @keepN
+    )
+    AND version <> (
+      SELECT MIN(version) FROM node_history
+      WHERE node_id = @node_id AND namespace = @ns
+    )
+`;
+
+/** Sentinel thrown to roll back the dry-run transaction (identity-checked). */
+const DRY_RUN_ABORT = new Error('history-compaction dry-run rollback');
+
+/**
+ * Retroactively compact node_history across a namespace: prune every node's
+ * snapshots to keep-last-N + original v1. Use to one-shot already-bloated nodes
+ * (the write-time cap only bounds NEW snapshots). Non-destructive to current
+ * state — node_history is audit/display only. Runs in a single transaction.
+ * When `dryRun` is true, performs the prune in a transaction that is rolled back,
+ * so the returned count reflects what WOULD be removed without persisting it.
+ */
+export function runHistoryCompaction(
+  db: Database.Database,
+  namespace: string = 'default',
+  keepVersions: number,
+  dryRun: boolean = false,
+): { historyPruned: number } {
+  if (keepVersions <= 0) return { historyPruned: 0 };
+
+  const nodeIds = db
+    .prepare('SELECT DISTINCT node_id FROM node_history WHERE namespace = ?')
+    .all(namespace) as Array<{ node_id: string }>;
+
+  const pruneStmt = db.prepare(HISTORY_PRUNE_SQL);
+  let historyPruned = 0;
+  const txn = db.transaction(() => {
+    for (const { node_id } of nodeIds) {
+      const res = pruneStmt.run({ node_id, ns: namespace, keepN: keepVersions });
+      historyPruned += res.changes;
+    }
+    if (dryRun) throw DRY_RUN_ABORT; // roll back — count only
+  });
+  try {
+    txn();
+  } catch (err) {
+    if (err !== DRY_RUN_ABORT) throw err;
+  }
+  return { historyPruned };
 }
 
 /**

@@ -14,6 +14,7 @@ import { nodeFromRow, edgeFromRow } from '../types/index.js';
 import { safeJsonParse } from '../utils.js';
 import { metrics, startTimer, safeNamespaceLabel } from '../metrics.js';
 import { isDedupCandidate } from '../engine/dedup.js';
+import { HISTORY_PRUNE_SQL } from '../engine/maintenance.js';
 import type { EventLog } from './event-log.js';
 
 type Stmt = Database.Statement;
@@ -48,8 +49,9 @@ export class StateTree {
   private deleteEdgeByIdStmt: Stmt;
   private deleteEdgeByTripletStmt: Stmt;
 
-  // History statement
+  // History statements
   private insertHistoryStmt: Stmt;
+  private pruneHistoryStmt: Stmt;
 
   // Post-mutation callbacks
   private onMutateCallbacks: MutationCallback[] = [];
@@ -59,6 +61,10 @@ export class StateTree {
     private db: Database.Database,
     private eventLog: EventLog,
     namespace: string = 'default',
+    /** Per-node node_history retention cap (newest N + original v1). 0 = unlimited
+     *  (the default for direct construction / tests). Production passes
+     *  config.maintenance.historyKeepVersions from createEngramCore. */
+    private historyKeepVersions: number = 0,
   ) {
     this.namespace = namespace;
 
@@ -131,6 +137,28 @@ export class StateTree {
       INSERT INTO node_history (node_id, version, properties, changed_by, namespace)
       VALUES (@node_id, @version, @properties, @changed_by, @namespace)
     `);
+
+    // History retention (write-time cap). Shares HISTORY_PRUNE_SQL with the
+    // retroactive maintenance pass so semantics can't drift. The just-inserted
+    // snapshot always carries the highest version, so it is never pruned and the
+    // post-commit changed_by back-fill (which targets fresh rowids) is unaffected.
+    // No-op when historyKeepVersions <= 0 (see pruneHistory()).
+    this.pruneHistoryStmt = db.prepare(HISTORY_PRUNE_SQL);
+  }
+
+  /**
+   * Prune a node's version history to keep-last-N + the original (v1).
+   * Bounds unbounded node_history growth. No-op when retention is disabled
+   * (historyKeepVersions <= 0). MUST be called inside the caller's transaction
+   * so it is atomic with the snapshot insert.
+   */
+  private pruneHistory(nodeId: string): void {
+    if (this.historyKeepVersions <= 0) return;
+    this.pruneHistoryStmt.run({
+      node_id: nodeId,
+      ns: this.namespace,
+      keepN: this.historyKeepVersions,
+    });
   }
 
   /** Returns the namespace this instance operates on */
@@ -289,6 +317,7 @@ export class StateTree {
                 namespace: this.namespace,
               });
               historyRowIds.push(histResult.lastInsertRowid);
+              this.pruneHistory(existing.id);
 
               // Merge policy (auto-merge at create-time) — INCOMING WINS on
               // conflict. This is "update" semantic: the agent just asked for
@@ -366,6 +395,7 @@ export class StateTree {
               namespace: this.namespace,
             });
             historyRowIds.push(histResult.lastInsertRowid);
+            this.pruneHistory(existing.id);
 
             const currentProps = safeJsonParse(existing.properties);
             if (op.set) Object.assign(currentProps, op.set);
@@ -398,6 +428,7 @@ export class StateTree {
               namespace: this.namespace,
             });
             historyRowIds.push(histResult.lastInsertRowid);
+            this.pruneHistory(toDelete.id);
             this.deleteNodeStmt.run(op.node_id, this.namespace);
             results.push({ op: 'delete', node_id: op.node_id, version: toDelete.version });
             affectedNodeIds.push(op.node_id);
@@ -641,6 +672,7 @@ export class StateTree {
         namespace: this.namespace,
       });
       historyRowId = histResult.lastInsertRowid;
+      this.pruneHistory(target.id);
 
       // Merge policy (retro consolidation) — TARGET WINS on key conflict.
       // The operator (or maintenance --dedup) picked target as canonical, so

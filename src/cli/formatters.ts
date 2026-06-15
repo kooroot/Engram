@@ -187,6 +187,8 @@ export function formatMaintenanceReport(report: {
   activeNodes: number;
   activeEdges: number;
   totalEvents: number;
+  historyCompacted?: number;
+  warnings?: string[];
   dedup?: {
     clusters: Array<{
       type: string;
@@ -212,6 +214,12 @@ export function formatMaintenanceReport(report: {
     `  Active edges       ${report.activeEdges}`,
     `  Total events       ${report.totalEvents}`,
   ];
+
+  if (report.historyCompacted !== undefined) {
+    const verb = dryRun ? 'Would prune' : 'History pruned';
+    lines.push(chalk.dim('─'.repeat(40)));
+    lines.push(`  ${verb}${' '.repeat(Math.max(1, 18 - verb.length))}${report.historyCompacted} history snapshot(s)`);
+  }
 
   if (report.dedup) {
     lines.push(chalk.dim('─'.repeat(40)));
@@ -239,6 +247,13 @@ export function formatMaintenanceReport(report: {
           lines.push(chalk.dim(`      • ${s.name}  (${s.matched_by}, score ${s.score.toFixed(2)})`));
         }
       }
+    }
+  }
+
+  if (report.warnings && report.warnings.length > 0) {
+    lines.push(chalk.dim('─'.repeat(40)));
+    for (const w of report.warnings) {
+      lines.push(chalk.yellow(`  ⚠ ${w}`));
     }
   }
   return lines.join('\n');

@@ -4,6 +4,11 @@ export interface ContextBuildOptions {
   maxTokens: number;
   includeProperties: boolean;
   includeEdges: boolean;
+  /** Cap on how many nodes of each `type` are injected (highest-confidence
+   *  first). Bounds pathological crowding — e.g. one project accumulating 60+
+   *  near-identical `decision` nodes would otherwise dominate the whole token
+   *  budget and starve the project summary / insights. Undefined = no cap. */
+  maxPerType?: number;
 }
 
 const DEFAULT_OPTIONS: ContextBuildOptions = {
@@ -32,6 +37,20 @@ export function buildContext(
     return b.updated_at.localeCompare(a.updated_at);
   });
 
+  // Per-type cap: keep the top-N highest-confidence nodes of each type so a
+  // single over-represented type (e.g. many near-duplicate decisions) can't
+  // crowd out the rest before the char-budget loop even runs.
+  const selected = (opts.maxPerType && opts.maxPerType > 0)
+    ? (() => {
+        const perType = new Map<string, number>();
+        return sorted.filter((node) => {
+          const n = (perType.get(node.type) ?? 0) + 1;
+          perType.set(node.type, n);
+          return n <= opts.maxPerType!;
+        });
+      })()
+    : sorted;
+
   // L4 fix: Build edge lookup for both outgoing and incoming edges per node
   const outEdgeMap = new Map<string, Edge[]>();
   const inEdgeMap = new Map<string, Edge[]>();
@@ -56,7 +75,7 @@ export function buildContext(
   const lines: string[] = [];
   let charCount = 0;
 
-  for (const node of sorted) {
+  for (const node of selected) {
     const section = formatNode(
       node,
       outEdgeMap.get(node.id) ?? [],

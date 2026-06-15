@@ -17,12 +17,18 @@
  * is acceptable for English-dominant project names; extend with
  * locale-aware folding when that becomes a real concern.
  *
- * TODO (Tier 2): semantic similarity via embeddings. When an embedding
- * provider is configured, extend isDedupCandidate with a vector-cosine
- * branch gated on same-type. Keep Tier 1 as the fast-path pre-filter so
- * we only pay embedding cost on ambiguous names. The call site in
- * state-tree.ts will need a pluggable matcher interface then — current
- * signature is intentionally narrow so Tier 2 wiring is additive.
+ * Tier 2 (semantic similarity via embeddings) is IMPLEMENTED, but layered on
+ * TOP of this matcher rather than inside it — because isDedupCandidate is pure
+ * and synchronous while embeddings need async I/O + a vecDb connection. The
+ * cosine branch lives at the scan/service layer, not here:
+ *   - retroactive: dedup-scan.ts `cosineSimilarity` + `Tier2Options.getEmbedding`
+ *     (run via `engram maintenance --dedup --semantic`)
+ *   - create-time (post-hoc, eventual-consistency): service.ts onMutate callback,
+ *     gated on `config.dedup.semanticAutoMerge` + a configured embedding provider.
+ * Tier 1 here stays the always-on, no-embeddings fast path. Tier 2 is INERT
+ * until an embedding provider is configured (provider="none" ⇒ no vectors ⇒
+ * cosine has nothing to compare), so name-distinct near-duplicates accumulate
+ * silently without one — `maintenance --semantic` warns when that happens.
  */
 
 export function normalizeName(name: string): string {

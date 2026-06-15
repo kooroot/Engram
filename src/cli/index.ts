@@ -415,10 +415,12 @@ export function registerCLICommands(program: Command): void {
     .option('-d, --dry-run', 'Preview without making changes')
     .option('--dedup', 'Also run retroactive dedup (Tier 1: normalized-name / token-subset / Jaccard ≥ 0.7)')
     .option('--semantic', 'When paired with --dedup, also run Tier 2 cosine-similarity matching using stored embeddings (requires an embedding provider)')
+    .option('--compact-history', 'Retroactively prune node version-history to keep-last-N + original v1 (bounds node_history bloat)')
     .action((opts) => withCore((core) => {
       const report = svc.runMaintenanceCycle(core, opts.dryRun ?? false, {
         dedup: opts.dedup,
         semantic: opts.semantic,
+        compactHistory: opts.compactHistory,
       });
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     }, ns())());

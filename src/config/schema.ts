@@ -33,6 +33,14 @@ export const ConfigSchema = z.object({
     archiveConfidenceThreshold: z.number().min(0).max(1).default(0.3),
     archiveInactiveDays: z.number().int().positive().default(90),
     orphanGraceDays: z.number().int().positive().default(30),
+    /** Per-node cap on retained version-history snapshots. Keeps the newest
+     *  N snapshots PLUS the original (v1); set 0 to disable pruning. Older
+     *  intermediate snapshots are pruned at write time (and retroactively via
+     *  `maintenance --compact-history`).
+     *  Bounds node_history growth — a hot node updated 300+ times was otherwise
+     *  storing 300+ full-`properties` blobs. Current node state is unaffected:
+     *  node_history is audit/display only, never replayed to compute state. */
+    historyKeepVersions: z.number().int().min(0).default(20),
   }).default({}),
 
   dedup: z.object({

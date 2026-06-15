@@ -89,6 +89,29 @@ describe('Context Builder', () => {
     expect(firstNodeLine).not.toContain('Alice');
   });
 
+  it('should cap nodes per type with maxPerType', () => {
+    // 5 distinct-named decisions (no auto-dedup) + 1 project, descending confidence.
+    const names = ['Alpha', 'Beta', 'Gamma', 'Delta', 'Epsilon'];
+    const ids = names.map((n, i) => {
+      const { results } = stateTree.mutate([
+        { op: 'create', type: 'decision', name: n, summary: `decision ${n}`, confidence: 0.9 - i * 0.01 },
+      ]);
+      return results[0].node_id;
+    });
+    const { results: proj } = stateTree.mutate([
+      { op: 'create', type: 'project', name: 'ProjX', summary: 'the project', confidence: 0.99 },
+    ]);
+    const nodes = [...ids, proj[0].node_id].map(id => stateTree.getNode(id)!);
+
+    const ctx = buildContext(nodes, [], { maxTokens: 5000, maxPerType: 2 });
+    const decisionHeaders = ctx.split('\n').filter(l => l.includes('[decision]'));
+    expect(decisionHeaders).toHaveLength(2);   // only top-2 highest-confidence decisions
+    expect(ctx).toContain('## Alpha [decision]');
+    expect(ctx).toContain('## Beta [decision]');
+    expect(ctx).not.toContain('Epsilon');      // lowest-confidence decision dropped
+    expect(ctx).toContain('## ProjX [project]'); // other types unaffected by the cap
+  });
+
   it('should estimate tokens correctly', () => {
     // L2: Updated to ~3.3 chars per token for JSON-heavy content
     expect(estimateTokens('hello world')).toBe(4); // 11 / 3.3 ≈ 3.33 → ceil = 4
