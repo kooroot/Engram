@@ -63,9 +63,19 @@ export function runHistoryCompaction(
 ): { historyPruned: number } {
   if (keepVersions <= 0) return { historyPruned: 0 };
 
+  // Pre-filter to nodes that can actually have prunable snapshots. A node with
+  // <= keepVersions+1 snapshots deletes nothing: HISTORY_PRUNE_SQL keeps the
+  // newest keepVersions rows and additionally protects MIN(version), so for
+  // keepVersions+1 rows the single non-kept row IS the min and is protected ->
+  // a guaranteed no-op DELETE. Skipping those (HAVING COUNT(*) > keepVersions+1)
+  // leaves historyPruned and the resulting history byte-identical while avoiding
+  // one correlated-subquery DELETE per under-cap node — the steady-state shape,
+  // since the write-time cap settles every mutated node at exactly keepN+1.
   const nodeIds = db
-    .prepare('SELECT DISTINCT node_id FROM node_history WHERE namespace = ?')
-    .all(namespace) as Array<{ node_id: string }>;
+    .prepare(
+      'SELECT node_id FROM node_history WHERE namespace = ? GROUP BY node_id HAVING COUNT(*) > ?'
+    )
+    .all(namespace, keepVersions + 1) as Array<{ node_id: string }>;
 
   const pruneStmt = db.prepare(HISTORY_PRUNE_SQL);
   let historyPruned = 0;
