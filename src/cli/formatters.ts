@@ -1,6 +1,6 @@
 import chalk from 'chalk';
 import type { Node, Edge, Event } from '../types/index.js';
-import type { StatusInfo, EdgeInfo, HistoryEntry } from '../service.js';
+import type { StatusInfo, EdgeInfo, HistoryEntry, ReembedReport } from '../service.js';
 
 // ─── Table ───────────────────────────────────────────────
 
@@ -256,6 +256,42 @@ export function formatMaintenanceReport(report: {
       lines.push(chalk.yellow(`  ⚠ ${w}`));
     }
   }
+  return lines.join('\n');
+}
+
+// ─── Reembed ─────────────────────────────────────────────
+
+export function formatReembedReport(reports: ReembedReport[], dryRun: boolean): string {
+  const prefix = dryRun ? chalk.yellow('[DRY RUN] ') : '';
+  const lines = [
+    chalk.bold(`${prefix}Re-embed Report`),
+    chalk.dim('─'.repeat(48)),
+  ];
+
+  const verb = dryRun ? 'would embed' : 'embedded';
+  let totalToEmbed = 0;
+  let totalEmbedded = 0;
+
+  for (const r of reports) {
+    totalToEmbed += r.toEmbed;
+    totalEmbedded += r.embedded;
+    const count = dryRun ? r.toEmbed : r.embedded;
+    lines.push(
+      `  ${chalk.cyan(r.namespace.padEnd(20))} ` +
+      `${String(count).padStart(6)} ${verb}  ` +
+      chalk.dim(`(${r.alreadyEmbedded}/${r.totalNodes} already had vectors)`),
+    );
+    for (const w of r.warnings) {
+      lines.push(chalk.yellow(`    ⚠ ${w}`));
+    }
+  }
+
+  if (reports.length !== 1) {
+    lines.push(chalk.dim('─'.repeat(48)));
+    const total = dryRun ? totalToEmbed : totalEmbedded;
+    lines.push(`  ${chalk.bold('Total'.padEnd(20))} ${String(total).padStart(6)} ${verb}`);
+  }
+
   return lines.join('\n');
 }
 

@@ -149,6 +149,39 @@ export class VectorStore {
     return text;
   }
 
+  /**
+   * Source IDs in this namespace that have a LIVE vector (a metadata row whose
+   * `id` also exists in vec_embeddings). The set the reembed backfill subtracts
+   * from "all nodes" to find what still needs embedding — a metadata row without
+   * a vec row counts as missing, so it gets re-embedded. Empty when vec is off.
+   */
+  liveSourceIds(sourceType: string): Set<string> {
+    if (!this.vecEnabled) return new Set();
+    const rows = this.db.prepare(`
+      SELECT e.source_id AS sid
+      FROM embeddings e
+      INNER JOIN vec_embeddings v ON v.id = e.id
+      WHERE e.source_type = ? AND e.namespace = ?
+    `).all(sourceType, this.namespace) as Array<{ sid: string }>;
+    return new Set(rows.map(r => r.sid));
+  }
+
+  /**
+   * The dimension baked into the existing vec_embeddings table (`float[N]`),
+   * parsed from its CREATE statement — or null when vec is off / the table is
+   * absent. The reembed guard compares this against the provider's dimension:
+   * vec0 columns are fixed-width, so a model swap to a different dimension can't
+   * INSERT and must rebuild the (namespace-shared) table rather than backfill.
+   */
+  tableDimension(): number | null {
+    if (!this.vecEnabled) return null;
+    const row = this.db.prepare(
+      "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'vec_embeddings'"
+    ).get() as { sql: string | null } | undefined;
+    const match = row?.sql?.match(/float\[(\d+)\]/i);
+    return match ? Number(match[1]) : null;
+  }
+
   removeBySource(sourceType: string, sourceId: string): number {
     const existing = this.getBySourceStmt.all(
       sourceType, sourceId, this.namespace
