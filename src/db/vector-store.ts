@@ -25,6 +25,7 @@ export class VectorStore {
 
   private searchAllStmt: Stmt | null = null;
   private searchByTypeStmt: Stmt | null = null;
+  private hasVecStmt: Stmt | null = null;
 
   constructor(
     private db: Database.Database,
@@ -59,6 +60,9 @@ export class VectorStore {
       );
       this.deleteVecStmt = this.db.prepare(
         'DELETE FROM vec_embeddings WHERE id = ?'
+      );
+      this.hasVecStmt = this.db.prepare(
+        'SELECT 1 FROM vec_embeddings WHERE id = ? LIMIT 1'
       );
       // Namespace filter joins via embeddings metadata
       this.searchAllStmt = this.db.prepare(`
@@ -125,6 +129,24 @@ export class VectorStore {
     }
 
     return id;
+  }
+
+  /**
+   * The embed-input text currently stored for a source — but ONLY when it is
+   * backed by a live vector row. Lets the auto-embed hook skip re-embedding when
+   * the text is unchanged, without the risk of leaving a node permanently
+   * without a vector. Returns null when there is no row, more than one row
+   * (ambiguous — re-embed to self-heal), or the metadata row exists but its
+   * vector is missing (self-heal). Namespace-scoped via getBySourceStmt.
+   */
+  getStoredEmbedText(sourceType: string, sourceId: string): string | null {
+    const rows = this.getBySourceStmt.all(
+      sourceType, sourceId, this.namespace
+    ) as Array<{ id: string; text: string }>;
+    if (rows.length !== 1) return null;
+    const { id, text } = rows[0];
+    if (this.vecEnabled && (!this.hasVecStmt || !this.hasVecStmt.get(id))) return null;
+    return text;
   }
 
   removeBySource(sourceType: string, sourceId: string): number {

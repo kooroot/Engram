@@ -79,6 +79,17 @@ function makeEmbeddingLookup(
 }
 
 /**
+ * The canonical embed-input for a node — the single source of truth so the
+ * auto-embed hook and any backfill path produce byte-identical vectors (and so
+ * the skip-unchanged guard compares against the same string that was stored).
+ */
+export function buildNodeEmbedText(
+  node: Pick<Node, 'name' | 'type' | 'properties' | 'summary'>,
+): string {
+  return node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+}
+
+/**
  * Merge source into target. Both can be IDs or names.
  * Returns counts of edges re-pointed and deduplicated.
  */
@@ -208,7 +219,16 @@ export function createEngramCore(
       for (const nodeId of nodeIds) {
         const node = stateTree.getNode(nodeId);
         if (!node || node.archived) continue;
-        const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+        const text = buildNodeEmbedText(node);
+        // Skip re-embedding when the embed-input is byte-identical to the live
+        // stored vector's text. link() fires this callback for BOTH edge
+        // endpoints, and confidence-only / summary-stable updates don't change
+        // the embed-input — re-embedding them is a wasted API call + DELETE +
+        // INSERT producing an identical vector. Leaving the existing vector
+        // also keeps Tier 2's getEmb() lookup intact. getStoredEmbedText returns
+        // null when no live vector backs the text, so first-creates and
+        // self-heal (missing-vector) cases still embed.
+        if (vectorStore.getStoredEmbedText('node', nodeId) === text) continue;
         pending.push({ nodeId, text });
       }
       if (pending.length === 0) return;
