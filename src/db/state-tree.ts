@@ -53,6 +53,16 @@ export class StateTree {
   private insertHistoryStmt: Stmt;
   private pruneHistoryStmt: Stmt;
 
+  // Post-commit linkage / merge statements. Hoisted to the constructor: shared
+  // by mutate/link/mergeNodes, which formerly re-prepared them per call or even
+  // inside the per-edge re-point loops.
+  private updateNodeEventRefStmt: Stmt;
+  private updateHistoryChangedByStmt: Stmt;
+  private updateEdgeEventRefStmt: Stmt;
+  private repointEdgeSourceStmt: Stmt;
+  private repointEdgeTargetStmt: Stmt;
+  private archiveNodeStmt: Stmt;
+
   // Post-mutation callbacks
   private onMutateCallbacks: MutationCallback[] = [];
   private pendingCallbacks: Set<Promise<void>> = new Set();
@@ -144,6 +154,26 @@ export class StateTree {
     // post-commit changed_by back-fill (which targets fresh rowids) is unaffected.
     // No-op when historyKeepVersions <= 0 (see pruneHistory()).
     this.pruneHistoryStmt = db.prepare(HISTORY_PRUNE_SQL);
+
+    // -- Post-commit linkage / merge (hoisted) --
+    this.updateNodeEventRefStmt = db.prepare(
+      'UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?'
+    );
+    this.updateHistoryChangedByStmt = db.prepare(
+      'UPDATE node_history SET changed_by = ? WHERE id = ?'
+    );
+    this.updateEdgeEventRefStmt = db.prepare(
+      'UPDATE edges SET event_id = ? WHERE id = ? AND namespace = ?'
+    );
+    this.repointEdgeSourceStmt = db.prepare(
+      'UPDATE edges SET source_id = ? WHERE id = ? AND namespace = ?'
+    );
+    this.repointEdgeTargetStmt = db.prepare(
+      'UPDATE edges SET target_id = ? WHERE id = ? AND namespace = ?'
+    );
+    this.archiveNodeStmt = db.prepare(
+      "UPDATE nodes SET archived = 1, updated_at = strftime('%Y-%m-%dT%H:%M:%f','now') WHERE id = ? AND namespace = ?"
+    );
   }
 
   /**
@@ -296,6 +326,8 @@ export class StateTree {
       merged_into_id: string;
       matched_by: 'exact' | 'substring' | 'jaccard';
     }> = [];
+    // Captured inside the transaction (the event is appended atomically now).
+    let eventId = 0;
 
     // Phase 6c — IMMEDIATE transaction closes the concurrent-write race.
     // Default DEFERRED txns acquire the write lock lazily (on first write),
@@ -469,48 +501,50 @@ export class StateTree {
           }
         }
       }
+      // Atomic finalize — append the event and back-fill event_id/changed_by
+      // INSIDE the same transaction so committed state always carries its
+      // immutable-log entry and audit linkage. (Formerly these ran as separate
+      // post-commit writes: a crash between commit and append left committed
+      // state with no event; a crash mid-backfill left event_id NULL forever.)
+      const event = this.eventLog.append({
+        type: 'mutation',
+        source: 'agent',
+        content: autoMerges.length > 0
+          ? { operations, auto_merges: autoMerges }
+          : { operations },
+        state_ref: affectedNodeIds,
+      });
+      eventId = event.id;
+      // Run unconditionally: a deleted node's id matches 0 rows here, so the
+      // former per-node existence SELECT was redundant.
+      for (const nodeId of affectedNodeIds) {
+        this.updateNodeEventRefStmt.run(event.id, nodeId, this.namespace);
+      }
+      // M8: attach event_id to only THIS mutation's history rows, by exact rowid.
+      for (const rowid of historyRowIds) {
+        this.updateHistoryChangedByStmt.run(event.id, rowid);
+      }
     });
 
     mutationTxn.immediate();
-
-    const event = this.eventLog.append({
-      type: 'mutation',
-      source: 'agent',
-      content: autoMerges.length > 0
-        ? { operations, auto_merges: autoMerges }
-        : { operations },
-      state_ref: affectedNodeIds,
-    });
-
-    const updateEventRef = this.db.prepare(
-      'UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?'
-    );
-    // M8: update only THIS mutation's history rows, by exact rowid
-    const updateHistoryById = this.db.prepare(
-      'UPDATE node_history SET changed_by = ? WHERE id = ?'
-    );
-    for (const nodeId of affectedNodeIds) {
-      const exists = this.getNodeByIdStmt.get(nodeId, this.namespace) as NodeRow | undefined;
-      if (exists) {
-        updateEventRef.run(event.id, nodeId, this.namespace);
-      }
-    }
-    for (const rowid of historyRowIds) {
-      updateHistoryById.run(event.id, rowid);
-    }
 
     this.fireCallbacks(affectedNodeIds);
 
     metrics.mutations.inc({ namespace: safeNamespaceLabel(this.namespace), kind: 'node' }, operations.length);
     metrics.mutationDuration.observe({ namespace: safeNamespaceLabel(this.namespace), kind: 'node' }, stopTimer());
 
-    return { results, event_id: event.id };
+    return { results, event_id: eventId };
   }
 
   link(operations: LinkOp[]): { results: LinkResult[]; event_id: number } {
     const stopTimer = startTimer();
     const results: LinkResult[] = [];
     const affectedEdgeIds: string[] = [];
+    // Endpoint nodes of created/updated edges — collected during the op loop so
+    // callbacks fire without the former post-commit existence re-query. Deletes
+    // are intentionally excluded (matches prior behavior).
+    const affectedNodeIds = new Set<string>();
+    let eventId = 0;
 
     const linkTxn = this.db.transaction(() => {
       for (const op of operations) {
@@ -561,6 +595,9 @@ export class StateTree {
               results.push({ op: 'create', edge_id: id });
               affectedEdgeIds.push(id);
             }
+            // Both branches touch these two nodes — record for callbacks.
+            affectedNodeIds.add(op.source_id);
+            affectedNodeIds.add(op.target_id);
             break;
           }
           case 'update': {
@@ -589,6 +626,8 @@ export class StateTree {
             });
             results.push({ op: 'update', edge_id: edgeRow.id });
             affectedEdgeIds.push(edgeRow.id);
+            affectedNodeIds.add(edgeRow.source_id);
+            affectedNodeIds.add(edgeRow.target_id);
             break;
           }
           case 'delete': {
@@ -610,29 +649,22 @@ export class StateTree {
           }
         }
       }
+      // Atomic finalize — append the event + back-fill edge event_id inside the
+      // same transaction (formerly post-commit writes; see mutate()).
+      const event = this.eventLog.append({
+        type: 'mutation',
+        source: 'agent',
+        content: { link_operations: operations },
+        state_ref: affectedEdgeIds,
+      });
+      eventId = event.id;
+      // Unconditional: a deleted edge's id matches 0 rows here.
+      for (const edgeId of affectedEdgeIds) {
+        this.updateEdgeEventRefStmt.run(event.id, edgeId, this.namespace);
+      }
     });
 
     linkTxn.immediate();
-
-    const event = this.eventLog.append({
-      type: 'mutation',
-      source: 'agent',
-      content: { link_operations: operations },
-      state_ref: affectedEdgeIds,
-    });
-
-    const updateEdgeRef = this.db.prepare(
-      'UPDATE edges SET event_id = ? WHERE id = ? AND namespace = ?'
-    );
-    const affectedNodeIds = new Set<string>();
-    for (const edgeId of affectedEdgeIds) {
-      const exists = this.getEdgeByIdStmt.get(edgeId, this.namespace) as EdgeRow | undefined;
-      if (exists) {
-        updateEdgeRef.run(event.id, edgeId, this.namespace);
-        affectedNodeIds.add(exists.source_id);
-        affectedNodeIds.add(exists.target_id);
-      }
-    }
 
     if (affectedNodeIds.size > 0) {
       this.fireCallbacks([...affectedNodeIds]);
@@ -641,7 +673,7 @@ export class StateTree {
     metrics.mutations.inc({ namespace: safeNamespaceLabel(this.namespace), kind: 'edge' }, operations.length);
     metrics.mutationDuration.observe({ namespace: safeNamespaceLabel(this.namespace), kind: 'edge' }, stopTimer());
 
-    return { results, event_id: event.id };
+    return { results, event_id: eventId };
   }
 
   private fireCallbacks(nodeIds: string[]): void {
@@ -741,9 +773,7 @@ export class StateTree {
           this.deleteEdgeByIdStmt.run(e.id, this.namespace);
           dedupEdges++;
         } else {
-          this.db.prepare(
-            'UPDATE edges SET source_id = ? WHERE id = ? AND namespace = ?'
-          ).run(target.id, e.id, this.namespace);
+          this.repointEdgeSourceStmt.run(target.id, e.id, this.namespace);
           mergedEdges++;
         }
       }
@@ -758,40 +788,35 @@ export class StateTree {
           this.deleteEdgeByIdStmt.run(e.id, this.namespace);
           dedupEdges++;
         } else {
-          this.db.prepare(
-            'UPDATE edges SET target_id = ? WHERE id = ? AND namespace = ?'
-          ).run(target.id, e.id, this.namespace);
+          this.repointEdgeTargetStmt.run(target.id, e.id, this.namespace);
           mergedEdges++;
         }
       }
 
       // 4. Archive source (keeps history, excludes from active queries)
-      this.db.prepare(
-        'UPDATE nodes SET archived = 1, updated_at = strftime(\'%Y-%m-%dT%H:%M:%f\',\'now\') WHERE id = ? AND namespace = ?'
-      ).run(source.id, this.namespace);
+      this.archiveNodeStmt.run(source.id, this.namespace);
+
+      // 5. Atomic finalize — append the merge event + back-fill event_id /
+      //    changed_by INSIDE the same transaction. Formerly post-commit writes
+      //    that, on a crash, could leave a committed merge unlogged or its
+      //    event_id/changed_by NULL forever.
+      const event = this.eventLog.append({
+        type: 'mutation',
+        source: 'agent',
+        content: {
+          operation: 'merge_nodes',
+          source_id: sourceId,
+          target_id: targetId,
+          merged_edges: mergedEdges,
+          dedup_edges: dedupEdges,
+        },
+        state_ref: [sourceId, targetId],
+      });
+      this.updateNodeEventRefStmt.run(event.id, target.id, this.namespace);
+      this.updateHistoryChangedByStmt.run(event.id, historyRowId);
     });
 
     txn.immediate();
-
-    // Log merge event
-    const event = this.eventLog.append({
-      type: 'mutation',
-      source: 'agent',
-      content: {
-        operation: 'merge_nodes',
-        source_id: sourceId,
-        target_id: targetId,
-        merged_edges: mergedEdges,
-        dedup_edges: dedupEdges,
-      },
-      state_ref: [sourceId, targetId],
-    });
-
-    // Reference the event on target and the specific history row we inserted
-    this.db.prepare('UPDATE nodes SET event_id = ? WHERE id = ? AND namespace = ?')
-      .run(event.id, target.id, this.namespace);
-    this.db.prepare('UPDATE node_history SET changed_by = ? WHERE id = ?')
-      .run(event.id, historyRowId);
 
     // Fire callbacks for both nodes (cache invalidation, re-embed)
     this.fireCallbacks([sourceId, targetId]);
