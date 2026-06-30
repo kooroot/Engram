@@ -1,24 +1,14 @@
-import type { Node } from '../types/index.js';
 import { metrics } from '../metrics.js';
 
 export interface CacheConfig {
-  maxNodes: number;
-  nodeTTLMs: number;
   contextCacheSize: number;
   contextTTLMs: number;
 }
 
 const DEFAULT_CACHE_CONFIG: CacheConfig = {
-  maxNodes: 10_000,
-  nodeTTLMs: 300_000,      // 5 minutes
   contextCacheSize: 100,
   contextTTLMs: 60_000,    // 1 minute
 };
-
-interface CachedNode {
-  node: Node;
-  cachedAt: number;
-}
 
 interface CachedContext {
   key: string;
@@ -28,61 +18,25 @@ interface CachedContext {
 }
 
 /**
- * In-memory cache for hot nodes and context results.
- * Node cache: Map with TTL eviction.
- * Context cache: LRU with TTL and invalidation on mutation.
+ * In-memory LRU + TTL cache for get_context results, invalidated whenever a
+ * node it references is mutated.
+ *
+ * A node-level cache used to live here but was never populated — StateTree
+ * reads go straight to SQLite, which is a fast indexed point lookup — so it
+ * only added dead eviction code and a misleading "reads are cached" signal.
+ * Removed in the Step-0 cleanup; the read-path N+1 is addressed by batching
+ * graph expansion in get_context instead.
  */
 export class EngineCache {
-  private nodeCache: Map<string, CachedNode>;
   private contextCache: Map<string, CachedContext>;
   private config: CacheConfig;
 
   constructor(config: Partial<CacheConfig> = {}) {
     this.config = { ...DEFAULT_CACHE_CONFIG, ...config };
-    this.nodeCache = new Map();
     this.contextCache = new Map();
   }
 
-  // ─── Node Cache ───────────────���─────────────────────────
-
-  getNode(id: string): Node | null {
-    const cached = this.nodeCache.get(id);
-    if (!cached) {
-      metrics.cacheMisses.inc({ kind: 'node' });
-      return null;
-    }
-
-    if (Date.now() - cached.cachedAt > this.config.nodeTTLMs) {
-      this.nodeCache.delete(id);
-      metrics.cacheMisses.inc({ kind: 'node' });
-      return null;
-    }
-
-    metrics.cacheHits.inc({ kind: 'node' });
-    return cached.node;
-  }
-
-  setNode(node: Node): void {
-    // Evict if at capacity
-    if (this.nodeCache.size >= this.config.maxNodes) {
-      this.evictOldestNodes(Math.floor(this.config.maxNodes * 0.1));
-    }
-
-    this.nodeCache.set(node.id, { node, cachedAt: Date.now() });
-  }
-
-  invalidateNode(id: string): void {
-    this.nodeCache.delete(id);
-
-    // Invalidate any context cache entries that reference this node
-    for (const [key, entry] of this.contextCache) {
-      if (entry.nodeIds.has(id)) {
-        this.contextCache.delete(key);
-      }
-    }
-  }
-
-  // ─── Context Cache ───────────────────────────��──────────
+  // ─── Context Cache ───────────────────────────────────────
 
   getContext(key: string): string | null {
     const cached = this.contextCache.get(key);
@@ -116,26 +70,25 @@ export class EngineCache {
     });
   }
 
-  // ─── Utilities ──────────────────────────────��───────────
+  /** Drop any cached context that references this node. Called from the
+   *  mutate/link/merge tool handlers so a stale recall can't survive a write. */
+  invalidateNode(id: string): void {
+    for (const [key, entry] of this.contextCache) {
+      if (entry.nodeIds.has(id)) {
+        this.contextCache.delete(key);
+      }
+    }
+  }
+
+  // ─── Utilities ───────────────────────────────────────────
 
   clear(): void {
-    this.nodeCache.clear();
     this.contextCache.clear();
   }
 
   get stats() {
     return {
-      nodeCount: this.nodeCache.size,
       contextCount: this.contextCache.size,
     };
-  }
-
-  private evictOldestNodes(count: number): void {
-    const entries = [...this.nodeCache.entries()]
-      .sort((a, b) => a[1].cachedAt - b[1].cachedAt);
-
-    for (let i = 0; i < count && i < entries.length; i++) {
-      this.nodeCache.delete(entries[i][0]);
-    }
   }
 }

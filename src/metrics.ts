@@ -167,11 +167,11 @@ export const metrics = {
   ),
   cacheHits: new Counter(
     'engram_cache_hits_total',
-    'Cache hits (context or node)'
+    'Context cache hits'
   ),
   cacheMisses: new Counter(
     'engram_cache_misses_total',
-    'Cache misses (context or node)'
+    'Context cache misses'
   ),
   embeddings: new Counter(
     'engram_embeddings_total',
