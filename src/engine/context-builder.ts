@@ -17,6 +17,14 @@ const DEFAULT_OPTIONS: ContextBuildOptions = {
   includeEdges: true,
 };
 
+/** Default per-type injection cap for get_context recall blocks (the
+ *  SessionStart / UserPromptSubmit hooks). Keeps the top-N highest-confidence
+ *  nodes of each type so one over-represented type (e.g. a project's many
+ *  near-duplicate decisions) can't crowd out the rest of the token budget.
+ *  Exported as the single source of truth for BOTH read paths — the MCP
+ *  get_context tool and service.getContext — so they stay in lockstep. */
+export const CONTEXT_MAX_PER_TYPE = 6;
+
 /**
  * Builds a token-efficient text representation of a subgraph
  * suitable for injection into an LLM prompt.

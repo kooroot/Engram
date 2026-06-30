@@ -218,6 +218,39 @@ export class StateTree {
     return rows.map(nodeFromRow);
   }
 
+  // ─── Batch reads (read-path expansion) ───────────────────────
+
+  /**
+   * Hydrate many nodes by id in a single query (namespace-scoped, active only).
+   * Order is not guaranteed. Used by the get_context batched expansion to avoid
+   * a per-neighbor point query (the former N+1). Prepared per call because the
+   * IN-list arity varies; better-sqlite3 caches by SQL string so repeated
+   * arities are cheap.
+   */
+  getNodesByIds(ids: string[]): Node[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(
+      `SELECT * FROM nodes WHERE id IN (${placeholders}) AND namespace = ? AND archived = 0`
+    ).all(...ids, this.namespace) as NodeRow[];
+    return rows.map(nodeFromRow);
+  }
+
+  /**
+   * Fetch all active edges touching any of `ids` (as source OR target) in a
+   * single query (namespace-scoped, active only). The set-wise analogue of
+   * getEdgesFrom + getEdgesTo, used by expandNeighborhood().
+   */
+  getEdgesForNodes(ids: string[]): Edge[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => '?').join(',');
+    const rows = this.db.prepare(
+      `SELECT * FROM edges WHERE namespace = ? AND archived = 0
+         AND (source_id IN (${placeholders}) OR target_id IN (${placeholders}))`
+    ).all(this.namespace, ...ids, ...ids) as EdgeRow[];
+    return rows.map(edgeFromRow);
+  }
+
   // ─── Edge Operations ─────────────────────────────────────────
 
   getEdge(id: string): Edge | null {

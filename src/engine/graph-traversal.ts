@@ -93,6 +93,46 @@ export function traverseGraph(
   };
 }
 
+/**
+ * Batched depth-1 neighborhood expansion for a SET of anchor nodes.
+ *
+ * Equivalent to running traverseGraph({ depth: 1, direction: 'both' }) from
+ * each anchor and unioning the results, but in 2 queries total instead of
+ * O(anchors) per-anchor traversals. The get_context read path (the hottest
+ * path, hit on every SessionStart / UserPromptSubmit) previously expanded
+ * every candidate individually — up to ~100 traversals, each re-fetching the
+ * anchor and re-SELECTing hub neighbors shared with other candidates. This
+ * collapses that to one edge query + one node query and dedups shared
+ * neighbors for free.
+ *
+ * Returns every active edge touching an anchor, plus the active neighbor nodes
+ * (excluding the anchors themselves). Matches traverseGraph's archived
+ * handling: a non-archived edge to an archived neighbor is still returned, but
+ * the archived neighbor node is not — buildContext then renders it by id, same
+ * as before.
+ */
+export function expandNeighborhood(
+  stateTree: StateTree,
+  anchorIds: string[],
+): { nodes: Node[]; edges: Edge[] } {
+  if (anchorIds.length === 0) return { nodes: [], edges: [] };
+
+  const anchorSet = new Set(anchorIds);
+  const edges = stateTree.getEdgesForNodes(anchorIds);
+
+  const neighborIds = new Set<string>();
+  for (const e of edges) {
+    if (!anchorSet.has(e.source_id)) neighborIds.add(e.source_id);
+    if (!anchorSet.has(e.target_id)) neighborIds.add(e.target_id);
+  }
+
+  const nodes = neighborIds.size > 0
+    ? stateTree.getNodesByIds([...neighborIds])
+    : [];
+
+  return { nodes, edges };
+}
+
 function getEdges(stateTree: StateTree, nodeId: string, direction: string): Edge[] {
   switch (direction) {
     case 'outgoing':
