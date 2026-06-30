@@ -52,6 +52,7 @@ export function loadConfig(overrides: ConfigOverrides = {}): Config {
       confidenceDecayFactor: overrides.maintenance?.confidenceDecayFactor,
       archiveConfidenceThreshold: overrides.maintenance?.archiveConfidenceThreshold,
       archiveInactiveDays: overrides.maintenance?.archiveInactiveDays,
+      archiveGraceDays: overrides.maintenance?.archiveGraceDays,
       orphanGraceDays: overrides.maintenance?.orphanGraceDays,
       historyKeepVersions: overrides.maintenance?.historyKeepVersions
         ?? (env['ENGRAM_HISTORY_KEEP_VERSIONS'] ? Number(env['ENGRAM_HISTORY_KEEP_VERSIONS']) : undefined),
