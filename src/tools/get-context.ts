@@ -4,10 +4,17 @@ import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import type { StateTree } from '../db/state-tree.js';
 import type { VectorStore } from '../db/vector-store.js';
 import type { Node, Edge } from '../types/index.js';
-import { traverseGraph } from '../engine/graph-traversal.js';
-import { buildContext } from '../engine/context-builder.js';
+import { expandNeighborhood } from '../engine/graph-traversal.js';
+import { buildContext, CONTEXT_MAX_PER_TYPE } from '../engine/context-builder.js';
+import { sanitizeFtsQuery } from '../service.js';
 import type { EngineCache } from '../engine/cache.js';
 import type { EmbeddingProvider } from '../embeddings/index.js';
+
+/** FTS candidate cap for the keyword branch. Kept in line with
+ *  service.getContext (CLI/REST) so the MCP and service read paths surface the
+ *  same candidate pool — and the per-type cap + 2000-token budget discard most
+ *  of a wider pool anyway. */
+const FTS_CANDIDATE_LIMIT = 20;
 
 export function registerGetContext(
   server: McpServer,
@@ -39,24 +46,22 @@ export function registerGetContext(
       const allNodes = new Map<string, Node>();
       const allEdges = new Map<string, Edge>();
 
+      // Candidate gathering — accumulate anchor nodes from every active
+      // strategy, then expand ONCE (below). Mirrors service.getContext so the
+      // two read paths can't drift.
+
       // 1. Direct entity resolution
       if (entities && entities.length > 0) {
         for (const entity of entities) {
           const node = stateTree.getNode(entity) ?? stateTree.getNodeByName(entity);
-          if (node) {
-            allNodes.set(node.id, node);
-            expandFromNode(stateTree, node.id, allNodes, allEdges);
-          }
+          if (node) allNodes.set(node.id, node);
         }
       }
 
-      // 2. Graph-based keyword search (H1: search ALL node types, not hardcoded list)
+      // 2. Graph keyword search (FTS5, all node types)
       if (topic && (strategy === 'graph' || strategy === 'hybrid')) {
-        const keywords = topic.toLowerCase().split(/\s+/);
-        const candidates = findNodesByKeywords(stateTree, keywords);
-        for (const node of candidates) {
+        for (const node of searchByKeywords(stateTree, topic, FTS_CANDIDATE_LIMIT)) {
           allNodes.set(node.id, node);
-          expandFromNode(stateTree, node.id, allNodes, allEdges);
         }
       }
 
@@ -70,13 +75,9 @@ export function registerGetContext(
               limit: 10,
               sourceType: 'node',
             });
-
             for (const result of vecResults) {
               const node = stateTree.getNode(result.source_id);
-              if (node && !node.archived) {
-                allNodes.set(node.id, node);
-                expandFromNode(stateTree, node.id, allNodes, allEdges);
-              }
+              if (node && !node.archived) allNodes.set(node.id, node);
             }
           } catch {
             // Embedding failed — fall back to graph results only
@@ -84,10 +85,7 @@ export function registerGetContext(
         }
       }
 
-      const nodes = [...allNodes.values()];
-      const edges = [...allEdges.values()];
-
-      if (nodes.length === 0) {
+      if (allNodes.size === 0) {
         return {
           content: [{
             type: 'text' as const,
@@ -96,7 +94,21 @@ export function registerGetContext(
         };
       }
 
-      const context = buildContext(nodes, edges, { maxTokens: max_tokens });
+      // 4. Single batched depth-1 expansion over all candidates. Replaces the
+      //    former per-candidate traverseGraph (an N+1: up to ~100 candidates ×
+      //    anchor re-fetch + per-neighbor point queries) with ~2 queries, and
+      //    dedups shared neighbors for free.
+      const { nodes: neighbors, edges } = expandNeighborhood(stateTree, [...allNodes.keys()]);
+      for (const n of neighbors) if (!allNodes.has(n.id)) allNodes.set(n.id, n);
+      for (const e of edges) allEdges.set(e.id, e);
+
+      const nodes = [...allNodes.values()];
+      // maxPerType: same diversity cap service.getContext applies, so one
+      // over-represented type can't crowd out the agent-facing recall block.
+      const context = buildContext(nodes, [...allEdges.values()], {
+        maxTokens: max_tokens,
+        maxPerType: CONTEXT_MAX_PER_TYPE,
+      });
       cache.setContext(cacheKey, context, nodes.map(n => n.id));
 
       return { content: [{ type: 'text' as const, text: context }] };
@@ -112,49 +124,27 @@ export function registerGetContext(
   });
 }
 
-function expandFromNode(
-  stateTree: StateTree,
-  nodeId: string,
-  allNodes: Map<string, Node>,
-  allEdges: Map<string, Edge>,
-): void {
-  const result = traverseGraph(stateTree, {
-    from: nodeId,
-    direction: 'both',
-    depth: 1,
-  });
-  for (const n of result.nodes) allNodes.set(n.id, n);
-  for (const e of result.edges) allEdges.set(e.id, e);
-}
-
 /**
- * Fast FTS5-backed keyword search (with JS fallback).
+ * FTS5-backed keyword search with a JS linear-scan fallback for inputs FTS5
+ * can't parse. Uses the same sanitizer as service.searchNodes so the MCP and
+ * CLI/REST keyword branches behave identically (quoted phrases preserved,
+ * plain tokens prefix-matched and OR-joined).
  */
-function findNodesByKeywords(stateTree: StateTree, keywords: string[]): Node[] {
-  if (keywords.length === 0) return [];
-
-  // Build FTS5 OR query with prefix match per keyword
-  const sanitized = keywords
-    .map(kw => kw.replace(/["()\-*:^]/g, ''))
-    .filter(Boolean)
-    .map(kw => `${kw}*`)
-    .join(' OR ');
-
+function searchByKeywords(stateTree: StateTree, topic: string, limit: number): Node[] {
+  const sanitized = sanitizeFtsQuery(topic);
   if (!sanitized) return [];
-
   try {
-    return stateTree.searchFts(sanitized, 100);
+    return stateTree.searchFts(sanitized, limit);
   } catch {
-    // Fallback: linear scan
-    const allActive = stateTree.searchAllNodes(500);
+    const keywords = topic.toLowerCase().split(/\s+/).filter(Boolean);
     const results: Node[] = [];
-    for (const node of allActive) {
+    for (const node of stateTree.searchAllNodes(500)) {
       const hay = [
         node.name, node.type, node.summary ?? '',
         JSON.stringify(node.properties),
       ].join(' ').toLowerCase();
       if (keywords.some(kw => hay.includes(kw))) results.push(node);
     }
-    return results;
+    return results.slice(0, limit);
   }
 }

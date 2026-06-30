@@ -14,8 +14,8 @@ import { UsageLog } from './db/usage-log.js';
 import { EngineCache } from './engine/cache.js';
 import { getStateStats, runMaintenance, runHistoryCompaction, type MaintenanceReport } from './engine/maintenance.js';
 import { runDedupPass, cosineSimilarity, type DedupPassReport, type Tier2Options } from './engine/dedup-scan.js';
-import { traverseGraph } from './engine/graph-traversal.js';
-import { buildContext } from './engine/context-builder.js';
+import { expandNeighborhood } from './engine/graph-traversal.js';
+import { buildContext, CONTEXT_MAX_PER_TYPE } from './engine/context-builder.js';
 import type { Node, Edge, Event, EventType } from './types/index.js';
 import type { EmbeddingProvider } from './embeddings/index.js';
 import { OpenAIEmbeddingProvider } from './embeddings/openai.js';
@@ -28,11 +28,6 @@ import { log } from './logger.js';
 
 export { exportNamespace, importBundle } from './port.js';
 export type { ExportBundle, ExportOptions, ImportOptions, ImportResult } from './port.js';
-
-/** Max nodes of each type injected into a getContext() recall block. Bounds the
- *  SessionStart/UserPromptSubmit hook so one over-represented type (e.g. a
- *  project's many near-duplicate decisions) can't starve the rest. */
-const CONTEXT_MAX_PER_TYPE = 6;
 
 /** Resolve a node by ID or name */
 function resolveNode(core: EngramCore, idOrName: string): Node | null {
@@ -457,7 +452,7 @@ export function searchNodes(
  * plain tokens are prefix-matched (`engi*` matches engineer/engineering)
  * and joined with OR so any match wins.
  */
-function sanitizeFtsQuery(input: string): string {
+export function sanitizeFtsQuery(input: string): string {
   const trimmed = input.trim();
   if (!trimmed) return '';
   const out: string[] = [];
@@ -587,34 +582,31 @@ export async function getContext(
   const allNodes = new Map<string, Node>();
   const allEdges = new Map<string, Edge>();
 
+  // Candidate gathering — accumulate anchor nodes from every active strategy,
+  // then expand ONCE (below). Previously each candidate was expanded inline via
+  // a per-node depth-1 traversal (an N+1 hot spot); now expansion is batched.
+
   // Direct entity resolution
   if (opts.entities) {
     for (const entity of opts.entities) {
       const node = core.stateTree.getNode(entity)
         ?? core.stateTree.getNodeByName(entity);
-      if (node) {
-        allNodes.set(node.id, node);
-        expand(core, node.id, allNodes, allEdges);
-      }
+      if (node) allNodes.set(node.id, node);
     }
   }
 
   // Graph keyword search
   if (opts.topic && (strategy === 'graph' || strategy === 'hybrid')) {
-    const candidates = searchNodes(core, opts.topic, 20);
-    for (const node of candidates) {
+    for (const node of searchNodes(core, opts.topic, 20)) {
       allNodes.set(node.id, node);
-      expand(core, node.id, allNodes, allEdges);
     }
   }
 
   // Semantic vector search
   if (opts.topic && (strategy === 'semantic' || strategy === 'hybrid')) {
     try {
-      const semantic = await semanticSearch(core, opts.topic, 10);
-      for (const node of semantic) {
+      for (const node of await semanticSearch(core, opts.topic, 10)) {
         allNodes.set(node.id, node);
-        expand(core, node.id, allNodes, allEdges);
       }
     } catch {
       // Semantic search failed — fall back to graph results only
@@ -626,6 +618,12 @@ export async function getContext(
     return 'No relevant context found.';
   }
 
+  // Single batched depth-1 expansion over all candidates (replaces the former
+  // per-candidate traverseGraph N+1; dedups shared neighbors for free).
+  const { nodes: neighbors, edges } = expandNeighborhood(core.stateTree, [...allNodes.keys()]);
+  for (const n of neighbors) if (!allNodes.has(n.id)) allNodes.set(n.id, n);
+  for (const e of edges) allEdges.set(e.id, e);
+
   const out = buildContext(
     [...allNodes.values()],
     [...allEdges.values()],
@@ -636,21 +634,6 @@ export async function getContext(
   );
   metrics.contextDuration.observe({ namespace: safeNamespaceLabel(core.config.namespace), strategy }, stopTimer());
   return out;
-}
-
-function expand(
-  core: EngramCore,
-  nodeId: string,
-  allNodes: Map<string, Node>,
-  allEdges: Map<string, Edge>,
-): void {
-  const result = traverseGraph(core.stateTree, {
-    from: nodeId,
-    direction: 'both',
-    depth: 1,
-  });
-  for (const n of result.nodes) allNodes.set(n.id, n);
-  for (const e of result.edges) allEdges.set(e.id, e);
 }
 
 // ─── Maintenance ─────────────────────────────────────────

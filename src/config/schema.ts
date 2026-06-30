@@ -10,8 +10,6 @@ export const ConfigSchema = z.object({
     'Namespace must be alphanumeric with dashes/dots/underscores').default('default'),
 
   cache: z.object({
-    maxNodes: z.number().int().positive().default(10_000),
-    nodeTTLMs: z.number().int().positive().default(300_000),
     contextCacheSize: z.number().int().positive().default(100),
     contextTTLMs: z.number().int().positive().default(60_000),
   }).default({}),

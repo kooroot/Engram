@@ -160,9 +160,9 @@ export class VectorStore {
     let results: Array<{ id: string; distance: number }>;
 
     if (params.sourceType && params.sourceType !== 'all' && this.searchByTypeStmt) {
-      results = this.searchByTypeStmt.all(buffer, limit, params.sourceType, this.namespace) as any[];
+      results = this.searchByTypeStmt.all(buffer, limit, params.sourceType, this.namespace) as unknown as Array<{ id: string; distance: number }>;
     } else if (this.searchAllStmt) {
-      results = this.searchAllStmt.all(buffer, limit, this.namespace) as any[];
+      results = this.searchAllStmt.all(buffer, limit, this.namespace) as unknown as Array<{ id: string; distance: number }>;
     } else {
       return [];
     }
