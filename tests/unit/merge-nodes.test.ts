@@ -151,4 +151,98 @@ describe('mergeNodes', () => {
     expect(history.length).toBe(1);
     expect(JSON.parse(history[0].properties)).toEqual({ y: 2 });
   });
+
+  it('collapses a direct edge between the merged pair instead of making a self-loop', () => {
+    const { results } = tree.mutate([
+      { op: 'create', type: 'concept', name: 'Src' },
+      { op: 'create', type: 'concept', name: 'Tgt' },
+    ]);
+    const [src, tgt] = results;
+    // Link the two duplicates BOTH ways — exactly the shape dedup operates on.
+    tree.link([
+      { op: 'create', source_id: src.node_id, predicate: 'related_to', target_id: tgt.node_id },
+      { op: 'create', source_id: tgt.node_id, predicate: 'is_a', target_id: src.node_id },
+    ]);
+
+    const result = tree.mergeNodes(src.node_id, tgt.node_id);
+
+    // Both inter-duplicate edges collapse into dedup_edges; neither becomes a
+    // target --> target self-loop.
+    expect(result.dedup_edges).toBe(2);
+    const selfLoops = [
+      ...tree.getEdgesFrom(tgt.node_id),
+      ...tree.getEdgesTo(tgt.node_id),
+    ].filter(e => e.source_id === e.target_id);
+    expect(selfLoops).toHaveLength(0);
+    expect(tree.getEdgesFrom(tgt.node_id)).toHaveLength(0);
+    expect(tree.getEdgesTo(tgt.node_id)).toHaveLength(0);
+  });
+});
+
+describe('EventLog.append concurrency semantics (P6b)', () => {
+  // better-sqlite3 is synchronous, so a true concurrent-writer race cannot be
+  // reproduced in-process. These tests pin the SQLite mechanism the .immediate
+  // fix relies on: a DEFERRED read-then-write upgrade fails with
+  // SQLITE_BUSY_SNAPSHOT (which busy_timeout cannot retry), whereas a txn that
+  // BEGINs IMMEDIATE takes the write lock up front and never hits that window.
+  const DIR = path.join(import.meta.dirname, '..', '.test-data');
+  const P = path.join(DIR, 'test-eventlog-concurrency.db');
+
+  const fresh = () => {
+    fs.mkdirSync(DIR, { recursive: true });
+    for (const ext of ['', '-wal', '-shm']) if (fs.existsSync(P + ext)) fs.unlinkSync(P + ext);
+    const db = new Database(P);
+    db.pragma('journal_mode = WAL');
+    db.exec('CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)');
+    db.prepare('INSERT INTO t (v) VALUES (1)').run();
+    db.close();
+  };
+
+  afterEach(() => {
+    for (const ext of ['', '-wal', '-shm']) if (fs.existsSync(P + ext)) fs.unlinkSync(P + ext);
+  });
+
+  // better-sqlite3 surfaces the SQLite extended result code on err.code; the
+  // human-readable err.message is just "database is locked" for the whole BUSY
+  // family. We assert on .code so the two cases are distinguishable.
+  const codeOfThrow = (fn: () => void): string | undefined => {
+    try { fn(); return undefined; }
+    catch (e) { return (e as { code?: string }).code; }
+  };
+
+  it('DEFERRED read-then-write upgrade fails with SQLITE_BUSY_SNAPSHOT when a writer commits in between', () => {
+    fresh();
+    const a = new Database(P); a.pragma('busy_timeout = 0');
+    const b = new Database(P); b.pragma('busy_timeout = 0');
+    try {
+      a.exec('BEGIN');                                  // DEFERRED — starts read-only
+      a.prepare('SELECT v FROM t WHERE id = 1').get();  // take a read snapshot
+      b.prepare('UPDATE t SET v = 2 WHERE id = 1').run(); // another connection commits
+      // The snapshot-upgrade conflict: busy_timeout cannot retry SNAPSHOT, which
+      // is exactly why a DEFERRED append() would fail under a concurrent writer.
+      expect(codeOfThrow(() => a.prepare('UPDATE t SET v = 3 WHERE id = 1').run()))
+        .toBe('SQLITE_BUSY_SNAPSHOT');
+      a.exec('ROLLBACK');
+    } finally {
+      a.close(); b.close();
+    }
+  });
+
+  it('BEGIN IMMEDIATE takes the write lock up front, so the writer never hits the snapshot window', () => {
+    fresh();
+    const a = new Database(P); a.pragma('busy_timeout = 0');
+    const b = new Database(P); b.pragma('busy_timeout = 0');
+    try {
+      a.exec('BEGIN IMMEDIATE');                         // acquire write lock at BEGIN
+      // b is locked out with plain SQLITE_BUSY (not SNAPSHOT) — a contention that
+      // busy_timeout WOULD retry, so the IMMEDIATE writer is safe across clients.
+      expect(codeOfThrow(() => b.prepare('UPDATE t SET v = 9 WHERE id = 1').run()))
+        .toBe('SQLITE_BUSY');
+      a.prepare('UPDATE t SET v = 3 WHERE id = 1').run(); // a proceeds, no snapshot conflict
+      a.exec('COMMIT');
+      expect((a.prepare('SELECT v FROM t WHERE id = 1').get() as { v: number }).v).toBe(3);
+    } finally {
+      a.close(); b.close();
+    }
+  });
 });

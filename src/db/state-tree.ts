@@ -766,6 +766,15 @@ export class StateTree {
       //   If target --predicate--> X already exists: delete the source edge (dedup)
       const outEdges = this.getEdgesBySourceStmt.all(source.id, this.namespace) as EdgeRow[];
       for (const e of outEdges) {
+        // source --predicate--> target would re-point to target --predicate-->
+        // target, a self-loop ("X related_to X" noise in every get_context for
+        // X). The two merged nodes being directly linked is exactly what dedup
+        // operates on, so collapse the relationship instead of materializing it.
+        if (e.target_id === target.id) {
+          this.deleteEdgeByIdStmt.run(e.id, this.namespace);
+          dedupEdges++;
+          continue;
+        }
         const existing = this.getEdgeByTripletStmt.get(
           target.id, e.predicate, e.target_id, this.namespace
         ) as EdgeRow | undefined;
@@ -781,6 +790,15 @@ export class StateTree {
       // Incoming edges: X --predicate--> source becomes X --predicate--> target
       const inEdges = this.getEdgesByTargetStmt.all(source.id, this.namespace) as EdgeRow[];
       for (const e of inEdges) {
+        // target --predicate--> source would re-point to target --predicate-->
+        // target (self-loop). Same collapse as the outgoing case. Also catches
+        // a pre-existing source self-loop, which the outgoing pass re-points to
+        // have source_id = target.id and this pass then drops.
+        if (e.source_id === target.id) {
+          this.deleteEdgeByIdStmt.run(e.id, this.namespace);
+          dedupEdges++;
+          continue;
+        }
         const existing = this.getEdgeByTripletStmt.get(
           e.source_id, e.predicate, target.id, this.namespace
         ) as EdgeRow | undefined;

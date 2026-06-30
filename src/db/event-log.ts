@@ -39,7 +39,15 @@ export class EventLog {
     this.queryRecentStmt = db.prepare('SELECT * FROM events WHERE namespace = ? ORDER BY id DESC LIMIT ?');
     this.verifyAllStmt = db.prepare('SELECT * FROM events WHERE namespace = ? ORDER BY id ASC');
 
-    // C2 fix: Atomic read-last-checksum + insert prevents race conditions
+    // C2 fix: Atomic read-last-checksum + insert prevents race conditions.
+    // .immediate: acquire the write lock at BEGIN. This txn reads the last
+    // event (for the checksum chain) then writes; a default DEFERRED txn would
+    // start read-only and, under a concurrent writer in WAL mode, fail the
+    // read→write upgrade with SQLITE_BUSY_SNAPSHOT — which busy_timeout does NOT
+    // retry. Standalone append() (e.g. the MCP log_event tool) thus stays safe
+    // with multiple clients on one DB file. When append() runs nested inside a
+    // mutate/link/merge IMMEDIATE txn, better-sqlite3 uses a SAVEPOINT and
+    // ignores the mode, so that path is unchanged.
     this.appendTxn = db.transaction((params: {
       type: EventType;
       source: EventSource;
@@ -69,7 +77,7 @@ export class EventLog {
 
       const row = this.getByIdStmt.get(result.lastInsertRowid, this.namespace) as EventRow;
       return eventFromRow(row);
-    });
+    }).immediate;
   }
 
   append(params: {
