@@ -7,6 +7,7 @@ import { StateTree } from '../../src/db/state-tree.js';
 import { traverseGraph } from '../../src/engine/graph-traversal.js';
 import { buildContext, estimateTokens } from '../../src/engine/context-builder.js';
 import { seedTestGraph } from '../fixtures/seed-data.js';
+import type { Node, Edge } from '../../src/types/index.js';
 
 const TEST_DB_DIR = path.join(import.meta.dirname, '..', '.test-data');
 const TEST_DB_PATH = path.join(TEST_DB_DIR, 'test-context.db');
@@ -117,5 +118,48 @@ describe('Context Builder', () => {
     expect(estimateTokens('hello world')).toBe(4); // 11 / 3.3 ≈ 3.33 → ceil = 4
     expect(estimateTokens('')).toBe(0);
     expect(estimateTokens('a'.repeat(330))).toBe(100); // 330 / 3.3 = 100
+  });
+});
+
+describe('Context Builder — budget loop & edge cap (P6)', () => {
+  let seq = 0;
+  const TS = '2026-01-01T00:00:00.000';
+  const mkNode = (o: Partial<Node> & { name: string }): Node => ({
+    id: o.id ?? `n${seq++}`, type: o.type ?? 'concept', name: o.name,
+    properties: o.properties ?? {}, summary: o.summary ?? null,
+    confidence: o.confidence ?? 1.0, created_at: TS, updated_at: o.updated_at ?? TS,
+    version: 1, archived: false, event_id: null,
+  });
+  const mkEdge = (source_id: string, target_id: string, o: Partial<Edge> = {}): Edge => ({
+    id: o.id ?? `e${seq++}`, source_id, predicate: o.predicate ?? 'relates_to', target_id,
+    properties: {}, confidence: o.confidence ?? 1.0, created_at: TS, updated_at: o.updated_at ?? TS,
+    version: 1, archived: false, event_id: null,
+  });
+
+  it('keeps fitting smaller nodes after an oversized one (no early break)', () => {
+    // 660-char budget. The first (highest-confidence) node overflows it; the
+    // loop must CONTINUE, not break, or the two small nodes vanish entirely.
+    const big = mkNode({ id: 'big', name: 'Big', confidence: 1.0, summary: 'X'.repeat(800) });
+    const s1 = mkNode({ id: 's1', name: 'SmallOne', confidence: 0.9, summary: 'tiny' });
+    const s2 = mkNode({ id: 's2', name: 'SmallTwo', confidence: 0.8, summary: 'tiny' });
+
+    const ctx = buildContext([big, s1, s2], [], { maxTokens: 200 });
+
+    expect(ctx).toContain('## Big [concept]');
+    expect(ctx).toContain('(truncated)');
+    expect(ctx).toContain('## SmallOne [concept]'); // would be dropped by the old `break`
+    expect(ctx).toContain('## SmallTwo [concept]');
+  });
+
+  it('caps edges per direction and summarizes the remainder as (+N more)', () => {
+    const hub = mkNode({ id: 'hub', name: 'Hub' });
+    const targets = Array.from({ length: 12 }, (_, i) => mkNode({ id: `t${i}`, name: `T${i}` }));
+    const edges = targets.map(t => mkEdge('hub', t.id));
+
+    const ctx = buildContext([hub, ...targets], edges, { maxTokens: 100_000 });
+
+    const outLines = ctx.split('\n').filter(l => l.startsWith('-> ') && !l.includes('more'));
+    expect(outLines).toHaveLength(8);        // MAX_EDGES_PER_DIRECTION
+    expect(ctx).toContain('-> (+4 more)');   // 12 − 8 elided
   });
 });

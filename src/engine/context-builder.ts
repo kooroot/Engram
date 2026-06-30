@@ -25,6 +25,22 @@ const DEFAULT_OPTIONS: ContextBuildOptions = {
  *  get_context tool and service.getContext — so they stay in lockstep. */
 export const CONTEXT_MAX_PER_TYPE = 6;
 
+/** Max edges rendered per direction (outgoing / incoming) for a single node in
+ *  a context block. A hub node can have hundreds of edges; rendering them all
+ *  dumps dozens of `-> predicate: target` lines that crowd out other nodes (and
+ *  can blow the whole token budget). The highest-confidence, most-recent edges
+ *  are kept and the remainder is summarized as `(+N more)`. */
+const MAX_EDGES_PER_DIRECTION = 8;
+
+/** Highest-confidence first, then most-recent. Edge confidences are frequently
+ *  1.0, so the recency tiebreak keeps the cut deterministic rather than arbitrary. */
+function sortEdgesForDisplay(edges: Edge[]): Edge[] {
+  return [...edges].sort((a, b) => {
+    if (b.confidence !== a.confidence) return b.confidence - a.confidence;
+    return b.updated_at.localeCompare(a.updated_at);
+  });
+}
+
 /**
  * Builds a token-efficient text representation of a subgraph
  * suitable for injection into an LLM prompt.
@@ -94,13 +110,19 @@ export function buildContext(
     const sectionChars = section.length;
 
     if (charCount + sectionChars > maxChars) {
-      // Try to fit at least the header
+      // This node's full section doesn't fit. Emit just its header (so the
+      // agent knows it exists) if even that fits, then KEEP GOING — a later,
+      // smaller node may still fit the remaining budget. Using `break` here was
+      // a latent bug: one oversized section (e.g. a hub with many edges, or a
+      // very long summary) silently dropped every subsequent node from the
+      // response, sometimes collapsing the whole context to a single header.
       const header = `## ${node.name} [${node.type}]`;
       if (charCount + header.length + 20 <= maxChars) {
         lines.push(header);
         lines.push('(truncated)');
+        charCount += header.length + 12; // header + '\n\n(truncated)'
       }
-      break;
+      continue;
     }
 
     lines.push(section);
@@ -131,21 +153,29 @@ function formatNode(
     }
   }
 
-  // Outgoing edges: node -> target
+  // Outgoing edges: node -> target (capped; highest-confidence/most-recent kept)
   if (opts.includeEdges && outEdges.length > 0) {
-    for (const edge of outEdges) {
+    const sorted = sortEdgesForDisplay(outEdges);
+    for (const edge of sorted.slice(0, MAX_EDGES_PER_DIRECTION)) {
       const targetName = nodeNameMap.get(edge.target_id) ?? edge.target_id;
       const edgeConf = edge.confidence < 1.0 ? ` (${edge.confidence.toFixed(2)})` : '';
       lines.push(`-> ${edge.predicate}: ${targetName}${edgeConf}`);
     }
+    if (sorted.length > MAX_EDGES_PER_DIRECTION) {
+      lines.push(`-> (+${sorted.length - MAX_EDGES_PER_DIRECTION} more)`);
+    }
   }
 
-  // L4: Incoming edges: source -> node
+  // L4: Incoming edges: source -> node (capped)
   if (opts.includeEdges && inEdges.length > 0) {
-    for (const edge of inEdges) {
+    const sorted = sortEdgesForDisplay(inEdges);
+    for (const edge of sorted.slice(0, MAX_EDGES_PER_DIRECTION)) {
       const sourceName = nodeNameMap.get(edge.source_id) ?? edge.source_id;
       const edgeConf = edge.confidence < 1.0 ? ` (${edge.confidence.toFixed(2)})` : '';
       lines.push(`<- ${edge.predicate}: ${sourceName}${edgeConf}`);
+    }
+    if (sorted.length > MAX_EDGES_PER_DIRECTION) {
+      lines.push(`<- (+${sorted.length - MAX_EDGES_PER_DIRECTION} more)`);
     }
   }
 
