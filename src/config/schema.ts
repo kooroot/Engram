@@ -37,6 +37,10 @@ export const ConfigSchema = z.object({
     confidenceDecayFactor: z.number().min(0).max(1).default(0.95),
     archiveConfidenceThreshold: z.number().min(0).max(1).default(0.3),
     archiveInactiveDays: z.number().int().positive().default(90),
+    /** Min days a low-confidence node must sit untouched before it is archived.
+     *  Shields freshly-logged uncertain facts (below the threshold) from being
+     *  archived on the next maintenance cycle. Distinct from archiveInactiveDays. */
+    archiveGraceDays: z.number().int().positive().default(7),
     orphanGraceDays: z.number().int().positive().default(30),
     /** Per-node cap on retained version-history snapshots. Keeps the newest
      *  N snapshots PLUS the original (v1); set 0 to disable pruning. Older

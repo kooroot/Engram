@@ -117,3 +117,72 @@ describe('runMaintenance — idempotent confidence decay (P5)', () => {
     expect(read(id).last_decayed_at).toBeNull(); // never touched
   });
 });
+
+describe('runMaintenance — archive grace gate (P6c)', () => {
+  let db: Database.Database;
+  let stateTree: StateTree;
+
+  beforeEach(() => {
+    db = setupDb();
+    stateTree = new StateTree(db, new EventLog(db));
+  });
+  afterEach(() => {
+    db.close();
+    if (fs.existsSync(TEST_DB_PATH)) fs.unlinkSync(TEST_DB_PATH);
+  });
+
+  // archiveInactiveDays huge so decay never fires; isolate the low-confidence
+  // archive pass. 'concept' is also exempt from orphan archiving, so the only
+  // thing that can archive the subject is the confidence-threshold pass.
+  const GRACE_CFG = {
+    confidenceDecayFactor: 0.95,
+    archiveConfidenceThreshold: 0.3,
+    archiveInactiveDays: 3650,
+    archiveGraceDays: 7,
+    orphanGraceDays: 3650,
+    historyKeepVersions: 0,
+  };
+
+  const seedLowConfidence = (): string => {
+    const { results } = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'Uncertain', confidence: 0.2 },
+    ]);
+    return results[0].node_id;
+  };
+  const isArchived = (id: string) =>
+    (db.prepare('SELECT archived FROM nodes WHERE id = ?').get(id) as { archived: number }).archived === 1;
+
+  it('does NOT archive a freshly-created low-confidence node (within grace window)', () => {
+    const id = seedLowConfidence();
+    const r = runMaintenance(db, 'default', GRACE_CFG);
+    expect(r.archived).toBe(0);
+    expect(isArchived(id)).toBe(false); // survives — the agent may still reinforce it
+  });
+
+  it('archives a low-confidence node once it sits untouched past the grace window', () => {
+    const id = seedLowConfidence();
+    // Backdate updated_at beyond archiveGraceDays (7) — now genuinely stale.
+    db.prepare(
+      "UPDATE nodes SET updated_at = strftime('%Y-%m-%dT%H:%M:%f','now','-8 days') WHERE id = ?"
+    ).run(id);
+
+    const r = runMaintenance(db, 'default', GRACE_CFG);
+    expect(r.archived).toBe(1);
+    expect(isArchived(id)).toBe(true);
+  });
+
+  it('resets the grace clock when the node is updated (confidence stays low)', () => {
+    const id = seedLowConfidence();
+    // Make it old enough to archive...
+    db.prepare(
+      "UPDATE nodes SET updated_at = strftime('%Y-%m-%dT%H:%M:%f','now','-8 days') WHERE id = ?"
+    ).run(id);
+    // ...but a touch that keeps it below the threshold still bumps updated_at to
+    // now, so the grace window restarts and this cycle must not archive it.
+    stateTree.mutate([{ op: 'update', node_id: id, confidence: 0.25 }]);
+
+    const r = runMaintenance(db, 'default', GRACE_CFG);
+    expect(r.archived).toBe(0);
+    expect(isArchived(id)).toBe(false);
+  });
+});

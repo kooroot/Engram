@@ -4,6 +4,12 @@ export interface MaintenanceConfig {
   confidenceDecayFactor: number;
   archiveConfidenceThreshold: number;
   archiveInactiveDays: number;
+  /** Min days a node must sit untouched (by updated_at) before low-confidence
+   *  archiving applies. Protects freshly-created low-confidence nodes (an agent
+   *  may deliberately log an uncertain fact below the threshold) from being
+   *  archived on the very next maintenance cycle, before they can be reinforced
+   *  or referenced. Distinct from archiveInactiveDays (the decay window). */
+  archiveGraceDays: number;
   orphanGraceDays: number;
   /** Per-node cap on retained node_history snapshots (newest N + original v1). 0 disables pruning. */
   historyKeepVersions: number;
@@ -13,6 +19,7 @@ const DEFAULT_CONFIG: MaintenanceConfig = {
   confidenceDecayFactor: 0.95,
   archiveConfidenceThreshold: 0.3,
   archiveInactiveDays: 90,
+  archiveGraceDays: 7,
   orphanGraceDays: 30,
   historyKeepVersions: 20,
 };
@@ -149,17 +156,29 @@ export function runMaintenance(
   });
   report.decayed = decayResult.changes;
 
+  // Archive low-confidence nodes — but only those that have also been inactive
+  // for archiveGraceDays. Without the age gate, a node created (or updated) with
+  // an explicitly low confidence (an agent logging an uncertain fact below the
+  // threshold) was archived on the very next maintenance cycle — possibly the
+  // same day, since the SessionStart hook can trigger one — vanishing from
+  // get_context before it could be reinforced or referenced. The grace window
+  // lets a fresh uncertain fact survive; a real update bumps updated_at and
+  // resets the clock. Decay-driven archival is unaffected: decay only fires
+  // after archiveInactiveDays (>> archiveGraceDays) of inactivity, so a node
+  // decayed below the threshold is already well past the grace window.
   const archiveStmt = db.prepare(`
     UPDATE nodes
     SET archived = 1
     WHERE namespace = @ns
       AND archived = 0
       AND confidence < @threshold
+      AND updated_at < datetime('now', @graceAgo)
   `);
 
   const archiveResult = archiveStmt.run({
     ns: namespace,
     threshold: cfg.archiveConfidenceThreshold,
+    graceAgo: `-${cfg.archiveGraceDays} days`,
   });
   report.archived = archiveResult.changes;
 
