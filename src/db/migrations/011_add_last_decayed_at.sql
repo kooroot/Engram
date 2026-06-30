@@ -1,0 +1,16 @@
+-- P5: a separate "last decayed" clock for idempotent confidence decay.
+--
+-- The old decay (runMaintenance) multiplied confidence by
+-- factor^(now - updated_at) on every run while freezing updated_at, so running
+-- maintenance N times decayed N-fold. The decay step now measures elapsed days
+-- from MAX(updated_at, last_decayed_at) and advances last_decayed_at to now(),
+-- making re-runs idempotent (see src/engine/maintenance.ts).
+--
+-- Nullable, no backfill: the decay statement uses IFNULL(last_decayed_at,
+-- updated_at), so existing rows (and any future row inserted/imported without
+-- stamping this column) anchor to updated_at — exactly the original behavior —
+-- and receive a real last_decayed_at on their first decay. NULL therefore means
+-- "never decayed", which is accurate. SQLite cannot ADD COLUMN with a
+-- non-constant default, which is the other reason this stays nullable rather
+-- than defaulting to now().
+ALTER TABLE nodes ADD COLUMN last_decayed_at TEXT;

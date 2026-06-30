@@ -169,6 +169,42 @@ describe('StateTree - Node Operations', () => {
     expect(versions).toEqual([1, 6, 7, 8]);
   });
 
+  it('runHistoryCompaction pre-filter skips under-cap nodes and prunes only over-cap ones', () => {
+    // Settled node: keepN+1 snapshots (v1..v4 with keepN=3) — provably nothing
+    // to prune (newest 3 kept, v1 = MIN is protected). The pre-filter must
+    // exclude it so its per-node DELETE never runs, and it must stay untouched.
+    const { results: s } = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'Settled', properties: { v: 0 } },
+    ]);
+    const settledId = s[0].node_id;
+    for (let i = 1; i <= 4; i++) {
+      stateTree.mutate([{ op: 'update', node_id: settledId, set: { v: i } }]);
+    }
+
+    // Over-cap node: 8 snapshots, 4 prunable (v2..v5).
+    const { results: b } = stateTree.mutate([
+      { op: 'create', type: 'concept', name: 'Bloated', properties: { v: 0 } },
+    ]);
+    const bloatedId = b[0].node_id;
+    for (let i = 1; i <= 8; i++) {
+      stateTree.mutate([{ op: 'update', node_id: bloatedId, set: { v: i } }]);
+    }
+
+    const versionsOf = (id: string) => (db
+      .prepare('SELECT version FROM node_history WHERE node_id = ? ORDER BY version')
+      .all(id) as Array<{ version: number }>).map(r => r.version);
+
+    expect(versionsOf(settledId)).toEqual([1, 2, 3, 4]);
+    expect(versionsOf(bloatedId).length).toBe(8);
+
+    // historyPruned must come from the over-cap node ONLY (byte-identical to the
+    // unfiltered scan, which would also delete 0 from the settled node).
+    const live = runHistoryCompaction(db, 'default', 3, false);
+    expect(live.historyPruned).toBe(4);
+    expect(versionsOf(settledId)).toEqual([1, 2, 3, 4]); // untouched by pre-filter
+    expect(versionsOf(bloatedId)).toEqual([1, 6, 7, 8]);
+  });
+
   it('should delete a node and cascade edges', () => {
     const { results } = stateTree.mutate([
       { op: 'create', type: 'person', name: 'Charlie' },

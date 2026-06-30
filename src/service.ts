@@ -79,6 +79,129 @@ function makeEmbeddingLookup(
 }
 
 /**
+ * The canonical embed-input for a node — the single source of truth so the
+ * auto-embed hook and any backfill path produce byte-identical vectors (and so
+ * the skip-unchanged guard compares against the same string that was stored).
+ */
+export function buildNodeEmbedText(
+  node: Pick<Node, 'name' | 'type' | 'properties' | 'summary'>,
+): string {
+  return node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+}
+
+export interface ReembedOptions {
+  /** Re-embed every node, overwriting existing vectors (default: only nodes
+   *  with no live vector — the backfill case after enabling embeddings late). */
+  force?: boolean;
+  /** Nodes per embedding API call. Default 64. */
+  batchSize?: number;
+  /** Report counts without calling the provider or writing anything. */
+  dryRun?: boolean;
+}
+
+export interface ReembedReport {
+  namespace: string;
+  totalNodes: number;
+  alreadyEmbedded: number;
+  toEmbed: number;
+  embedded: number;
+  dryRun: boolean;
+  warnings: string[];
+}
+
+// Upper bound on nodes pulled in one listing. Far above any realistic
+// single-namespace graph (current scale ~1k); a hit is surfaced as a warning
+// rather than silently truncating the backfill.
+const REEMBED_NODE_LIMIT = 1_000_000;
+
+/**
+ * Backfill or refresh node embeddings for the current namespace.
+ *
+ * Default (incremental) embeds only nodes that have no live vector — the case
+ * where embeddings were enabled after data already existed. `force` re-embeds
+ * every node, overwriting in place. Reuses buildNodeEmbedText so backfilled
+ * vectors are byte-identical to what the auto-embed hook would have produced.
+ *
+ * Refuses (throws) when the provider's dimension differs from the existing vec
+ * table's: vec0 columns are fixed-width and shared across namespaces, so a
+ * dimension change needs a full rebuild, not a per-namespace backfill — failing
+ * loudly here beats letting every store() throw mid-run and leaving the index
+ * half-written.
+ */
+export async function reembedNamespace(
+  core: EngramCore,
+  opts: ReembedOptions = {},
+): Promise<ReembedReport> {
+  const ns = core.config.namespace;
+  const warnings: string[] = [];
+
+  if (!core.embeddingProvider || !core.vectorStore.isVecEnabled) {
+    throw new Error(
+      'Re-embed requires an embedding provider and vector support. ' +
+      'Set ENGRAM_EMBEDDING_PROVIDER (e.g. openai/ollama/local) and ensure sqlite-vec loaded.',
+    );
+  }
+
+  const tableDim = core.vectorStore.tableDimension();
+  const providerDim = core.embeddingProvider.dimension;
+  if (tableDim !== null && tableDim !== providerDim) {
+    throw new Error(
+      `Vector table is float[${tableDim}] but the provider produces ${providerDim}-dim vectors. ` +
+      'A dimension change requires rebuilding the (namespace-shared) vector index, ' +
+      'which `engram reembed` does not do. Delete the vec DB file to rebuild from scratch, ' +
+      'or configure a model whose dimension matches.',
+    );
+  }
+
+  const nodes = core.stateTree.searchAllNodes(REEMBED_NODE_LIMIT);
+  if (nodes.length === REEMBED_NODE_LIMIT) {
+    warnings.push(`Listed the first ${REEMBED_NODE_LIMIT} nodes; some may be unprocessed.`);
+  }
+
+  const live = core.vectorStore.liveSourceIds('node');
+  const alreadyEmbedded = nodes.reduce((n, node) => n + (live.has(node.id) ? 1 : 0), 0);
+  const targets = opts.force ? nodes : nodes.filter(node => !live.has(node.id));
+
+  const report: ReembedReport = {
+    namespace: ns,
+    totalNodes: nodes.length,
+    alreadyEmbedded,
+    toEmbed: targets.length,
+    embedded: 0,
+    dryRun: opts.dryRun ?? false,
+    warnings,
+  };
+
+  if (opts.dryRun || targets.length === 0) return report;
+
+  const batchSize = Math.max(1, opts.batchSize ?? 64);
+  const writeBatch = core.vecDb.db.transaction(
+    (items: Array<{ id: string; text: string }>, vectors: number[][]) => {
+      for (let i = 0; i < items.length; i++) {
+        core.vectorStore.removeBySource('node', items[i].id);
+        core.vectorStore.store({
+          source_type: 'node',
+          source_id: items[i].id,
+          text: items[i].text,
+          embedding: vectors[i],
+        });
+      }
+    },
+  );
+
+  for (let i = 0; i < targets.length; i += batchSize) {
+    const slice = targets.slice(i, i + batchSize);
+    const items = slice.map(node => ({ id: node.id, text: buildNodeEmbedText(node) }));
+    // Embed outside the transaction (network/CPU); persist the batch atomically.
+    const vectors = await core.embeddingProvider.embedBatch(items.map(it => it.text));
+    writeBatch(items, vectors);
+    report.embedded += items.length;
+  }
+
+  return report;
+}
+
+/**
  * Merge source into target. Both can be IDs or names.
  * Returns counts of edges re-pointed and deduplicated.
  */
@@ -133,6 +256,8 @@ export function resolveEmbeddingProvider(
         model: config.embedding.model,
         dimension: config.embedding.dimension,
         baseUrl: config.embedding.baseUrl,
+        timeoutMs: config.embedding.openaiTimeoutMs,
+        maxRetries: config.embedding.openaiMaxRetries,
       });
     case 'local':
       return new LocalEmbeddingProvider(config.embedding.dimension);
@@ -161,6 +286,8 @@ export function resolveEmbeddingProvider(
           model: config.embedding.model,
           dimension: config.embedding.dimension,
           baseUrl: config.embedding.baseUrl,
+          timeoutMs: config.embedding.openaiTimeoutMs,
+          maxRetries: config.embedding.openaiMaxRetries,
         });
       }
       return null;
@@ -208,7 +335,16 @@ export function createEngramCore(
       for (const nodeId of nodeIds) {
         const node = stateTree.getNode(nodeId);
         if (!node || node.archived) continue;
-        const text = node.summary ?? `${node.name} [${node.type}]: ${JSON.stringify(node.properties)}`;
+        const text = buildNodeEmbedText(node);
+        // Skip re-embedding when the embed-input is byte-identical to the live
+        // stored vector's text. link() fires this callback for BOTH edge
+        // endpoints, and confidence-only / summary-stable updates don't change
+        // the embed-input — re-embedding them is a wasted API call + DELETE +
+        // INSERT producing an identical vector. Leaving the existing vector
+        // also keeps Tier 2's getEmb() lookup intact. getStoredEmbedText returns
+        // null when no live vector backs the text, so first-creates and
+        // self-heal (missing-vector) cases still embed.
+        if (vectorStore.getStoredEmbedText('node', nodeId) === text) continue;
         pending.push({ nodeId, text });
       }
       if (pending.length === 0) return;

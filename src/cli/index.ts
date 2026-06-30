@@ -425,6 +425,52 @@ export function registerCLICommands(program: Command): void {
       console.log(fmt.formatMaintenanceReport(report, opts.dryRun ?? false));
     }, ns())());
 
+  // ─── reembed ─────────────────────────────────────
+
+  program
+    .command('reembed')
+    .description('Embed nodes into the vector index — backfill nodes missing a vector (e.g. after enabling embeddings), or refresh all with --force')
+    .option('-f, --force', 'Re-embed every node, overwriting existing vectors (default: only nodes missing a vector)')
+    .option('-a, --all-namespaces', 'Re-embed across every namespace (default: current namespace only)')
+    .option('-b, --batch-size <n>', 'Nodes per embedding API call', '64')
+    .option('-d, --dry-run', 'Report what would be embedded without calling the provider')
+    .action(async (opts) => {
+      const reembedOpts = {
+        force: Boolean(opts.force),
+        batchSize: safeInt(opts.batchSize, 64),
+        dryRun: Boolean(opts.dryRun),
+      };
+      const reports = [] as Awaited<ReturnType<typeof svc.reembedNamespace>>[];
+
+      const runOne = async (namespace?: string) => {
+        const core = createEngramCore(namespace ? { namespace } : ns() ? { namespace: ns()! } : {});
+        try {
+          reports.push(await svc.reembedNamespace(core, reembedOpts));
+        } finally {
+          await core.closeAsync();
+        }
+      };
+
+      try {
+        if (opts.allNamespaces) {
+          const probe = createEngramCore(ns() ? { namespace: ns()! } : {});
+          let names: string[];
+          try {
+            names = svc.listNamespaces(probe);
+          } finally {
+            await probe.closeAsync();
+          }
+          for (const name of names) await runOne(name);
+        } else {
+          await runOne();
+        }
+        console.log(fmt.formatReembedReport(reports, reembedOpts.dryRun));
+      } catch (err) {
+        console.error('Re-embed failed:', err instanceof Error ? err.message : String(err));
+        process.exitCode = 1;
+      }
+    });
+
   // ─── merge ───────────────────────────────────────
 
   program

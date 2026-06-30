@@ -43,6 +43,10 @@ export function loadConfig(overrides: ConfigOverrides = {}): Config {
         ?? (env['ENGRAM_EMBEDDING_TIMEOUT_MS'] ? Number(env['ENGRAM_EMBEDDING_TIMEOUT_MS']) : undefined),
       ollamaUrl: overrides.embedding?.ollamaUrl ?? env['OLLAMA_URL'],
       ollamaModel: overrides.embedding?.ollamaModel ?? env['OLLAMA_MODEL'],
+      openaiTimeoutMs: overrides.embedding?.openaiTimeoutMs
+        ?? (env['ENGRAM_OPENAI_TIMEOUT_MS'] ? Number(env['ENGRAM_OPENAI_TIMEOUT_MS']) : undefined),
+      openaiMaxRetries: overrides.embedding?.openaiMaxRetries
+        ?? (env['ENGRAM_OPENAI_MAX_RETRIES'] ? Number(env['ENGRAM_OPENAI_MAX_RETRIES']) : undefined),
     },
     maintenance: {
       confidenceDecayFactor: overrides.maintenance?.confidenceDecayFactor,
