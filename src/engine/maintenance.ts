@@ -108,15 +108,36 @@ export function runMaintenance(
   const cfg = { ...DEFAULT_CONFIG, ...config };
   const report: MaintenanceReport = { decayed: 0, archived: 0, orphansDetected: 0 };
 
-  // M4: Proportional confidence decay
+  // M4 + P5: Proportional, IDEMPOTENT confidence decay.
+  //
+  // The decay anchor is the LATER of updated_at and last_decayed_at, so decay is
+  // applied at most once per elapsed day and is safe to re-run:
+  //   - exponent = whole days since that anchor; SET advances last_decayed_at to
+  //     now(), so a second run the same day sees exponent 0 (the `>= 1` gate
+  //     below makes it a true no-op) instead of re-applying the full inactivity
+  //     exponent (the prior bug: factor^(now-updated_at) every run = N-fold decay).
+  //   - MAX(updated_at, last_decayed_at) means a real mutation (which advances
+  //     updated_at) implicitly resets the decay clock without the write path
+  //     touching last_decayed_at — so no StateTree change is needed and the guard
+  //     is self-correcting even for archive/merge/import paths.
+  //   - IFNULL(last_decayed_at, updated_at) handles NULL (existing rows pre-011,
+  //     freshly-created nodes, imported nodes): they anchor to updated_at, exactly
+  //     as the original code did, then get a real last_decayed_at on first decay.
+  // updated_at is intentionally NOT advanced here — it is load-bearing for the
+  // archive/orphan inactivity windows (below) and read-path recency ordering.
   const decayStmt = db.prepare(`
     UPDATE nodes
     SET confidence = confidence * POWER(@factor,
-      MAX(1, CAST(julianday('now') - julianday(updated_at) AS INTEGER))),
-        updated_at = updated_at
+          CAST(julianday('now')
+               - MAX(julianday(updated_at), julianday(IFNULL(last_decayed_at, updated_at)))
+               AS INTEGER)),
+        last_decayed_at = strftime('%Y-%m-%dT%H:%M:%f','now')
     WHERE namespace = @ns
       AND archived = 0
       AND updated_at < datetime('now', @daysAgo)
+      AND CAST(julianday('now')
+               - MAX(julianday(updated_at), julianday(IFNULL(last_decayed_at, updated_at)))
+               AS INTEGER) >= 1
       AND confidence > @threshold
   `);
 

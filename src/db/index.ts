@@ -103,6 +103,7 @@ export function initMainDb(config: Config): DatabaseConnection {
     '008_namespace_scope_fixes.sql',
     '009_add_usage_log.sql',
     '010_drop_redundant_indexes.sql',
+    '011_add_last_decayed_at.sql',
   ]);
 
   ensurePlannerStats(db);
