@@ -144,6 +144,8 @@ export function resolveEmbeddingProvider(
         model: config.embedding.model,
         dimension: config.embedding.dimension,
         baseUrl: config.embedding.baseUrl,
+        timeoutMs: config.embedding.openaiTimeoutMs,
+        maxRetries: config.embedding.openaiMaxRetries,
       });
     case 'local':
       return new LocalEmbeddingProvider(config.embedding.dimension);
@@ -172,6 +174,8 @@ export function resolveEmbeddingProvider(
           model: config.embedding.model,
           dimension: config.embedding.dimension,
           baseUrl: config.embedding.baseUrl,
+          timeoutMs: config.embedding.openaiTimeoutMs,
+          maxRetries: config.embedding.openaiMaxRetries,
         });
       }
       return null;

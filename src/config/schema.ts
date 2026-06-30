@@ -24,6 +24,13 @@ export const ConfigSchema = z.object({
     shellTimeoutMs: z.number().int().positive().default(30_000),
     ollamaUrl: z.string().optional(),
     ollamaModel: z.string().optional(),
+    /** Per-attempt abort deadline for the OpenAI provider. Bounds the awaited
+     *  auto-embed hook so a stalled API can't hang the read path or shutdown.
+     *  Separate from shellTimeoutMs (that one drives the shell provider). */
+    openaiTimeoutMs: z.number().int().positive().default(30_000),
+    /** Extra attempts after the first on a retryable OpenAI failure
+     *  (429 / 5xx / network / timeout). 0 disables retry. */
+    openaiMaxRetries: z.number().int().min(0).default(2),
   }).default({}),
 
   maintenance: z.object({
