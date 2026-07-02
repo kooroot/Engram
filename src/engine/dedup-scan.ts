@@ -16,14 +16,19 @@
  * This keeps the node most likely to be the "real" one and preserves
  * history order.
  *
- * Complexity: O(n²) per type bucket. Acceptable for typical engram sizes
- * (low thousands of nodes/type). For larger scales, swap in blocking /
- * LSH on normalized names — the isDedupCandidate signature is stable so
- * that's an additive change.
+ * Complexity: Tier 1 is O(n) probe precompute + exact-name hash grouping,
+ * then candidate generation via a prefix-filtered token inverted index
+ * (PPJoin-style): each node only compares against nodes sharing one of its
+ * (⌊0.3·|tokens|⌋+1) globally-rarest tokens. That prefix is provably
+ * sufficient for both match tiers — a Jaccard ≥ 0.7 pair must intersect the
+ * prefix by pigeonhole, and a token-subset pair contains ALL of the shorter
+ * side's tokens (so also its prefix) — so no pair the exhaustive O(n²) scan
+ * would find is missed. Worst case degrades to O(n²) cheap set compares when
+ * every name shares rare tokens; typical vocabularies are near-linear.
  */
 import type Database from 'better-sqlite3';
 import type { NodeRow } from '../types/index.js';
-import { isDedupCandidate } from './dedup.js';
+import { makeProbe, matchProbes, type DedupProbe } from './dedup.js';
 
 /** Cosine similarity between two same-length float vectors. Unit-vector
  *  safe (just dot product for normalized), general for arbitrary vectors.
@@ -122,15 +127,57 @@ export function findDedupClusters(
     };
 
     // ── Tier 1: name-based ───────────────────────────────────
-    for (let i = 0; i < bucket.length; i++) {
-      for (let j = i + 1; j < bucket.length; j++) {
-        const a = bucket[i]!;
-        const b = bucket[j]!;
-        const m = isDedupCandidate(
-          { name: a.name, type: a.type },
-          { name: b.name, type: b.type },
-        );
-        if (m) recordMatch(a.id, b.id, m);
+    // Probe each name ONCE (normalization/tokenization dominates the scan),
+    // then generate candidate pairs from an inverted token index instead of
+    // exhaustive O(n²) — see the header comment for the completeness argument.
+    const probes: DedupProbe[] = bucket.map(r => makeProbe(r.name));
+
+    // 1a. Exact-normalized-name groups via hash — no tokenization needed.
+    const byNorm = new Map<string, number[]>();
+    for (let i = 0; i < probes.length; i++) {
+      const g = byNorm.get(probes[i]!.norm);
+      if (g) g.push(i);
+      else byNorm.set(probes[i]!.norm, [i]);
+    }
+    for (const group of byNorm.values()) {
+      for (let k = 1; k < group.length; k++) {
+        recordMatch(bucket[group[0]!]!.id, bucket[group[k]!]!.id, { reason: 'exact', score: 1 });
+      }
+    }
+
+    // 1b. Fuzzy tiers (token-subset / jaccard) via prefix-filtered blocking.
+    // Global token frequencies first (rarest tokens make the tightest blocks).
+    const tokenFreq = new Map<string, number>();
+    for (const p of probes) {
+      for (const t of p.tokens) tokenFreq.set(t, (tokenFreq.get(t) ?? 0) + 1);
+    }
+    // Postings over ALL tokens (query side is prefix-limited; the index side
+    // must stay complete for the subset tier, where the longer name's rare
+    // tokens may fall outside its own prefix).
+    const postings = new Map<string, number[]>();
+    for (let i = 0; i < probes.length; i++) {
+      for (const t of probes[i]!.tokens) {
+        const post = postings.get(t);
+        if (post) post.push(i);
+        else postings.set(t, [i]);
+      }
+    }
+    const prefixOf = (p: DedupProbe): string[] => {
+      const toks = [...p.tokens].sort((a, b) => (tokenFreq.get(a)! - tokenFreq.get(b)!) || (a < b ? -1 : 1));
+      return toks.slice(0, Math.floor(0.3 * toks.length) + 1);
+    };
+    for (let i = 0; i < probes.length; i++) {
+      const pi = probes[i]!;
+      if (pi.tokens.size === 0) continue;
+      const seen = new Set<number>();
+      for (const t of prefixOf(pi)) {
+        for (const j of postings.get(t)!) {
+          if (j === i || seen.has(j)) continue;
+          seen.add(j);
+          if (pi.norm === probes[j]!.norm) continue; // exact pairs already recorded in 1a
+          const m = matchProbes(pi, probes[j]!);
+          if (m) recordMatch(bucket[i]!.id, bucket[j]!.id, m);
+        }
       }
     }
 

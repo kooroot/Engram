@@ -4,13 +4,14 @@ import { createEngramCore, type EngramCore } from '../service.js';
 import * as svc from '../service.js';
 import * as fmt from './formatters.js';
 import type { EventType } from '../types/index.js';
-import { runOnboard } from './onboard.js';
-import { runDoctor } from './doctor.js';
-import { runUsage, type Period, type Breakdown } from './usage.js';
-import { runTui } from './tui.js';
-import { runReset } from './reset.js';
-import { runBackup, runListBackups } from './backup.js';
-import { runRestore } from './restore.js';
+import type { Period, Breakdown } from './usage.js';
+
+// Interactive/rare commands (onboard, doctor, usage TUI, reset, backup,
+// restore) are imported INSIDE their action handlers. The CLI binary is
+// spawned by Claude Code hooks on every SessionStart / UserPromptSubmit, and
+// eagerly importing the TUI stack dominated that cold start — `ink` alone
+// costs ~183ms to import (vs ~4ms for commander, ~3ms for better-sqlite3).
+// Lazy-loading it cut `engram context` hook latency from ~250ms to ~70ms.
 
 // Hook event names accepted by `engram context --hook-format`. Limited to
 // what Claude Code's hook contract actually consumes; reject typos at the CLI
@@ -60,6 +61,7 @@ export function registerCLICommands(program: Command): void {
     .command('onboard')
     .description('Interactive setup wizard (data dir, namespace, embedding, Claude Code MCP)')
     .action(async () => {
+      const { runOnboard } = await import('./onboard.js');
       await runOnboard();
     });
 
@@ -70,7 +72,8 @@ export function registerCLICommands(program: Command): void {
     .description('Create a snapshot of the engram DB (auto-prunes oldest beyond --keep)')
     .option('-l, --label <label>', 'Human-readable label appended to the backup folder name')
     .option('-k, --keep <n>', 'Keep newest N backups (default 5; or set ENGRAM_BACKUP_KEEP env var)')
-    .action((opts: { label?: string; keep?: string }) => withCore((core) => {
+    .action((opts: { label?: string; keep?: string }) => withCore(async (core) => {
+      const { runBackup } = await import('./backup.js');
       const keep = opts.keep ? Number(opts.keep) : undefined;
       runBackup(core, { label: opts.label, keep });
     }, ns())());
@@ -78,7 +81,10 @@ export function registerCLICommands(program: Command): void {
   program
     .command('backups')
     .description('List all backups for the current data directory')
-    .action(() => withCore((core) => runListBackups(core), ns())());
+    .action(() => withCore(async (core) => {
+      const { runListBackups } = await import('./backup.js');
+      runListBackups(core);
+    }, ns())());
 
   program
     .command('restore [id]')
@@ -87,6 +93,7 @@ export function registerCLICommands(program: Command): void {
     .option('-y, --yes', 'Skip confirmation prompt', false)
     .option('--no-safety-backup', "Don't create a safety backup of current state before restoring (DANGEROUS)")
     .action((id: string | undefined, opts: { latest?: boolean; yes?: boolean; safetyBackup?: boolean }) => withCore(async (core) => {
+      const { runRestore } = await import('./restore.js');
       // commander turns --no-safety-backup into safetyBackup=false (default true)
       const noSafety = opts.safetyBackup === false;
       await runRestore(core, { id, latest: opts.latest, yes: opts.yes, noSafetyBackup: noSafety });
@@ -104,6 +111,7 @@ export function registerCLICommands(program: Command): void {
       // commander: declaring `--no-backup` makes opts.backup default to true
       // and become false only when --no-backup is explicitly passed.
       const noBackup = opts.backup === false;
+      const { runReset } = await import('./reset.js');
       await runReset(core, {
         all: opts.all,
         yes: opts.yes,
@@ -120,6 +128,7 @@ export function registerCLICommands(program: Command): void {
     .option('--fix', 'Attempt to auto-repair detected issues (e.g. rebuild native modules)')
     .option('--quiet', 'Suppress the banner')
     .action(async (opts: { fix?: boolean; quiet?: boolean }) => {
+      const { runDoctor } = await import('./doctor.js');
       await runDoctor({ fix: opts.fix, quiet: opts.quiet });
     });
 
@@ -137,9 +146,11 @@ export function registerCLICommands(program: Command): void {
     .action((opts: { period: string; by: string; all?: boolean; plain?: boolean }) => withCore(async (core) => {
       const useTui = !opts.plain && process.stdout.isTTY;
       if (useTui) {
+        const { runTui } = await import('./tui.js');
         await runTui(core);
         return;
       }
+      const { runUsage } = await import('./usage.js');
       const period = (['day', 'week', 'month'].includes(opts.period) ? opts.period : 'week') as Period;
       const breakdown = (['tool', 'day', 'namespace'].includes(opts.by) ? opts.by : 'tool') as Breakdown;
       runUsage(core, { period, breakdown, allNamespaces: !!opts.all, plain: true });
@@ -150,6 +161,7 @@ export function registerCLICommands(program: Command): void {
     .command('tui', { hidden: true })
     .description('Alias for `engram usage` (interactive dashboard)')
     .action(() => withCore(async (core) => {
+      const { runTui } = await import('./tui.js');
       await runTui(core);
     }, ns())());
 

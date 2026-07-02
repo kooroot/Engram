@@ -44,10 +44,10 @@ export function registerQueryEngram(server: McpServer, stateTree: StateTree): vo
           };
         }
 
-        const edges = [
-          ...stateTree.getEdgesFrom(node.id),
-          ...stateTree.getEdgesTo(node.id),
-        ];
+        // Capped per direction: a hub node with thousands of edges used to
+        // produce a multi-MB response. Keeps the highest-confidence /
+        // most-recent edges — the same order the text renderer displays.
+        const edges = stateTree.getEdgesForNodes([node.id], DIRECT_LOOKUP_EDGE_CAP);
 
         return {
           content: [{
@@ -110,6 +110,9 @@ export function registerQueryEngram(server: McpServer, stateTree: StateTree): vo
   });
 }
 
+/** Max edges fetched per direction in direct-lookup mode. */
+const DIRECT_LOOKUP_EDGE_CAP = 100;
+
 interface RenderOpts {
   format: 'json' | 'text';
   max_tokens?: number;
@@ -145,43 +148,72 @@ function renderResult(nodes: Node[], edges: Edge[], depthReached: number, opts: 
     });
   }
 
-  // Budgeted: drop lowest-confidence nodes until under budget
+  // Budgeted: keep the LARGEST top-k prefix (by confidence, then recency)
+  // that fits the token budget. Each node/edge is serialized exactly once and
+  // candidate payload sizes are computed from prefix sums — the previous loop
+  // re-stringified the entire payload on every 25% shrink (up to ~17 full
+  // serializations of megabyte payloads) and could overshoot, returning fewer
+  // nodes than the budget allowed.
+  //
+  // Edges are kept when AT LEAST ONE endpoint is kept (matching the text
+  // renderer, which displays half-dangling edges by id). The old
+  // both-endpoints filter silently dropped EVERY edge in direct-lookup mode,
+  // where neighbor nodes are never part of `nodes`.
   const sorted = [...shaped].sort((a, b) =>
     b.confidence !== a.confidence ? b.confidence - a.confidence
       : b.updated_at.localeCompare(a.updated_at),
   );
 
-  let kept = sorted;
-  let truncated = false;
-  while (kept.length > 0) {
-    const keptIds = new Set(kept.map(n => n.id));
-    const filteredEdges = edges.filter(e => keptIds.has(e.source_id) && keptIds.has(e.target_id));
-    const payload = {
-      nodes: kept,
-      edges: filteredEdges,
-      meta: {
-        total_nodes: kept.length,
-        depth_reached: depthReached,
-        ...(truncated ? { truncated: true, original_count: shaped.length } : {}),
-      },
-    };
-    const serialized = JSON.stringify(payload);
-    if (estimateTokens(serialized) <= opts.max_tokens) return serialized;
-    kept = kept.slice(0, Math.max(1, kept.length - Math.max(1, Math.floor(kept.length / 4))));
-    truncated = true;
-    if (kept.length === 1) {
-      // Final attempt: return single top node even if over budget (better than nothing)
-      const keptIds2 = new Set(kept.map(n => n.id));
-      const filteredEdges2 = edges.filter(e => keptIds2.has(e.source_id) && keptIds2.has(e.target_id));
-      return JSON.stringify({
-        nodes: kept,
-        edges: filteredEdges2,
-        meta: { total_nodes: 1, depth_reached: depthReached, truncated: true, original_count: shaped.length },
-      });
-    }
-  }
+  const nodeStrs = sorted.map(n => JSON.stringify(n));
+  const edgeStrs = edges.map(e => JSON.stringify(e));
 
-  return JSON.stringify({ nodes: [], edges: [], meta: { total_nodes: 0, depth_reached: depthReached, truncated: true, original_count: shaped.length } });
+  // Map each edge to the smallest k at which it becomes included (the rank of
+  // its earliest-kept endpoint). Edges touching no sorted node are never kept.
+  const rankOf = new Map<string, number>();
+  sorted.forEach((n, i) => rankOf.set(n.id, i));
+  const edgeMinK = edges.map(e => {
+    const rs = rankOf.get(e.source_id);
+    const rt = rankOf.get(e.target_id);
+    if (rs === undefined && rt === undefined) return Infinity;
+    return Math.min(rs ?? Infinity, rt ?? Infinity) + 1;
+  });
+
+  const metaStr = (k: number, truncated: boolean) => JSON.stringify({
+    total_nodes: k,
+    depth_reached: depthReached,
+    ...(truncated ? { truncated: true, original_count: shaped.length } : {}),
+  });
+
+  // Exact serialized length of the k-prefix payload, built from parts:
+  // {"nodes":[a,b],"edges":[c],"meta":{...}}
+  const assemble = (k: number): string => {
+    const keptNodes = nodeStrs.slice(0, k);
+    const keptEdges: string[] = [];
+    for (let i = 0; i < edgeStrs.length; i++) {
+      if (edgeMinK[i]! <= k) keptEdges.push(edgeStrs[i]!);
+    }
+    const truncated = k < sorted.length;
+    return `{"nodes":[${keptNodes.join(',')}],"edges":[${keptEdges.join(',')}],"meta":${metaStr(k, truncated)}}`;
+  };
+  const fits = (k: number): boolean =>
+    estimateTokens(assemble(k)) <= opts.max_tokens!;
+
+  // Fast path: everything fits.
+  if (sorted.length > 0 && fits(sorted.length)) return assemble(sorted.length);
+
+  // Binary search the largest fitting k (k=1 is returned even when over
+  // budget — a single top node beats an empty response).
+  let lo = 1;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = Math.ceil((lo + hi) / 2);
+    if (fits(mid)) lo = mid;
+    else hi = mid - 1;
+  }
+  if (sorted.length === 0) {
+    return `{"nodes":[],"edges":[],"meta":${metaStr(0, true)}}`;
+  }
+  return assemble(Math.max(1, lo));
 }
 
 function stripProperties(node: Node): Node {
