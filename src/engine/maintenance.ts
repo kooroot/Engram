@@ -38,7 +38,7 @@ export interface MaintenanceReport {
  * Call sites must skip execution when @keepN <= 0.
  */
 export const HISTORY_PRUNE_SQL = `
-  DELETE FROM node_history
+  DELETE FROM node_history INDEXED BY idx_node_history_node
   WHERE node_id = @node_id AND namespace = @ns
     AND id NOT IN (
       SELECT id FROM node_history
@@ -50,6 +50,11 @@ export const HISTORY_PRUNE_SQL = `
       WHERE node_id = @node_id AND namespace = @ns
     )
 `;
+// ^ INDEXED BY pins the outer DELETE to the (node_id, version) index. Without
+// stats (a DB that has never been ANALYZEd) the planner was observed picking
+// idx_node_history_namespace — a scan of the ENTIRE namespace's history on
+// every update/delete/auto-merge. The subqueries already resolve via the same
+// index; this makes the whole prune O(log H + keepN) deterministically.
 
 /** Sentinel thrown to roll back the dry-run transaction (identity-checked). */
 const DRY_RUN_ABORT = new Error('history-compaction dry-run rollback');
@@ -182,13 +187,21 @@ export function runMaintenance(
   });
   report.archived = archiveResult.changes;
 
+  // Two anti-joins instead of one NOT EXISTS with an OR: the OR form can't
+  // use either edge index (SQLite falls back to a full edge scan PER candidate
+  // node — O(nodes × edges)); split, each subquery is a keyed probe on
+  // idx_edges_source / idx_edges_target. Semantically identical:
+  // NOT EXISTS(A OR B) ≡ NOT EXISTS(A) AND NOT EXISTS(B).
   const orphanStmt = db.prepare(`
     SELECT n.id FROM nodes n
     WHERE n.namespace = @ns
       AND n.archived = 0
       AND n.type NOT IN ('rule', 'concept')
       AND NOT EXISTS (
-        SELECT 1 FROM edges e WHERE (e.source_id = n.id OR e.target_id = n.id) AND e.namespace = @ns
+        SELECT 1 FROM edges e WHERE e.source_id = n.id AND e.namespace = @ns
+      )
+      AND NOT EXISTS (
+        SELECT 1 FROM edges e WHERE e.target_id = n.id AND e.namespace = @ns
       )
       AND n.updated_at < datetime('now', @daysAgo)
   `);

@@ -72,29 +72,65 @@ export interface DedupOptions {
 }
 
 /**
- * Returns match info if `incoming` should be treated as a duplicate of
- * `existing`, null otherwise. Type mismatch always → null (strict gate).
+ * A name pre-processed for repeated dedup comparison. Normalization and
+ * tokenization are the dominant cost of a dedup pass (regex work per name),
+ * so hot paths — the O(same-type-nodes) create-time scan and the O(n²)
+ * retroactive cluster scan — compute each name's probe ONCE and compare
+ * probes, instead of re-deriving both sides on every pair.
  *
- * "substring" reason now uses TOKEN-SUBSET containment, not raw substring —
- * avoids false positives like "Bot" merging into "Robotics" (where `bot`
- * appears inside `robotics` as a byte sequence but they're unrelated words).
- * "engram" still merges into "Engram Twin Mode" because `{engram}` ⊆
- * `{engram, twin, mode}` at the token level.
+ * `tokens` is computed lazily: an exact normalized match (the common dedup
+ * hit) never needs it, and neither side of a pair tokenizes unless the
+ * normalized strings differ.
  */
-export function isDedupCandidate(
-  incoming: { name: string; type: string },
-  existing: { name: string; type: string },
+export interface DedupProbe {
+  norm: string;
+  tokens: Set<string>;
+}
+
+export function makeProbe(name: string): DedupProbe {
+  let toks: Set<string> | null = null;
+  const norm = normalizeName(name);
+  return {
+    norm,
+    get tokens(): Set<string> {
+      if (toks === null) toks = tokenize(name);
+      return toks;
+    },
+  };
+}
+
+/**
+ * Memoized probe constructor for hot paths that see the same names repeatedly
+ * (the create-time dedup scan re-reads every same-type name per mutate call).
+ * Safe across processes: a probe is a pure function of the name string, so a
+ * cached entry can never go stale — worst case is a cold cache. Bounded by
+ * insertion-order eviction (names are re-cached on next use).
+ */
+const PROBE_CACHE_MAX = 20_000;
+const probeCache = new Map<string, DedupProbe>();
+
+export function makeProbeCached(name: string): DedupProbe {
+  let p = probeCache.get(name);
+  if (p) return p;
+  p = makeProbe(name);
+  if (probeCache.size >= PROBE_CACHE_MAX) {
+    probeCache.delete(probeCache.keys().next().value!);
+  }
+  probeCache.set(name, p);
+  return p;
+}
+
+/** Compare two precomputed probes. Same semantics as isDedupCandidate minus
+ *  the type gate (callers bucket by type before probing). */
+export function matchProbes(
+  a: DedupProbe,
+  b: DedupProbe,
   opts: DedupOptions = {},
 ): DedupMatch | null {
-  if (incoming.type !== existing.type) return null;
+  if (a.norm === b.norm) return { reason: 'exact', score: 1 };
 
-  const nIn = normalizeName(incoming.name);
-  const nEx = normalizeName(existing.name);
-
-  if (nIn === nEx) return { reason: 'exact', score: 1 };
-
-  const tIn = tokenize(incoming.name);
-  const tEx = tokenize(existing.name);
+  const tIn = a.tokens;
+  const tEx = b.tokens;
 
   // Token-subset: shorter's tokens all present in longer's tokens.
   const [shorter, longer] = tIn.size <= tEx.size ? [tIn, tEx] : [tEx, tIn];
@@ -107,4 +143,26 @@ export function isDedupCandidate(
   if (score >= threshold) return { reason: 'jaccard', score };
 
   return null;
+}
+
+/**
+ * Returns match info if `incoming` should be treated as a duplicate of
+ * `existing`, null otherwise. Type mismatch always → null (strict gate).
+ *
+ * "substring" reason now uses TOKEN-SUBSET containment, not raw substring —
+ * avoids false positives like "Bot" merging into "Robotics" (where `bot`
+ * appears inside `robotics` as a byte sequence but they're unrelated words).
+ * "engram" still merges into "Engram Twin Mode" because `{engram}` ⊆
+ * `{engram, twin, mode}` at the token level.
+ *
+ * One-shot convenience over makeProbe/matchProbes — loops should build probes
+ * once and call matchProbes directly.
+ */
+export function isDedupCandidate(
+  incoming: { name: string; type: string },
+  existing: { name: string; type: string },
+  opts: DedupOptions = {},
+): DedupMatch | null {
+  if (incoming.type !== existing.type) return null;
+  return matchProbes(makeProbe(incoming.name), makeProbe(existing.name), opts);
 }

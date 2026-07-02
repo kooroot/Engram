@@ -13,7 +13,7 @@ import type {
 import { nodeFromRow, edgeFromRow } from '../types/index.js';
 import { safeJsonParse } from '../utils.js';
 import { metrics, startTimer, safeNamespaceLabel } from '../metrics.js';
-import { isDedupCandidate } from '../engine/dedup.js';
+import { makeProbeCached, matchProbes, type MatchReason } from '../engine/dedup.js';
 import { HISTORY_PRUNE_SQL } from '../engine/maintenance.js';
 import type { EventLog } from './event-log.js';
 
@@ -52,6 +52,11 @@ export class StateTree {
   // History statements
   private insertHistoryStmt: Stmt;
   private pruneHistoryStmt: Stmt;
+
+  // Dedup scan statement (narrow: id + name only). The create-path scan used
+  // to SELECT * every same-type row — hydrating each row's properties/summary
+  // TEXT just to compare names made the scan O(N × row-size) per create op.
+  private dedupScanNamesStmt: Stmt;
 
   // Post-commit linkage / merge statements. Hoisted to the constructor: shared
   // by mutate/link/mergeNodes, which formerly re-prepared them per call or even
@@ -140,6 +145,11 @@ export class StateTree {
     this.deleteEdgeByIdStmt = db.prepare('DELETE FROM edges WHERE id = ? AND namespace = ?');
     this.deleteEdgeByTripletStmt = db.prepare(
       'DELETE FROM edges WHERE source_id = ? AND predicate = ? AND target_id = ? AND namespace = ?'
+    );
+
+    // -- Dedup scan (create path) --
+    this.dedupScanNamesStmt = db.prepare(
+      'SELECT id, name FROM nodes WHERE type = ? AND namespace = ? AND archived = 0'
     );
 
     // -- History --
@@ -254,30 +264,61 @@ export class StateTree {
    * Hydrate many nodes by id in a single query (namespace-scoped, active only).
    * Order is not guaranteed. Used by the get_context batched expansion to avoid
    * a per-neighbor point query (the former N+1). Prepared per call because the
-   * IN-list arity varies; better-sqlite3 caches by SQL string so repeated
-   * arities are cheap.
+   * IN-list arity varies; re-preparing costs ~10µs (better-sqlite3 does NOT
+   * cache statements by SQL string), which is noise on this path.
    */
-  getNodesByIds(ids: string[]): Node[] {
+  getNodesByIds(ids: string[], includeArchived: boolean = false): Node[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => '?').join(',');
+    const archivedFilter = includeArchived ? '' : ' AND archived = 0';
     const rows = this.db.prepare(
-      `SELECT * FROM nodes WHERE id IN (${placeholders}) AND namespace = ? AND archived = 0`
+      `SELECT * FROM nodes WHERE id IN (${placeholders}) AND namespace = ?${archivedFilter}`
     ).all(...ids, this.namespace) as NodeRow[];
     return rows.map(nodeFromRow);
   }
 
   /**
-   * Fetch all active edges touching any of `ids` (as source OR target) in a
+   * Fetch active edges touching any of `ids` (as source OR target) in a
    * single query (namespace-scoped, active only). The set-wise analogue of
-   * getEdgesFrom + getEdgesTo, used by expandNeighborhood().
+   * getEdgesFrom + getEdgesTo, used by expandNeighborhood() and the batched
+   * BFS in traverseGraph().
+   *
+   * `perAnchorDirLimit` caps how many edges are returned PER (anchor,
+   * direction), keeping the highest-confidence / most-recent ones — the same
+   * ordering buildContext renders with, so a hub node's context block is
+   * unchanged while the fetch stops hydrating thousands of rows it would
+   * discard. Uncapped fetch (traversal) passes nothing.
    */
-  getEdgesForNodes(ids: string[]): Edge[] {
+  getEdgesForNodes(ids: string[], perAnchorDirLimit?: number): Edge[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => '?').join(',');
+
+    if (!perAnchorDirLimit || perAnchorDirLimit <= 0) {
+      const rows = this.db.prepare(
+        `SELECT * FROM edges WHERE namespace = ? AND archived = 0
+           AND (source_id IN (${placeholders}) OR target_id IN (${placeholders}))`
+      ).all(this.namespace, ...ids, ...ids) as EdgeRow[];
+      return rows.map(edgeFromRow);
+    }
+
+    // Window-ranked fetch: rank per (anchor, direction) so the top-N outgoing
+    // AND top-N incoming of every anchor survive independently. Explicit
+    // column list because edgeFromRow spreads the row (rn must not leak).
     const rows = this.db.prepare(
-      `SELECT * FROM edges WHERE namespace = ? AND archived = 0
-         AND (source_id IN (${placeholders}) OR target_id IN (${placeholders}))`
-    ).all(this.namespace, ...ids, ...ids) as EdgeRow[];
+      `SELECT id, source_id, predicate, target_id, properties, confidence,
+              created_at, updated_at, version, archived, event_id, namespace
+       FROM (
+         SELECT e.*, ROW_NUMBER() OVER (
+           PARTITION BY
+             CASE WHEN e.source_id IN (${placeholders}) THEN e.source_id ELSE e.target_id END,
+             CASE WHEN e.source_id IN (${placeholders}) THEN 0 ELSE 1 END
+           ORDER BY e.confidence DESC, e.updated_at DESC
+         ) AS rn
+         FROM edges e
+         WHERE e.namespace = ? AND e.archived = 0
+           AND (e.source_id IN (${placeholders}) OR e.target_id IN (${placeholders}))
+       ) WHERE rn <= ?`
+    ).all(...ids, ...ids, this.namespace, ...ids, ...ids, perAnchorDirLimit) as EdgeRow[];
     return rows.map(edgeFromRow);
   }
 
@@ -312,10 +353,21 @@ export class StateTree {
     const historyRowIds: Array<number | bigint> = []; // M8: track exact history rows to attach event_id to
 
     // Phase 6a — auto-dedup bookkeeping
-    // Prepared once per batch; reused across all 'create' ops (avoids re-preparing in a loop).
-    const getSameTypeActiveStmt = this.db.prepare(
-      'SELECT * FROM nodes WHERE type = ? AND namespace = ? AND archived = 0'
-    );
+    // Same-type candidate rows (id + name), scanned at most ONCE per type per
+    // batch. A batch of K creates used to run K full same-type SELECT * scans;
+    // now the first create of a type scans narrow columns and later creates
+    // reuse it (rows inserted by this batch are visible via batchInserted).
+    // Any update/delete op invalidates the cache: an in-batch rename or delete
+    // must be seen by subsequent creates exactly as the per-op re-scan did.
+    const batchCandidates = new Map<string, Array<{ id: string; name: string }>>();
+    const candidatesFor = (type: string): Array<{ id: string; name: string }> => {
+      let c = batchCandidates.get(type);
+      if (!c) {
+        c = this.dedupScanNamesStmt.all(type, this.namespace) as Array<{ id: string; name: string }>;
+        batchCandidates.set(type, c);
+      }
+      return c;
+    };
     // Tracks nodes created THIS batch so a later op in the same mutate() call can dedup into them.
     // Without this, `mutate([create A, create A])` would silently insert two rows before the txn commits.
     const batchInserted: Array<{ id: string; type: string; name: string; version: number }> = [];
@@ -343,25 +395,27 @@ export class StateTree {
             // Phase 6a — agents can't be trusted to always query before creating,
             // so engram enforces "one concept, one node" here. Scans both the DB
             // AND this batch's accumulated inserts (so intra-batch duplicates also merge).
-            const existingSameType = getSameTypeActiveStmt.all(op.type, this.namespace) as NodeRow[];
+            // The incoming name is probed once; existing names hit the memoized
+            // probe cache, so steady-state cost per candidate is a string compare
+            // instead of normalize+tokenize regex work per row.
+            const incomingProbe = makeProbeCached(op.name);
 
-            let dedupMatch: { row: NodeRow; reason: 'exact' | 'substring' | 'jaccard' } | null = null;
-            for (const row of existingSameType) {
-              const m = isDedupCandidate(
-                { name: op.name, type: op.type },
-                { name: row.name, type: row.type },
-              );
-              if (m) { dedupMatch = { row, reason: m.reason }; break; }
+            let dedupMatch: { row: NodeRow; reason: MatchReason } | null = null;
+            for (const cand of candidatesFor(op.type)) {
+              const m = matchProbes(incomingProbe, makeProbeCached(cand.name));
+              if (m) {
+                // Hydrate the full row only on match (the scan itself is narrow).
+                const row = this.getNodeByIdStmt.get(cand.id, this.namespace) as NodeRow | undefined;
+                if (row) { dedupMatch = { row, reason: m.reason }; break; }
+              }
             }
             // Batch-internal scan: a same-batch earlier create of the same concept
-            // hasn't been committed yet, so it wasn't in the DB query above.
+            // hasn't been committed yet when its type's candidate list was cached,
+            // so it may not be in the candidate scan above.
             if (!dedupMatch) {
               for (const pending of batchInserted) {
                 if (pending.type !== op.type) continue;
-                const m = isDedupCandidate(
-                  { name: op.name, type: op.type },
-                  { name: pending.name, type: pending.type },
-                );
+                const m = matchProbes(incomingProbe, makeProbeCached(pending.name));
                 if (m) {
                   // Hydrate the just-inserted row so the merge branch below can treat
                   // it uniformly with a DB-sourced row.
@@ -447,6 +501,10 @@ export class StateTree {
             break;
           }
           case 'update': {
+            // An update can rename a node — drop cached candidate lists so a
+            // later create in this batch re-scans and sees the new name (the
+            // per-op scan this cache replaced always saw in-txn state).
+            batchCandidates.clear();
             const existing = this.getNodeByIdStmt.get(op.node_id, this.namespace) as NodeRow | undefined;
             if (!existing) {
               throw new Error(`Node not found: ${op.node_id}`);
@@ -481,6 +539,9 @@ export class StateTree {
             break;
           }
           case 'delete': {
+            // A delete removes a dedup target — drop cached candidate lists so
+            // a later create in this batch can't merge into the deleted row.
+            batchCandidates.clear();
             const toDelete = this.getNodeByIdStmt.get(op.node_id, this.namespace) as NodeRow | undefined;
             if (!toDelete) {
               throw new Error(`Node not found: ${op.node_id}`);

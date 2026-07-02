@@ -15,7 +15,7 @@ const MIGRATIONS = [
   '001_init_events.sql', '002_init_state_tree.sql', '003_init_node_history.sql',
   '005_add_namespaces.sql', '007_add_fts5.sql', '008_namespace_scope_fixes.sql',
   '009_add_usage_log.sql', '010_drop_redundant_indexes.sql',
-  '011_add_last_decayed_at.sql',
+  '011_add_last_decayed_at.sql', '012_conditional_fts_triggers.sql',
 ];
 
 function setupDb(): Database.Database {
