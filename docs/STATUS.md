@@ -1,20 +1,20 @@
 # Engram — Project Status Report
 
-**Date:** 2026-04-14
-**Head:** `ae440a7`
-**Repo:** https://github.com/kooroot/Engram
+**Date:** 2026-07-03
+**Version:** 0.5.4 · **Head:** `7c03cb7`
+**Repo:** https://github.com/kooroot/Engram · **npm:** [@kooroot/engram](https://www.npmjs.com/package/@kooroot/engram) (latest 0.5.4)
 
 ---
 
 ## Executive Summary
 
-Engram has progressed from an initial MCP prototype to a **production-ready AI-native memory infrastructure** in three major cycles. The system now safely supports multi-tenant deployment, external clients, and observability — not just single-user experiments.
+Engram has progressed from an initial MCP prototype to a **published, production-ready AI-native memory infrastructure**. Beyond the multi-tenant core (event log + state tree + vectors, exposed over MCP / CLI / REST), the system now **captures memory automatically** — via onboarding instructions, Claude Code / Codex / Gemini hooks, and **Twin Mode** transcript extraction — and keeps the graph clean with **write-time + retroactive dedup**.
 
-**Maturity rating:** Ready for internal team deployment / beta rollout. Not yet npm-published. Two deferred items (H-A3 full atomicity, M2 real import-merge) are tracked but non-blocking.
+**Maturity rating:** Published to npm as `@kooroot/engram` (latest **0.5.4**). Runs daily as the shared memory backend for multiple AI CLIs. The most recent cycle (0.5.4) was a correctness + performance pass — mutation/event-log atomicity, idempotent maintenance, an archive grace window, and 5–46× write/dedup speedups.
 
 ---
 
-## Timeline
+## Timeline — pre-1.0 build-out (all bundled into the v0.1.0 tag)
 
 ```
 Phase 0 — Greenfield (2026-04-12 → 2026-04-13)
@@ -51,19 +51,39 @@ Stage X — Adversarial review fixes (2026-04-14)
 
 ---
 
+## Release History (published to npm)
+
+The build-out above shipped as **v0.1.0**. Subsequent published releases:
+
+| Version | Date | Headline |
+|---------|------|----------|
+| **0.1.x** | 2026-04-14/15 | Onboarding polish — TUI wizard, `doctor --fix`, native Ollama provider, `engram.env` auto-load, one-pass Claude/Codex/Gemini registration + instruction install |
+| **0.2.x** | 2026-04-15 | Per-tool token-usage tracking + `engram usage`, heatmap view |
+| **0.3.x** | 2026-04-15 | `engram tui` dashboard (ink + React); `reset` / `backup` / `restore`; flat single-op tool payloads (Gemini compat); proactive-capture instructions |
+| **0.4.0** | 2026-04-16 | Claude Code hooks — auto-capture as a hard mechanism |
+| **0.5.0** | 2026-04-20 | **Twin Mode** — cross-AI memory via transcript extraction (Anthropic / Claude / Codex / Gemini providers + hook adapters) |
+| **0.5.1** | 2026-04-20 | Auto-dedup on `mutate_state`; `maintenance --dedup` retroactive cleanup |
+| **0.5.2** | 2026-05-20 | Codex `[features].hooks` flag fix |
+| **0.5.3** | 2026-06-15 | `maintenance --compact-history` retention pruning |
+| **0.5.4** | 2026-07-03 | **P-series** correctness + performance: atomic mutation+event, idempotent decay, archive grace window, `reembed`; **5–46× write/dedup, ~2.7× hook cold-start** |
+
+See [CHANGELOG.md](../CHANGELOG.md) for full per-version detail.
+
+---
+
 ## Current Shape
 
 ### Code metrics
 
 | Dimension | Value |
 |-----------|-------|
-| Source files | 32 TypeScript + 8 SQL migrations |
-| Lines of source | ~4,800 |
-| Tests | **79 passing** (10 files) |
+| Source files | 61 TypeScript/TSX + 12 SQL migrations |
+| Lines of source | ~12,300 |
+| Tests | **249 passing** (19 files) |
 | MCP tools | **7** |
-| REST endpoints | **14** |
-| CLI commands | **14** |
-| External runtime deps | `@modelcontextprotocol/sdk`, `better-sqlite3`, `sqlite-vec`, `hono`, `@hono/node-server`, `chalk`, `commander`, `ulid`, `zod` |
+| REST endpoints | **14** documented (incl. health / metrics) |
+| CLI commands | **25** |
+| External runtime deps | `@modelcontextprotocol/sdk`, `better-sqlite3`, `sqlite-vec`, `hono`, `@hono/node-server`, `chalk`, `commander`, `ulid`, `zod`, `ink`, `react`, `@clack/prompts`, `@anthropic-ai/sdk` |
 
 ### Tech stack
 
@@ -98,9 +118,9 @@ Stage X — Adversarial review fixes (2026-04-14)
 
 | Area | Maturity | Notes |
 |------|----------|-------|
-| 3-tier memory (Event Log / State Tree / Vectors) | ✅ Stable | 79 tests, per-namespace checksum chain |
+| 3-tier memory (Event Log / State Tree / Vectors) | ✅ Stable | per-namespace checksum chain, atomic mutation + event append |
 | MCP tools | ✅ Stable | 7 tools, Zod-validated, cache-invalidating |
-| CLI | ✅ Stable | 14 commands, colorized output |
+| CLI | ✅ Stable | 25 commands, colorized output |
 | REST API | ✅ Stable | 14 endpoints, auth + rate + CORS + body limits |
 | Namespaces | ✅ Stable | Per-row scoping, LRU core cache, allowlist |
 | FTS5 keyword search | ✅ Stable | Auto-synced via triggers, sub-1 ms at 11 K nodes |
@@ -111,6 +131,13 @@ Stage X — Adversarial review fixes (2026-04-14)
 | Rate limiting | ✅ Stable | Token bucket, socket-addr default, XFF opt-in |
 | Authentication | ✅ Stable | Bearer token, timing-safe compare, multi-token rotation |
 | Production hardening | ✅ Stable | Body limits, input caps, NaN-safe env parsing |
+| Onboarding (`onboard` / `doctor`) | ✅ Stable | TUI wizard, one-pass Claude/Codex/Gemini registration, `doctor --fix` |
+| Auto-capture hooks | ✅ Stable | Claude Code / Codex / Gemini session hooks (v0.4.0, v0.5.2 flag fix) |
+| Twin Mode (`autosave`) | ✅ Functional | Transcript → structured memory; Anthropic / Claude / Codex / Gemini providers (v0.5.0) |
+| Deduplication | ✅ Stable | Auto-dedup on `mutate_state` create + `maintenance --dedup` retroactive (v0.5.1) |
+| History compaction | ✅ Stable | `maintenance --compact-history` retention pruning (v0.5.3) |
+| TUI dashboard (`usage`) | ✅ Stable | ink + React; graph, events, per-tool token heatmap (v0.2–0.3) |
+| Write/read performance | ✅ Stable | Atomic mutation+event; P7 pass = 5–46× write/dedup, ~2.7× hook cold-start (v0.5.4) |
 
 ---
 
@@ -137,7 +164,7 @@ Adversarial review was applied twice. Current mitigations:
 | History cascade on node delete | FK `ON DELETE CASCADE` removed (migration 008) — audit survives delete |
 | Over-broad `changed_by IS NULL` update | History rowid tracked per insert, UPDATE by exact id |
 
-**Residual risk:** H-A3 (merge event append is not in the same transaction as the mutation itself) would matter only on a crash between commit and event append; the event_id-by-rowid fix limits the blast radius to "the merge succeeded but its event ref is missing," which `verifyIntegrity()` can still detect per-namespace. Acceptable until Stage C re-architects the chain.
+**H-A3 resolved (0.5.4):** `mutate` / `link` / `mergeNodes` now append the event log *inside* the mutation transaction (commit `0fa4b3b`; P6b `313841b` promoted the append to `BEGIN IMMEDIATE`), so state, event, and their linkage commit atomically. `verifyIntegrity()` continues to validate the per-namespace chain.
 
 ---
 
@@ -152,7 +179,7 @@ Adversarial review was applied twice. Current mitigations:
 | `get_context` hybrid (graph + semantic) | < 200 ms | ~80 ms for 8 nodes + embed call |
 | Namespace creation (first touch) | N/A | Opens 2 SQLite handles, runs migrations once per process |
 
-No artificial benchmarks beyond FTS5 yet — add a broader suite in Stage C if performance claims become load-bearing.
+The 0.5.4 **P7 pass** added a measured hotpath benchmark (`bun run bench` → `scripts/bench-perf.ts`) across the write path, FTS, dedup, and CLI cold-start, yielding **5–46× write/dedup speedups** and **~2.7× faster hook cold-start**. Mutation and event-log append are now committed in a single transaction (previously the deferred H-A3 risk).
 
 ---
 
@@ -160,7 +187,6 @@ No artificial benchmarks beyond FTS5 yet — add a broader suite in Stage C if p
 
 | Item | Why deferred |
 |------|--------------|
-| **H-A3** full merge atomicity (event append inside mutation txn) | Requires re-architecting the checksum chain read-under-lock; current rowid-based fix mitigates the realistic failure mode |
 | **M2** import `merge` strategy actually merges properties | Current behavior is "replace if newer," which is usable; deeper merge matches `StateTree.mergeNodes` semantics |
 | **M9** FTS5 sanitizer handles hyphenated tokens | Minor UX; quoted phrases work today as a workaround |
 | **M10** REST error handler uses string matching | Works today; brittle on future error messages. Error classes coming in Stage C |
@@ -177,16 +203,15 @@ These are tracked in `docs/STATUS.md` (this file) and in the review artifacts in
 
 ### Immediate (recommended)
 
-1. **Real-world dogfood**: hook Engram into a personal / team Claude Desktop config and run for a week. Gather actual failure modes.
-2. **CI/CD**: GitHub Actions with typecheck + test + build on PR.
-3. **npm publish** (optional): unlock `npx engram …` for zero-install agents.
+1. ✅ **Dogfooded** — runs daily as the shared memory backend across multiple AI CLIs (Twin Mode + auto-capture hooks).
+2. ✅ **npm published** — `@kooroot/engram` on npm (latest 0.5.4); `npx @kooroot/engram …` works for zero-install agents.
+3. **CI/CD** (still open): GitHub Actions with typecheck + test + build on PR — no `.github/workflows` yet.
 
 ### Stage C (when quality-tier improvements become worthwhile)
 
 - Recursive CTE traversal (perf at depth ≥ 3)
 - Edge embeddings (semantic quality)
 - Time-travel queries via `node_history`
-- Merge atomicity re-architecture (H-A3 full fix)
 - Web dashboard (graph visualizer + event timeline)
 - Plugin hook system (audit exporter, webhook)
 
@@ -197,7 +222,7 @@ These are tracked in `docs/STATUS.md` (this file) and in the review artifacts in
 | Item | Status |
 |------|--------|
 | TypeScript strict mode, zero errors | ✅ |
-| All tests pass | ✅ 79/79 |
+| All tests pass | ✅ 249/249 |
 | Schema migrations version-tracked | ✅ `_migrations` table |
 | Auth, rate limit, CORS, body limits | ✅ All env-configurable |
 | Prometheus metrics + health endpoint | ✅ `/api/metrics`, `/api/health` |
@@ -207,8 +232,8 @@ These are tracked in `docs/STATUS.md` (this file) and in the review artifacts in
 | Backup / restore path | ✅ JSON export/import |
 | `.env.example` documenting all env vars | ✅ |
 | Architecture + operations docs in README | ✅ Rewritten 2026-04-14 |
-| CI/CD pipeline | ❌ Not yet wired |
-| npm package published | ❌ Not yet |
+| npm package published | ✅ `@kooroot/engram` (latest 0.5.4) |
+| CI/CD pipeline | ❌ Not yet wired (no `.github/workflows`) |
 | Observability dashboards pre-built | ❌ Raw metrics only |
 
 ---
