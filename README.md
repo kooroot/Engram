@@ -8,7 +8,8 @@
     <a href="#three-interfaces-one-memory">Interfaces</a> &middot;
     <a href="#architecture">Architecture</a> &middot;
     <a href="#configuration">Configuration</a> &middot;
-    <a href="#production-deployment">Production</a>
+    <a href="#production-deployment">Production</a> &middot;
+    <a href="CHANGELOG.md">Changelog</a>
   </p>
 </p>
 
@@ -120,16 +121,30 @@ engram context "Engram roadmap" \
 engram maintenance --dry-run               # decay / archive / orphan preview
 engram maintenance --compact-history \
   --dry-run                                # preview node_history pruning
+engram maintenance --dedup --dry-run       # preview duplicate-node cleanup
+
+# Dashboard, usage & embeddings
+engram usage                               # interactive TUI: graph, events, per-tool tokens
+engram reembed                             # backfill / refresh node vectors
 
 # Multi-tenant
 engram --namespace work status
 engram --namespace personal nodes --type note
 engram namespaces                          # list all tenants in the DB
 
-# Dedupe
-engram merge Alice-v1 Alice-v2             # re-points edges + archives source
+# Dedupe (auto-dedup also runs on mutate_state create)
+engram merge Alice-v1 Alice-v2             # manually re-point edges + archive source
 
-# Backup / restore
+# Twin Mode — capture memory from an AI transcript
+engram autosave <transcript-path> \
+  --provider claude-cli                    # extract structured memories from a session
+                                           # providers: auto|claude-cli|codex-cli|gemini-cli|anthropic
+
+# Backup / restore / reset
+engram backup                              # snapshot the namespace to disk
+engram backups                             # list existing snapshots
+engram restore <backup-id>                 # restore from a snapshot
+engram reset                               # wipe a namespace (prompts to back up first)
 engram --namespace work export > work.json
 engram import work.json --target backup --strategy reassign
 
@@ -162,7 +177,7 @@ All endpoints accept `?namespace=xyz` query param or `X-Engram-Namespace` header
 
 | Tool | Purpose |
 |------|---------|
-| `mutate_state` | Create / update / delete nodes (batched, atomic) |
+| `mutate_state` | Create / update / delete nodes (batched, atomic; auto-dedups near-duplicates on create) |
 | `link_entities` | Create / update / delete SPO edges (auto-upsert on triplet) |
 | `query_engram` | Lookup by id/name/type, or BFS graph traversal (depth ≤ 5) |
 | `get_context` | Primary read path — graph + semantic hybrid, token budgeted |
@@ -171,6 +186,19 @@ All endpoints accept `?namespace=xyz` query param or `X-Engram-Namespace` header
 | `merge_nodes` | Unify duplicate entities (re-points edges, archives source) |
 
 Tools validate inputs with Zod (size and count caps applied). Tool call failures return structured errors; the MCP server logs them and continues.
+
+## Automatic Capture & Twin Mode
+
+Engram doesn't only wait to be called — it can capture memory on its own, so the next session resumes without losing context.
+
+| Mechanism | What it does |
+|-----------|--------------|
+| **Onboarding instructions** | `engram onboard` installs token-conscious capture guidance into each detected AI CLI, so the agent proactively saves substantive work. |
+| **Auto-capture hooks** | Claude Code / Codex / Gemini hooks fire at session events to capture work as a hard mechanism, not just a prompt suggestion. |
+| **Twin Mode** (`engram autosave`) | Extracts structured memories directly from a conversation transcript — same graph, whichever assistant produced the session. Providers: Anthropic SDK, Claude CLI (subscription auth, no API key), Codex CLI, Gemini CLI. |
+| **Auto-dedup** | `mutate_state` collapses near-duplicate nodes at write time; `engram maintenance --dedup` cleans up retroactively. |
+
+`engram usage` opens an interactive TUI dashboard — graph stats, event stream, and a per-tool token-usage heatmap.
 
 ## Architecture
 
@@ -324,7 +352,7 @@ Every response sets `X-Request-ID` so structured logs can be correlated.
 bun install                    # Install dependencies
 bun run dev                    # Start dev MCP server via tsx
 bun run build                  # Compile TypeScript + copy migrations
-bun run test                   # Run all tests (79 currently)
+bun run test                   # Run all tests (249 currently, 19 files)
 bun run test:watch             # Watch mode
 bun run typecheck              # Type check only
 ```
@@ -420,6 +448,10 @@ Agent flow:
    → BFS expands 1 hop from anchors
    → Context builder serializes within token budget
 ```
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md) for the full version history. Current version: **0.5.4**.
 
 ## License
 
